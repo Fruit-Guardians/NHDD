@@ -4,6 +4,7 @@ nhdd
 *.dex
 *.class
 *.jar
+*.so
 local.properties
 .gradle/
 build/
@@ -11,3 +12,7 @@ build/
 .idea/
 *.iml
 .cxx/
+nhdd_output/
+gui/nhdd-gui
+gui/nhdd_output/
+gui/go.sum
