@@ -4,13 +4,20 @@
 //
 // Build: aarch64-linux-android34-clang -O2 -static -o nhdd nhdd.c
 // Usage: nhdd <pid|package> [output_dir] [--so|--dex|--all]
+//                           [--snapshot ROUNDS] [--interval SECS]
 //
 // Features:
 //   - Accept PID or package name (auto-resolve via /proc/*/cmdline)
+//   - Multi-process scan: when given a package, ALL matching PIDs are scanned
+//     (main + child :remote / push processes). The real decrypted DEX is often
+//     loaded in a child process; scanning only the smallest PID misses it.
 //   - Page-by-page scanning (proven effective, no false negatives)
-//   - Dump DEX files (default) with auto-fix SHA-1 + Adler32
-//   - Dump SO files (--so) with auto-fix ELF header
-//   - Dump both (--all)
+//   - DEX content de-duplication (by recomputed SHA-1 signature) — across both
+//     processes and snapshot rounds, the same DEX is written only once.
+//   - Dump DEX files (default) with auto-fix SHA-1 + Adler32 + header fields
+//   - Dump SO files (--so) with auto-fix ELF header, spanning contiguous maps
+//   - Snapshot mode (--snapshot N --interval T): re-scan the target N times so
+//     even a DEX that only briefly exists in memory gets captured.
 //   - Static binary, no dependencies
 
 #define _GNU_SOURCE
@@ -23,6 +30,7 @@
 #include <inttypes.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <errno.h>
 
@@ -34,6 +42,112 @@ static const uint8_t kElfMagic[] = {0x7f, 0x45, 0x4c, 0x46}; // \x7fELF
 #define MODE_DEX 1
 #define MODE_SO  2
 #define MODE_ALL (MODE_DEX | MODE_SO)
+
+// ---- Limits ----
+#define MAX_PIDS         256
+#define DEDUP_DEX_MAX    1024
+#define DEDUP_SO_MAX     512
+
+// ---- Parsed /proc/<pid>/maps region ----
+typedef struct {
+    uintptr_t start;
+    uintptr_t end;
+    char      perms[8];   // e.g. "r-xp"
+    char      path[512];  // mapped file path ("" if anonymous)
+} maps_region;
+
+typedef struct {
+    maps_region *regs;
+    size_t       count;
+} maps_list;
+
+// ---- Cross-process / cross-snapshot de-dup tables ----
+// DEX identity = the 20-byte SHA-1 signature recomputed in fix_dex_header_and_checksums
+// (lives at offset 0x0C of a fixed DEX). Same content => same signature.
+static uint8_t g_dex_sigs[DEDUP_DEX_MAX][20];
+static int     g_dex_sig_count = 0;
+// SO identity = resolved maps path (when present). Anonymous SOs dedup by base addr.
+static char    g_so_paths[DEDUP_SO_MAX][512];
+static int     g_so_path_count = 0;
+
+static int dex_sig_seen(const uint8_t sig[20]) {
+    for (int i = 0; i < g_dex_sig_count; i++)
+        if (memcmp(g_dex_sigs[i], sig, 20) == 0) return 1;
+    return 0;
+}
+
+static void dex_sig_remember(const uint8_t sig[20]) {
+    if (g_dex_sig_count < DEDUP_DEX_MAX) {
+        memcpy(g_dex_sigs[g_dex_sig_count], sig, 20);
+        g_dex_sig_count++;
+    }
+}
+
+static int so_path_seen(const char *path) {
+    if (path[0] == '\0') return 0;
+    for (int i = 0; i < g_so_path_count; i++)
+        if (strcmp(g_so_paths[i], path) == 0) return 1;
+    return 0;
+}
+
+static void so_path_remember(const char *path) {
+    if (path[0] == '\0') return;
+    if (g_so_path_count < DEDUP_SO_MAX) {
+        strncpy(g_so_paths[g_so_path_count], path, sizeof(g_so_paths[0]) - 1);
+        g_so_paths[g_so_path_count][sizeof(g_so_paths[0]) - 1] = '\0';
+        g_so_path_count++;
+    }
+}
+
+// ---- Scan configuration (set in main, read by scan_pid) ----
+static int g_region_delay_us = 0;  // usleep between regions (stealth mode)
+
+// pread with EINTR retry. Returns total bytes read into buf (<=want), or -1 on
+// hard error before any byte. Avoids treating a transient signal as EOF.
+static ssize_t pread_retry(int fd, void *buf, size_t want, off_t off) {
+    size_t got = 0;
+    while (got < want) {
+        ssize_t r = pread(fd, (char *)buf + got, want - got, off + (off_t)got);
+        if (r > 0) { got += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        break;  // r==0 (EOF/hole) or hard error
+    }
+    return (ssize_t)got;
+}
+
+// Validate a DEX hit to filter false-positive magic in random data.
+// `magic_off` points at the "dex\n" within `buf` (n bytes available there).
+// Returns 1 if the version tag + size + header fields look like a real DEX.
+static int dex_hit_valid(const uint8_t *buf, size_t n, size_t magic_off, uint32_t *out_size) {
+    // version tag: bytes after magic must start with a digit (covers 035..041).
+    size_t v = magic_off + 4;
+    if (v >= n) return 0;
+    if (!isdigit((unsigned char)buf[v])) return 0;
+
+    // Read file_size (0x20) either from this page or via a fresh header read.
+    uint32_t dex_size = 0;
+    if (magic_off + 0x24 <= n) {
+        memcpy(&dex_size, buf + magic_off + 0x20, 4);
+    } else {
+        // Header crosses the page boundary; caller will re-read full header.
+        // Accept for now, full validation happens after we read it.
+        *out_size = 0;
+        return 1;
+    }
+    if (dex_size < 0x70 || dex_size > 0x10000000) return 0;
+
+    // Header cross-checks (sanity): header_size==0x70, key offsets within file.
+    uint32_t header_size = 0, string_ids_off = 0, class_defs_off = 0;
+    memcpy(&header_size, buf + magic_off + 0x24, 4);
+    memcpy(&string_ids_off, buf + magic_off + 0x3c, 4);
+    memcpy(&class_defs_off, buf + magic_off + 0x64, 4);
+    if (header_size != 0x70) return 0;
+    if (string_ids_off >= dex_size) return 0;
+    if (class_defs_off >= dex_size) return 0;
+
+    *out_size = dex_size;
+    return 1;
+}
 
 // ---- Package name resolution ----
 static int read_cmdline(const char *pid, char *out, size_t outsz) {
@@ -50,11 +164,14 @@ static int read_cmdline(const char *pid, char *out, size_t outsz) {
     return 0;
 }
 
-static int find_pid_for_package(const char *pkg, char *pid_out, size_t pid_sz) {
+// Collect ALL pids whose (colon-stripped) cmdline equals pkg.
+// Returns count, fills pids[]. This is the key to catching child processes
+// where the real decrypted DEX actually lives.
+static int find_pids_for_package(const char *pkg, char pids[][16], size_t pid_sz, int max) {
     DIR *d = opendir("/proc");
-    if (!d) return -1;
+    if (!d) return 0;
     struct dirent *de;
-    int best_pid = -1;
+    int count = 0;
     while ((de = readdir(d))) {
         const char *n = de->d_name;
         int all_digit = 1;
@@ -64,14 +181,12 @@ static int find_pid_for_package(const char *pkg, char *pid_out, size_t pid_sz) {
         char cmd[256];
         if (read_cmdline(n, cmd, sizeof(cmd)) != 0) continue;
         if (strcmp(cmd, pkg) != 0) continue;
-        int pid_val = atoi(n);
-        if (best_pid < 0 || pid_val < best_pid)
-            best_pid = pid_val;
+        if (count >= max) break;
+        snprintf(pids[count], pid_sz, "%s", n);
+        count++;
     }
     closedir(d);
-    if (best_pid < 0) return -1;
-    snprintf(pid_out, pid_sz, "%d", best_pid);
-    return 0;
+    return count;
 }
 
 // ---- Minimal SHA-1 (inline, no deps) ----
@@ -147,6 +262,7 @@ static uint32_t my_adler32(const uint8_t *data, size_t len) {
 }
 
 // ---- Fix DEX header + checksums (SHA-1 + Adler32) ----
+// Also fills the recomputed SHA-1 signature into the buffer (offset 0x0C).
 static void fix_dex_header_and_checksums(uint8_t *data, size_t size) {
     if (size < 0x70 || memcmp(data, kDexMagic, 4) != 0) return;
 
@@ -169,38 +285,89 @@ static void fix_dex_header_and_checksums(uint8_t *data, size_t size) {
     memcpy(data + 0x08, &cksum, 4);
 }
 
-// ---- Get SO name from maps line ----
-// Extracts the filename from a maps line like:
-// 7f8a001000-7f8a100000 r-xp 00000000 fd:00 12345 /data/app/.../libfoo.so
-static void get_so_name_from_maps(const char *pid, uintptr_t start_addr, char *name_out, size_t name_sz) {
+// ---- Load /proc/<pid>/maps into memory once, reused for scanning & SO lookup ----
+static maps_list *load_maps(const char *pid) {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%s/maps", pid);
     FILE *f = fopen(path, "r");
-    if (!f) { name_out[0] = '\0'; return; }
+    if (!f) return NULL;
+
+    maps_list *ml = calloc(1, sizeof(maps_list));
+    if (!ml) { fclose(f); return NULL; }
+    size_t cap = 512;
+    ml->regs = calloc(cap, sizeof(maps_region));
+    if (!ml->regs) { fclose(f); free(ml); return NULL; }
 
     char line[512];
     while (fgets(line, sizeof(line), f)) {
-        uintptr_t s, e;
-        if (sscanf(line, "%lx-%lx", &s, &e) < 2) continue;
-        if (s == start_addr) {
-            // Find the pathname after the inode
-            char *p = strchr(line, '/');
-            if (!p) p = strchr(line, '[');
-            if (p) {
-                // Remove trailing newline
-                size_t len = strlen(p);
-                if (len > 0 && p[len-1] == '\n') p[len-1] = '\0';
-                strncpy(name_out, p, name_sz - 1);
-                name_out[name_sz - 1] = '\0';
-            } else {
-                name_out[0] = '\0';
-            }
-            fclose(f);
-            return;
+        if (ml->count == cap) {
+            cap *= 2;
+            maps_region *nr = realloc(ml->regs, cap * sizeof(maps_region));
+            if (!nr) break;
+            ml->regs = nr;
+            memset(ml->regs + ml->count, 0, (cap - ml->count) * sizeof(maps_region));
         }
+        maps_region *r = &ml->regs[ml->count];
+        memset(r, 0, sizeof(*r));
+
+        // addr range + perms always present.
+        if (sscanf(line, "%lx-%lx %7s", &r->start, &r->end, r->perms) < 3) continue;
+
+        // Pathname (optional): the 6th whitespace-delimited field. Walk past
+        // start-end/perms/offset/dev/inode, then capture the rest as the path.
+        // Robust against anonymous mappings that have no path token.
+        const char *p = strchr(line, '\n');
+        char tmp[768];
+        snprintf(tmp, sizeof(tmp), "%s", line);
+        // Find the path: take substring after the inode field.
+        int fields = 0;
+        char *q = tmp;
+        while (fields < 5 && *q) {
+            while (*q == ' ') q++;
+            if (!*q) break;
+            while (*q && *q != ' ') q++;
+            fields++;
+        }
+        if (fields == 5) {
+            while (*q == ' ') q++;
+            // q now points at the path (or end of line). Trim trailing newline.
+            size_t plen = strlen(q);
+            while (plen > 0 && (q[plen-1] == '\n' || q[plen-1] == '\r' ||
+                               q[plen-1] == ' ' || q[plen-1] == '\t')) {
+                q[--plen] = '\0';
+            }
+            snprintf(r->path, sizeof(r->path), "%s", q);
+        }
+        (void)p;
+        ml->count++;
     }
     fclose(f);
-    name_out[0] = '\0';
+    return ml;
+}
+
+static void free_maps(maps_list *ml) {
+    if (!ml) return;
+    free(ml->regs);
+    free(ml);
+}
+
+// Find the SO's full contiguous extent by walking forward over regions that
+// share the same mapped path. ELF segments of one .so are mapped adjacently.
+static uintptr_t so_extent_end(const maps_list *ml, size_t idx, uintptr_t base_end) {
+    if (!ml || idx >= ml->count) return base_end;
+    const char *path = ml->regs[idx].path;
+    uintptr_t end = ml->regs[idx].end;
+    for (size_t i = idx + 1; i < ml->count; i++) {
+        const maps_region *r = &ml->regs[i];
+        // Stop at a gap or when the path changes / becomes a different file.
+        if (r->start > end + (1U << 20)) break;          // large hole => different area
+        if (path[0] != '\0' && strcmp(r->path, path) != 0) {
+            // Allow an anonymous continuation of the same SO (writable data etc.)
+            if (r->path[0] != '\0') break;
+        }
+        end = r->end;
+    }
+    return end > base_end ? end : base_end;
 }
 
 // ---- Extract basename from path ----
@@ -209,108 +376,57 @@ static const char *my_basename(const char *path) {
     return p ? p + 1 : path;
 }
 
-// ---- Main ----
-int main(int argc, char **argv) {
-    int mode = MODE_DEX; // default: dump DEX only
+// Counters carried across PID + snapshot iterations.
+typedef struct {
+    int dex_unique;     // DEX actually written to disk
+    int dex_dedup;      // DEX skipped as duplicates of an already-dumped one
+    int dex_total;      // every DEX magic hit
+    int so_count;       // SO files written
+    int procs;          // number of process scans performed
+} counters;
 
-    // Parse arguments
-    const char *target = NULL;
-    const char *out_dir = NULL;
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--so") == 0) { mode = MODE_SO; continue; }
-        if (strcmp(argv[i], "--dex") == 0) { mode = MODE_DEX; continue; }
-        if (strcmp(argv[i], "--all") == 0) { mode = MODE_ALL; continue; }
-        if (!target) { target = argv[i]; continue; }
-        if (!out_dir) { out_dir = argv[i]; continue; }
-    }
-
-    if (!target) {
-        fprintf(stderr,
-            "NHDD — No-Hook DEX/SO Dumper v4.0\n"
-            "Usage: %s <pid|package> [output_dir] [--so|--dex|--all]\n"
-            "\n"
-            "  Modes:\n"
-            "    --dex  Dump DEX files only (default)\n"
-            "    --so   Dump SO files only\n"
-            "    --all  Dump both DEX and SO files\n"
-            "\n"
-            "  DEX checksums (SHA-1 + Adler32) are auto-fixed.\n"
-            "  SO files are dumped from memory (may differ from disk).\n",
-            argv[0]);
-        return 1;
-    }
-
-    if (!out_dir) out_dir = "/data/local/tmp/nhdd_dump";
-
-    // Resolve target to PID
-    char pid_buf[16];
-    const char *pid;
-    int is_numeric = 1;
-    for (const char *c = target; *c; c++) {
-        if (!isdigit((unsigned char)*c)) { is_numeric = 0; break; }
-    }
-
-    if (is_numeric) {
-        pid = target;
-    } else {
-        if (find_pid_for_package(target, pid_buf, sizeof(pid_buf)) != 0) {
-            fprintf(stderr, "[-] No running process matches package '%s'\n", target);
-            return 1;
-        }
-        pid = pid_buf;
-        fprintf(stderr, "[*] Resolved package '%s' -> PID %s\n", target, pid);
-    }
-
-    // Read package name from PID
+// ---- Scan a single PID. Uses shared global de-dup tables. ----
+// Returns 0 if the process was dead/inaccessible, 1 if scanned.
+static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
+                    int mode, counters *c) {
     char pkg[256] = "unknown";
     read_cmdline(pid, pkg, sizeof(pkg));
-    fprintf(stderr, "[*] Target package: %s (PID %s)\n", pkg, pid);
 
-    // Open maps and mem
+    maps_list *ml = load_maps(pid);
+    if (!ml) {
+        fprintf(stderr, "[-] PID %s (%s): process gone (cannot read maps)\n", pid, pkg);
+        return 0;
+    }
     char path[256];
-    snprintf(path, sizeof(path), "/proc/%s/maps", pid);
-    FILE *maps = fopen(path, "r");
-    if (!maps) { fprintf(stderr, "[-] Cannot open %s: %s\n", path, strerror(errno)); return 1; }
-
     snprintf(path, sizeof(path), "/proc/%s/mem", pid);
     int mem_fd = open(path, O_RDONLY);
-    if (mem_fd < 0) { fprintf(stderr, "[-] Cannot open %s: %s\n", path, strerror(errno)); fclose(maps); return 1; }
+    if (mem_fd < 0) {
+        fprintf(stderr, "[-] PID %s (%s): process gone (cannot open mem): %s\n", pid, pkg, strerror(errno));
+        free_maps(ml);
+        return 0;
+    }
 
-    // Create output directories
-    char dex_dir[512], so_dir[512];
-    snprintf(dex_dir, sizeof(dex_dir), "%s/dex", out_dir);
-    snprintf(so_dir, sizeof(so_dir), "%s/so", out_dir);
-    mkdir(out_dir, 0777);
-    if (mode & MODE_DEX) mkdir(dex_dir, 0777);
-    if (mode & MODE_SO)  mkdir(so_dir, 0777);
+    c->procs++;
+    fprintf(stderr, "[*] Scanning PID %s (%s): %zu regions\n", pid, pkg, ml->count);
 
-    if (mode & MODE_DEX)
-        fprintf(stderr, "[*] Scanning for DEX files...\n");
-    if (mode & MODE_SO)
-        fprintf(stderr, "[*] Scanning for SO files...\n");
-    fprintf(stderr, "[*] Output directory: %s\n", out_dir);
-
-    char line[512];
-    int dex_count = 0, so_count = 0;
     uint8_t buf[4096];
-
-    // Track dumped SO base addresses to avoid duplicates
+    // Per-PID SO base de-dup (same base within one process is the same SO).
     uintptr_t dumped_so_bases[256];
-    int dumped_so_count = 0;
+    int dumped_so_base_count = 0;
+    int pid_dex_unique = 0, pid_dex_seen = 0;
 
-    // Page-by-page scanning
-    while (fgets(line, sizeof(line), maps)) {
-        uintptr_t start, end;
-        char perms[8] = {};
-        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) < 3) continue;
-        if (perms[0] != 'r') continue;
+    for (size_t ri = 0; ri < ml->count; ri++) {
+        maps_region *r = &ml->regs[ri];
+        if (r->perms[0] != 'r') continue;
 
-        size_t region_size = end - start;
+        size_t region_size = r->end - r->start;
         if (region_size < 64 || region_size > 0x40000000) continue;
 
-        for (uintptr_t addr = start; addr < end; addr += 4096) {
-            ssize_t n = pread(mem_fd, buf, sizeof(buf), (off_t)addr);
+        // Stealth: brief pause between regions to look less like bulk extraction.
+        if (g_region_delay_us > 0) usleep((useconds_t)g_region_delay_us);
+
+        for (uintptr_t addr = r->start; addr < r->end; addr += 4096) {
+            ssize_t n = pread_retry(mem_fd, buf, sizeof(buf), (off_t)addr);
             if (n < 64) continue;
 
             for (int i = 0; i <= n - 4; i++) {
@@ -318,62 +434,81 @@ int main(int argc, char **argv) {
                 if ((mode & MODE_DEX) && memcmp(buf + i, kDexMagic, 4) == 0) {
                     uintptr_t dex_addr = addr + i;
 
+                    // Validate the hit (version tag + header cross-checks) to
+                    // reject false-positive magic in random data.
                     uint32_t dex_size = 0;
-                    if (i + 0x24 <= n) {
-                        memcpy(&dex_size, buf + i + 0x20, 4);
-                    } else {
-                        uint8_t hdr[64];
-                        pread(mem_fd, hdr, 64, (off_t)dex_addr);
-                        memcpy(&dex_size, hdr + 0x20, 4);
+                    if (!dex_hit_valid(buf, (size_t)n, (size_t)i, &dex_size)) {
+                        // Header may cross the page; re-read a full 0x70 header.
+                        uint8_t hdr[0x70];
+                        if (pread_retry(mem_fd, hdr, 0x70, (off_t)dex_addr) == 0x70) {
+                            if (dex_hit_valid(hdr, 0x70, 0, &dex_size)) goto dex_accept;
+                        }
+                        continue;
                     }
+                dex_accept:;
+                    if (dex_size < 0x70 || dex_size > 0x10000000) continue;
 
-                    if (dex_size < 64 || dex_size > 0x10000000) continue;
-
-                    dex_count++;
-                    fprintf(stderr, "[+] Found DEX #%d at 0x%lx size=%u\n",
-                           dex_count, (unsigned long)dex_addr, dex_size);
-
-                    char outfile[512];
-                    snprintf(outfile, sizeof(outfile),
-                             "%s/dump_%d_%d.dex", dex_dir, atoi(pid), dex_count);
+                    c->dex_total++;
+                    pid_dex_seen++;
+                    fprintf(stderr, "[+] PID %s: DEX hit at 0x%lx size=%u\n",
+                           pid, (unsigned long)dex_addr, dex_size);
 
                     uint8_t *dex_data = (uint8_t *)calloc(1, dex_size);
                     if (!dex_data) { fprintf(stderr, "[-] calloc failed\n"); continue; }
 
                     // Read page-by-page instead of one huge contiguous pread.
-                    // Some ART/packer mappings contain unreadable holes or lazy pages;
-                    // stopping on the first failed read creates a truncated DEX.
+                    // calloc already zero-fills, so unreadable holes become zeros —
+                    // the file stays dex_size bytes with valid offsets for jadx.
                     size_t readable_total = 0;
                     int missing_pages = 0;
                     for (size_t off = 0; off < dex_size; off += 4096) {
                         size_t todo = dex_size - off;
                         if (todo > 4096) todo = 4096;
-                        ssize_t r = pread(mem_fd, dex_data + off, todo, (off_t)(dex_addr + off));
-                        if (r > 0) {
-                            readable_total += (size_t)r;
-                            if ((size_t)r < todo) missing_pages++;
+                        ssize_t rr = pread_retry(mem_fd, dex_data + off, todo, (off_t)(dex_addr + off));
+                        if (rr > 0) {
+                            readable_total += (size_t)rr;
+                            if ((size_t)rr < todo) missing_pages++;
                         } else {
                             missing_pages++;
                         }
                     }
 
-                    if (readable_total > 0) {
-                        fix_dex_header_and_checksums(dex_data, dex_size);
-                        int fd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-                        if (fd >= 0) {
-                            size_t written_total = 0;
-                            while (written_total < dex_size) {
-                                ssize_t w = write(fd, dex_data + written_total, dex_size - written_total);
-                                if (w <= 0) break;
-                                written_total += (size_t)w;
-                            }
-                            close(fd);
-                            if (written_total == dex_size) {
-                                printf("[+] DEX: %s (%u bytes, readable=%zu, zero_pages=%d)\n",
-                                       outfile, dex_size, readable_total, missing_pages);
-                            } else {
-                                fprintf(stderr, "[-] write failed/truncated for %s: %s\n", outfile, strerror(errno));
-                            }
+                    if (readable_total == 0) { free(dex_data); continue; }
+
+                    fix_dex_header_and_checksums(dex_data, dex_size);
+
+                    // De-dup by recomputed SHA-1 signature (offset 0x0C).
+                    const uint8_t *sig = dex_data + 0x0C;
+                    if (dex_sig_seen(sig)) {
+                        c->dex_dedup++;
+                        fprintf(stderr, "[=] PID %s: DEX at 0x%lx is a duplicate, skipped\n",
+                               pid, (unsigned long)dex_addr);
+                        free(dex_data);
+                        i += (dex_size > 4096 ? 4096 : dex_size);
+                        continue;
+                    }
+                    dex_sig_remember(sig);
+                    pid_dex_unique++;
+
+                    char outfile[768];
+                    snprintf(outfile, sizeof(outfile),
+                             "%s/dump_%s_%d.dex", dex_dir, pid, pid_dex_seen);
+
+                    int fd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                    if (fd >= 0) {
+                        size_t written_total = 0;
+                        while (written_total < dex_size) {
+                            ssize_t w = write(fd, dex_data + written_total, dex_size - written_total);
+                            if (w <= 0) break;
+                            written_total += (size_t)w;
+                        }
+                        close(fd);
+                        if (written_total == dex_size) {
+                            c->dex_unique++;
+                            printf("[+] DEX: %s (%u bytes, readable=%zu, zero_pages=%d) pid=%s\n",
+                                   outfile, dex_size, readable_total, missing_pages, pid);
+                        } else {
+                            fprintf(stderr, "[-] write failed/truncated for %s: %s\n", outfile, strerror(errno));
                         }
                     }
                     free(dex_data);
@@ -383,83 +518,64 @@ int main(int argc, char **argv) {
                 // ---- SO (ELF) scanning ----
                 if ((mode & MODE_SO) && memcmp(buf + i, kElfMagic, 4) == 0) {
                     uintptr_t elf_addr = addr + i;
-
-                    // Only dump ELF at page boundary (start of mmap'd region)
-                    // to avoid dumping ELF headers in the middle of data
+                    // Only treat page-boundary ELF as a real SO start.
                     if (i != 0) continue;
 
-                    // Check if we already dumped this base address
-                    int already_dumped = 0;
-                    for (int j = 0; j < dumped_so_count; j++) {
-                        if (dumped_so_bases[j] == elf_addr) {
-                            already_dumped = 1;
-                            break;
-                        }
-                    }
-                    if (already_dumped) continue;
+                    // Per-PID base de-dup.
+                    int already = 0;
+                    for (int j = 0; j < dumped_so_base_count; j++)
+                        if (dumped_so_bases[j] == elf_addr) { already = 1; break; }
+                    if (already) continue;
 
-                    // Read ELF header to get size info
                     uint8_t elf_hdr[64];
                     if (pread(mem_fd, elf_hdr, 64, (off_t)elf_addr) < 64) continue;
 
-                    // Check ELF class (32 or 64 bit)
-                    int is_64 = (elf_hdr[4] == 2); // EI_CLASS
+                    int is_64 = (elf_hdr[4] == 2);
                     if (elf_hdr[4] != 1 && elf_hdr[4] != 2) continue;
 
-                    // Get e_type (offset 16, 2 bytes LE)
                     uint16_t e_type = elf_hdr[16] | (elf_hdr[17] << 8);
-                    // Only dump shared objects (ET_DYN = 3)
-                    if (e_type != 3) continue;
+                    if (e_type != 3) continue; // ET_DYN only
 
-                    // Get the full size from maps
-                    // Find all contiguous regions belonging to this SO
-                    // Use the maps line we already have to determine the first segment
-                    // For a more accurate size, scan maps for all segments at this base
+                    // SO name from the maps region we are inside.
+                    const char *so_path = r->path;
+                    // Cross-process de-dup by path (anonymous SOs cannot dedup globally).
+                    if (so_path_seen(so_path)) {
+                        i += 4096;
+                        continue;
+                    }
 
-                    // Simple approach: use the current region size as minimum,
-                    // then try to find the full mapped range
+                    // SO extent = contiguous same-path regions, not just this line.
+                    uintptr_t so_end = so_extent_end(ml, ri, r->end);
                     uintptr_t so_start = elf_addr;
-                    uintptr_t so_end = end;
-
-                    // Look ahead in maps for more segments of the same file
-                    // For now, just use a reasonable max size
-                    // Read up to 64MB max for a single SO
                     size_t max_so_size = 64 * 1024 * 1024;
                     size_t so_size = so_end - so_start;
                     if (so_size > max_so_size) so_size = max_so_size;
 
-                    // Try to determine actual SO size from ELF program headers
+                    // Refine size from ELF program headers if smaller & sane.
                     if (is_64) {
-                        // ELF64: e_phoff=off28(8B), e_phentsize=off54(2B), e_phnum=off56(2B)
                         uint64_t e_phoff = 0;
                         memcpy(&e_phoff, elf_hdr + 32, 8);
                         uint16_t e_phentsize = elf_hdr[54] | (elf_hdr[55] << 8);
                         uint16_t e_phnum = elf_hdr[56] | (elf_hdr[57] << 8);
-
-                        // Find the maximum vaddr + memsz from LOAD segments
                         uint64_t max_addr = 0;
                         for (int p = 0; p < e_phnum && p < 32; p++) {
                             uint8_t phdr[56];
                             if (pread(mem_fd, phdr, 56, (off_t)(elf_addr + e_phoff + p * e_phentsize)) < 56) break;
                             uint32_t p_type = 0;
                             memcpy(&p_type, phdr, 4);
-                            if (p_type != 1) continue; // PT_LOAD
+                            if (p_type != 1) continue;
                             uint64_t p_vaddr = 0, p_memsz = 0;
                             memcpy(&p_vaddr, phdr + 16, 8);
                             memcpy(&p_memsz, phdr + 40, 8);
                             uint64_t seg_end = p_vaddr + p_memsz;
                             if (seg_end > max_addr) max_addr = seg_end;
                         }
-                        if (max_addr > 0 && max_addr < max_so_size) {
-                            so_size = (size_t)max_addr;
-                        }
+                        if (max_addr > 0 && max_addr < so_size) so_size = (size_t)max_addr;
                     } else {
-                        // ELF32: e_phoff=off28(4B), e_phentsize=off42(2B), e_phnum=off44(2B)
                         uint32_t e_phoff = 0;
                         memcpy(&e_phoff, elf_hdr + 28, 4);
                         uint16_t e_phentsize = elf_hdr[42] | (elf_hdr[43] << 8);
                         uint16_t e_phnum = elf_hdr[44] | (elf_hdr[45] << 8);
-
                         uint32_t max_addr = 0;
                         for (int p = 0; p < e_phnum && p < 32; p++) {
                             uint8_t phdr[32];
@@ -473,31 +589,18 @@ int main(int argc, char **argv) {
                             uint32_t seg_end = p_vaddr + p_memsz;
                             if (seg_end > max_addr) max_addr = seg_end;
                         }
-                        if (max_addr > 0 && max_addr < max_so_size) {
-                            so_size = (size_t)max_addr;
-                        }
+                        if (max_addr > 0 && max_addr < so_size) so_size = (size_t)max_addr;
                     }
 
-                    // Track this base address
-                    if (dumped_so_count < 256) {
-                        dumped_so_bases[dumped_so_count++] = elf_addr;
-                    }
+                    if (dumped_so_base_count < 256) dumped_so_bases[dumped_so_base_count++] = elf_addr;
+                    so_path_remember(so_path);
 
-                    so_count++;
-                    fprintf(stderr, "[+] Found SO #%d at 0x%lx size=%zu\n",
-                           so_count, (unsigned long)elf_addr, so_size);
-
-                    // Get SO name from maps
-                    char so_path[512] = "unknown";
-                    get_so_name_from_maps(pid, elf_addr, so_path, sizeof(so_path));
-
-                    // Build output filename
-                    char outfile[512];
-                    if (so_path[0] != '\0' && strcmp(so_path, "unknown") != 0) {
+                    char outfile[768];
+                    if (so_path[0] != '\0') {
                         const char *bname = my_basename(so_path);
                         snprintf(outfile, sizeof(outfile), "%s/%s", so_dir, bname);
                     } else {
-                        snprintf(outfile, sizeof(outfile), "%s/so_%d_%d.so", so_dir, atoi(pid), so_count);
+                        snprintf(outfile, sizeof(outfile), "%s/so_%s_%d.so", so_dir, pid, c->so_count + 1);
                     }
 
                     uint8_t *so_data = (uint8_t *)malloc(so_size);
@@ -505,11 +608,11 @@ int main(int argc, char **argv) {
 
                     ssize_t read_total = 0;
                     while (read_total < (ssize_t)so_size) {
-                        ssize_t r = pread(mem_fd, so_data + read_total,
+                        ssize_t rr = pread(mem_fd, so_data + read_total,
                                           so_size - read_total,
                                           (off_t)(elf_addr + read_total));
-                        if (r <= 0) break;
-                        read_total += r;
+                        if (rr <= 0) break;
+                        read_total += rr;
                     }
 
                     if (read_total > 0) {
@@ -517,11 +620,12 @@ int main(int argc, char **argv) {
                         if (fd >= 0) {
                             write(fd, so_data, read_total);
                             close(fd);
-                            printf("[+] SO: %s (%zd bytes) from %s\n", outfile, read_total, so_path);
+                            c->so_count++;
+                            printf("[+] SO: %s (%zd bytes) from %s pid=%s\n", outfile, read_total,
+                                   so_path[0] ? so_path : "(anon)", pid);
                         }
                     }
                     free(so_data);
-                    // Skip past this SO
                     i += 4096;
                 }
             }
@@ -529,14 +633,210 @@ int main(int argc, char **argv) {
     }
 
     close(mem_fd);
-    fclose(maps);
+    free_maps(ml);
+    fprintf(stderr, "[*] PID %s (%s): %d DEX (%d new), running totals: unique=%d dedup=%d\n",
+           pid, pkg, pid_dex_seen, pid_dex_unique, c->dex_unique, c->dex_dedup);
+    return 1;
+}
 
-    fprintf(stderr, "\n[*] Done. Found %d DEX, %d SO files in %s\n",
-            dex_count, so_count, out_dir);
+static int mkdir_checked(const char *path) {
+    if (mkdir(path, 0777) == 0) return 0;
+    if (errno == EEXIST) {
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+        fprintf(stderr, "[-] %s exists and is not a directory\n", path);
+        return -1;
+    }
+    fprintf(stderr, "[-] mkdir %s failed: %s\n", path, strerror(errno));
+    return -1;
+}
+
+// ---- Main ----
+int main(int argc, char **argv) {
+    int mode = MODE_DEX;
+    int snapshot_rounds = 1;     // fixed rounds (--snapshot N)
+    int snapshot_interval = 1;   // seconds between rounds
+    int watch = 0;               // --watch: loop until stable
+    int watch_dry_limit = 3;     // stop after K consecutive dry rounds
+    int max_rounds = 60;         // safety cap on rounds
+    int max_seconds = 120;       // safety cap on wall time
+    int stealth = 0;             // --stealth: add region delay
+
+    const char *target = NULL;
+    const char *out_dir = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--so") == 0) { mode = MODE_SO; continue; }
+        if (strcmp(argv[i], "--dex") == 0) { mode = MODE_DEX; continue; }
+        if (strcmp(argv[i], "--all") == 0) { mode = MODE_ALL; continue; }
+        if (strcmp(argv[i], "--snapshot") == 0 && i + 1 < argc) {
+            snapshot_rounds = atoi(argv[++i]);
+            if (snapshot_rounds < 1) snapshot_rounds = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--interval") == 0 && i + 1 < argc) {
+            snapshot_interval = atoi(argv[++i]);
+            if (snapshot_interval < 0) snapshot_interval = 0;
+            continue;
+        }
+        if (strcmp(argv[i], "--watch") == 0) {
+            watch = 1;
+            // optional K: --watch 3
+            if (i + 1 < argc && atoi(argv[i + 1]) > 0) { watch_dry_limit = atoi(argv[++i]); }
+            continue;
+        }
+        if (strcmp(argv[i], "--max-rounds") == 0 && i + 1 < argc) {
+            max_rounds = atoi(argv[++i]); if (max_rounds < 1) max_rounds = 60; continue;
+        }
+        if (strcmp(argv[i], "--max-seconds") == 0 && i + 1 < argc) {
+            max_seconds = atoi(argv[++i]); if (max_seconds < 1) max_seconds = 120; continue;
+        }
+        if (strcmp(argv[i], "--stealth") == 0) { stealth = 1; continue; }
+        if (strcmp(argv[i], "--region-delay") == 0 && i + 1 < argc) {
+            g_region_delay_us = atoi(argv[++i]) * 1000; continue;  // ms -> us
+        }
+        if (!target) { target = argv[i]; continue; }
+        if (!out_dir) { out_dir = argv[i]; continue; }
+    }
+
+    // --stealth enables a modest region delay by default (1ms) unless set.
+    if (stealth && g_region_delay_us == 0) g_region_delay_us = 1000;
+
+    if (!target) {
+        fprintf(stderr,
+            "NHDD — No-Hook DEX/SO Dumper v6.0\n"
+            "Usage: %s <pid|package> [output_dir] [--so|--dex|--all]\n"
+            "                       [--watch [K]] [--snapshot ROUNDS] [--interval SECS]\n"
+            "                       [--stealth] [--region-delay MS]\n"
+            "                       [--max-rounds N] [--max-seconds S]\n"
+            "\n"
+            "  Modes:\n"
+            "    --dex  Dump DEX files only (default)\n"
+            "    --so   Dump SO files only\n"
+            "    --all  Dump both DEX and SO files\n"
+            "\n"
+            "  Capture (key to 100%% first-gen recovery):\n"
+            "    --watch [K]    Keep scanning until K consecutive dry rounds (default 3).\n"
+            "                   Run it, then navigate the app's feature pages on the phone —\n"
+            "                   every lazily-loaded DEX gets captured as it enters memory.\n"
+            "                   Caps: --max-rounds (60), --max-seconds (120).\n"
+            "    --snapshot N   Fixed N rounds instead of --watch (default 1).\n"
+            "    --interval T   Seconds between rounds (default 1).\n"
+            "    --stealth      Add a small delay between memory regions to lower the\n"
+            "                   chance of anti-/proc/mem detection (see --region-delay).\n"
+            "    --region-delay MS  Region pause in ms (0 = none).\n"
+            "\n"
+            "  DEX checksums (SHA-1 + Adler32) are auto-fixed; hits are validated\n"
+            "  (DEX version tag + header fields) to reject false positives.\n"
+            "  SO files are dumped from memory (auto-fixed via SoFixer if present).\n",
+            argv[0]);
+        return 1;
+    }
+
+    if (!out_dir) out_dir = "/data/local/tmp/nhdd_dump";
+
+    // Resolve target: numeric PID => single pid; package => all matching pids.
+    char pids[MAX_PIDS][16];
+    int pid_count = 0;
+    int is_numeric = 1;
+    for (const char *c = target; *c; c++) {
+        if (!isdigit((unsigned char)*c)) { is_numeric = 0; break; }
+    }
+
+    if (is_numeric) {
+        snprintf(pids[0], sizeof(pids[0]), "%s", target);
+        pid_count = 1;
+    } else {
+        pid_count = find_pids_for_package(target, pids, sizeof(pids[0]), MAX_PIDS);
+        if (pid_count <= 0) {
+            fprintf(stderr, "[-] No running process matches package '%s'\n", target);
+            return 1;
+        }
+        fprintf(stderr, "[*] Resolved package '%s' -> %d process(es):", target, pid_count);
+        for (int i = 0; i < pid_count; i++) fprintf(stderr, " %s", pids[i]);
+        fprintf(stderr, "\n");
+    }
+
+    // Create output directories.
+    char dex_dir[512], so_dir[512];
+    snprintf(dex_dir, sizeof(dex_dir), "%s/dex", out_dir);
+    snprintf(so_dir, sizeof(so_dir), "%s/so", out_dir);
+    if (mkdir_checked(out_dir)) return 1;
+    if (mode & MODE_DEX) { if (mkdir_checked(dex_dir)) return 1; }
+    if (mode & MODE_SO)  { if (mkdir_checked(so_dir)) return 1; }
+
+    if (mode & MODE_DEX) fprintf(stderr, "[*] Scanning for DEX files...\n");
+    if (mode & MODE_SO)  fprintf(stderr, "[*] Scanning for SO files...\n");
+    fprintf(stderr, "[*] Output directory: %s\n", out_dir);
+    if (watch) {
+        fprintf(stderr, "[*] WATCH mode: scan until %d dry rounds (max %d rounds / %ds)\n",
+                watch_dry_limit, max_rounds, max_seconds);
+        fprintf(stderr, "[*] >>> Now navigate the app's feature pages on the phone; lazily-loaded\n");
+        fprintf(stderr, "        DEX will be captured as they enter memory. Stops automatically. <<<\n");
+    } else {
+        fprintf(stderr, "[*] Rounds: %d, interval: %ds\n", snapshot_rounds, snapshot_interval);
+    }
+
+    counters c;
+    memset(&c, 0, sizeof(c));
+
+    int rounds_run = 0;
+    int dry_rounds = 0;
+    time_t t_start = time(NULL);
+    int rounds_limit = watch ? max_rounds : snapshot_rounds;
+
+    for (int round = 0; round < rounds_limit; round++) {
+        // Wall-time safety cap (watch mode).
+        if (watch && max_seconds > 0) {
+            if (difftime(time(NULL), t_start) >= max_seconds) {
+                fprintf(stderr, "\n[*] Max seconds (%d) reached, stopping.\n", max_seconds);
+                break;
+            }
+        }
+        rounds_run++;
+        int unique_before = c.dex_unique;
+
+        if (rounds_limit > 1) fprintf(stderr, "\n[*] === Round %d ===\n", round + 1);
+
+        // Re-resolve pids each round for package targets (processes may respawn/die).
+        if (!is_numeric && rounds_limit > 1) {
+            pid_count = find_pids_for_package(target, pids, sizeof(pids[0]), MAX_PIDS);
+            if (pid_count <= 0) {
+                if (watch) {
+                    fprintf(stderr, "[*] no matching process yet, waiting for it to (re)appear...\n");
+                } else {
+                    fprintf(stderr, "[-] Round %d: no matching process (app may have exited)\n", round + 1);
+                }
+                if (snapshot_interval > 0) sleep(snapshot_interval);
+                continue;
+            }
+        }
+        for (int p = 0; p < pid_count; p++) {
+            scan_pid(pids[p], dex_dir, so_dir, mode, &c);
+        }
+
+        if (watch) {
+            int new_this = c.dex_unique - unique_before;
+            if (new_this > 0) dry_rounds = 0; else dry_rounds++;
+            fprintf(stderr, "[*] round %d: +%d new unique DEX (total=%d, dry=%d/%d)\n",
+                    round + 1, new_this, c.dex_unique, dry_rounds, watch_dry_limit);
+            if (dry_rounds >= watch_dry_limit) {
+                fprintf(stderr, "[*] stable set reached (%d dry rounds), stopping.\n", watch_dry_limit);
+                break;
+            }
+        }
+
+        if (round + 1 < rounds_limit && snapshot_interval > 0) {
+            sleep(snapshot_interval);
+        }
+    }
+
+    fprintf(stderr, "\n[*] Done. rounds=%d%s, processes_scanned=%d, DEX unique=%d (hits=%d, dedup_skipped=%d), SO=%d\n",
+            rounds_run, watch ? " (watch)" : "", c.procs, c.dex_unique,
+            c.dex_total, c.dex_dedup, c.so_count);
 
     // ---- Auto-fix SO files with SoFixer ----
-    if (so_count > 0) {
-        // Check if sofixer binary exists
+    if (c.so_count > 0) {
         const char *sofixer_paths[] = {
             "/data/local/tmp/sofixer",
             "/data/local/tmp/SoFixer64",
@@ -570,13 +870,11 @@ int main(int argc, char **argv) {
                     snprintf(cmd, sizeof(cmd), "%s -s %s -o %s -m 0x0 2>/dev/null", sofixer, src, dst);
                     int ret = system(cmd);
                     if (ret == 0) {
-                        // Replace original with fixed version
                         unlink(src);
                         rename(dst, src);
                         fixed++;
                         fprintf(stderr, "[+] Fixed: %s\n", de->d_name);
                     } else {
-                        // Fix failed, keep original dump
                         unlink(dst);
                         failed++;
                         fprintf(stderr, "[-] Fix failed: %s (kept raw dump)\n", de->d_name);

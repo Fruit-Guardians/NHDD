@@ -2,7 +2,9 @@
 
 **无需注入、无需 Hook 的 Android DEX/SO 内存脱壳工具**
 
-NHDD 以独立 root 进程运行，通过读取 `/proc/<pid>/mem` 直接扫描目标进程内存，找到 DEX/SO 文件并 dump。由于不注入任何代码到目标进程，加固方案无法检测到脱壳行为。
+nhdd 以独立 root 进程运行，通过读取 `/proc/<pid>/mem` 直接扫描目标进程内存，找到 DEX/SO 文件并 dump。由于不注入任何代码到目标进程，加固方案无法检测到脱壳行为。
+
+**能力边界**：本方式是**被动内存扫描**，能完整脱**一代壳**（含内存加载 DEX），对**二代抽取壳**只能拿到 DEX 骨架（方法体大多缺失），**三代 VMP 及以上**不在射程内。原因：不注入就无法主动调用方法触发解密。
 
 ## 原理
 
@@ -97,8 +99,14 @@ SO 文件在内存中可能被壳解密后与磁盘版本不同。NHDD 扫描 EL
 ## 功能特性
 
 - **零检测风险** — 不注入、不 hook、不 ptrace，目标进程完全无感知
+- **多进程扫描** — 给定包名时扫描**所有**匹配进程（主进程 + `:remote` 子进程），真实解密 DEX 常在子进程
+- **DEX 内容去重** — 按重算的 SHA-1 签名跨进程/跨快照去重，同一 DEX 只写一份
+- **快照轮询** — `--snapshot N` 在启动后多轮重扫，捕获时序敏感、短暂存在的 DEX
+- **watch 监听** — `--watch` 持续扫描直到稳定，配合手动点开功能页可捕获**按需 lazy-load** 的 DEX，是达到一代壳 ~100% 覆盖的关键
+- **反检测容错** — 壳杀进程后自动重新解析新 PID 继续扫；`--stealth` 区域间延时降低被注意概率
+- **DEX 真校验** — 命中后校验 version 标签 + header 字段，过滤 random 数据里的假阳性 magic
 - **DEX dump** — 自动扫描内存中的 DEX 文件，修复校验和
-- **SO dump** — 从内存 dump 解密后的 SO 文件，自动调用 SoFixer 修复
+- **SO dump** — 从内存 dump 解密后的 SO 文件，跨连续映射段读取，自动调用 SoFixer 修复
 - **包名解析** — 支持传入包名自动查找 PID
 - **自动修复** — DEX: SHA-1 + Adler32 + header_size + endian_tag + file_size；SO: shdr + phdr + 重定位
 - **无效文件清理** — 自动删除过小或损坏的 DEX
@@ -119,7 +127,7 @@ SO 文件在内存中可能被壳解密后与磁盘版本不同。NHDD 扫描 EL
 
 ```
 NHDD/
-├── nhdd.c              # 核心脱壳引擎 (C, 静态编译)
+├── nhdd.c              # 核心脱壳引擎 (C, 静态编译) — 多进程扫描/去重/快照
 ├── Makefile             # 编译配置
 ├── nhdd_ctrl.py         # 电脑端 Python 控制程序
 ├── fix_dex_checksum.py  # 独立 DEX 校验和修复工具
@@ -196,7 +204,13 @@ adb shell monkey -p com.example.app -c android.intent.category.LAUNCHER 1
 sleep 4
 adb shell "/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump"
 
-# 4. 拉到本地
+# 3b. 推荐用法：快照轮询，不依赖精确的 4 秒时机
+#     多轮扫描，DEX 在内存里短暂存在也能抓到，自动跨子进程去重。
+adb shell "monkey -p com.example.app -c android.intent.category.LAUNCHER 1 ; \
+           /data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump \
+           --snapshot 5 --interval 1"
+
+# 4. 拉到本地（DEX 在 nhdd_dump/dex/，SO 在 nhdd_dump/so/）
 adb pull /data/local/tmp/nhdd_dump/dex ./output
 
 # 5. dump SO 文件
@@ -205,6 +219,21 @@ adb shell "/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --so"
 # 6. 同时 dump DEX + SO
 adb shell "/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --all"
 ```
+
+nhdd 把结果分目录存放：`{out_dir}/dex/*.dex` 与 `{out_dir}/so/*.so`。
+给定包名时会扫描所有匹配进程（主进程 + `:remote` 子进程）；给定数字 PID 时只扫该进程。
+
+`--snapshot ROUNDS`：重复扫描 ROUNDS 轮（默认 1，即旧行为）。`--interval SECS`：每轮间隔秒数（默认 1）。快照模式下每轮会重新解析进程列表，能捕捉壳短暂加载的 DEX，且全程自动去重。
+
+**推荐用法：`--watch` 监听模式（一代壳 ~100% 覆盖的关键）**
+```bash
+# 启动 app 后持续扫描，同时在手机上逐个点开各功能页
+adb shell "monkey -p com.example.app -c android.intent.category.LAUNCHER 1 ; \
+           /data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch"
+```
+`--watch [K]`：循环扫描，连续 K 轮（默认 3）无新 DEX 自动停。按需 lazy-load 的 DEX 会在你点开对应功能页时进内存、被自动捕获。安全上限 `--max-rounds`（默认 60）、`--max-seconds`（默认 120）。
+
+**反检测**：对会杀进程的壳（如零跑），加 `--stealth`（区域间延时），或 `--region-delay MS` 自定延时；进程被杀后 watch 会自动重新解析新 PID 继续扫，不丢已抓结果。
 
 ### 方式二：Python 控制台
 
@@ -273,7 +302,9 @@ NHDD 的应对：
 
 ### Q: dump 出来 0 个 DEX？
 
-最常见原因：**等待时间太长**。壳在 app 启动后几秒内就会卸载 DEX。尝试缩短等待时间到 3-4 秒。
+最常见原因：**等待时间太长**。壳在 app 启动后几秒内就会卸载 DEX。解决办法：
+1. 改用快照轮询，不依赖精确时机：`nhdd <pkg> <dir> --snapshot 5 --interval 1`，它会从启动后立即多轮扫描，DEX 短暂存在也能抓到。
+2. 若已用快照仍为 0，说明真实 DEX 可能装在子进程——给定包名时 nhdd 会自动扫所有子进程，确认传的是包名而非主进程 PID。
 
 ### Q: jadx 打开 DEX 报错？
 
@@ -284,7 +315,7 @@ python3 fix_dex_checksum.py your_dex.dex
 
 ### Q: pidof 返回多个 PID？
 
-某些 app 有多个进程（主进程 + 子进程）。NHDD 会自动选择 PID 最小的（主进程）。也可以直接传入 PID：
+某些 app 有多个进程（主进程 + `:remote` 子进程）。给定包名时 nhdd 会**扫描所有匹配进程**（包括子进程，因为加固壳常把真实解密 DEX 装在子进程里）。也可以直接传入单个数字 PID 只扫该进程：
 ```bash
 nhdd 12345 /data/local/tmp/nhdd_dump
 ```

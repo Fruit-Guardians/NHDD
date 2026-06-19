@@ -28,8 +28,8 @@ dump() {
     sleep 1
     echo "[*] Launching $pkg..."
     monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
-    echo "[*] Waiting for app to load (8s)..."
-    sleep 8
+    echo "[*] Waiting for app to load (4s)..."
+    sleep 4
     echo "[*] Running NHDD..."
     $NHDD "$pkg" "$dir"
 }
