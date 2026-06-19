@@ -231,7 +231,9 @@ def gather_config():
                     default="su -c")
     cfg["su_cmd"] = su.strip()
     out = Prompt.ask("本地输出目录", default="./nhdd_output")
-    cfg["output_dir"] = out.strip() or "./nhdd_output"
+    # 去除首尾空白和可能的成对引号(用户手输时容易带上 "" 或 '')
+    out = out.strip().strip('"').strip("'").strip()
+    cfg["output_dir"] = out or "./nhdd_output"
     return cfg
 
 
@@ -323,11 +325,22 @@ def render_dashboard(st: DashState, pkg: str):
     return Group(main_panel, log_panel)
 
 
+def adb_shell_root(cmd, su_cmd=""):
+    """以 root 执行 shell 命令(nhdd 用 su 写的文件需 root 才能删)。"""
+    su = (su_cmd or "").strip()
+    if not su:
+        return adb_shell(cmd)
+    if "{cmd}" in su:
+        return adb_shell(su.replace("{cmd}", repr(cmd)))
+    return adb_shell(f"{su} {cmd!r}")
+
+
 def run_dump(pkg, cfg):
     """执行 dump,带 Live 进度面板。cfg['restart'] 控制是否重启 app。"""
-    # 清理
+    # 清理:nhdd 用 su 写的文件是 root 属主,普通 shell 的 rm 会 Permission denied
+    # → 残留跨次累积,污染下一次输出。故带 su 清理。
     console.print(Rule("准备", style="cyan"))
-    adb_shell(f"rm -rf {DEVICE_DUMP_DIR}; mkdir -p {DEVICE_DUMP_DIR}")
+    adb_shell_root(f"rm -rf {DEVICE_DUMP_DIR}; mkdir -p {DEVICE_DUMP_DIR}", cfg.get("su_cmd"))
 
     if cfg.get("restart"):
         adb_shell(f"am force-stop {pkg}")
@@ -415,6 +428,14 @@ def _pump(stream, st: DashState, is_stderr):
 def pull_and_summarize(pkg, st: DashState, output_dir):
     local = os.path.join(output_dir, pkg)
     os.makedirs(local, exist_ok=True)
+    # 防御:拉取前清空本地 dex/so 子目录的旧文件,避免上次同 app 结果残留合并进来。
+    for sub, exts in (("dex", (".dex",)), ("so", (".so",))):
+        sub_local = os.path.join(local, sub)
+        if os.path.isdir(sub_local):
+            for fn in os.listdir(sub_local):
+                if any(fn.endswith(e) for e in exts):
+                    try: os.remove(os.path.join(sub_local, fn))
+                    except OSError: pass
     rc, out = adb("pull", f"{DEVICE_DUMP_DIR}/.", local + os.sep)
     pulled_ok = rc == 0
 
@@ -511,6 +532,10 @@ def main():
         console.print(f"[green]输出目录(命令行指定):[/] {output_override}")
 
     st = run_dump(pkg, cfg)
+    if st.procs == 0:
+        console.print("[yellow]未扫描到任何进程(目标未运行或被杀),跳过拉取。[/]")
+        console.print("[yellow]建议:先手动打开 app 再扫,或在配置里开启「重启 app 再扫」。[/]")
+        return
     pull_and_summarize(pkg, st, cfg["output_dir"])
     console.print("\n[bold green]全部完成。[/]")
 
