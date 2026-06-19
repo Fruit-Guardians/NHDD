@@ -129,7 +129,8 @@ SO 文件在内存中可能被壳解密后与磁盘版本不同。NHDD 扫描 EL
 NHDD/
 ├── nhdd.c              # 核心脱壳引擎 (C, 静态编译) — 多进程扫描/去重/快照
 ├── Makefile             # 编译配置
-├── nhdd_ctrl.py         # 电脑端 Python 控制程序
+├── nhdd_ctrl.py         # 电脑端 Python 控制程序（终端脚本）
+├── nhdd_tui.py          # 电脑端终端版 TUI（rich 彩色界面 + watch 实时进度）
 ├── fix_dex_checksum.py  # 独立 DEX 校验和修复工具
 ├── gui/                 # 桌面 GUI (Go/Fyne)
 │   ├── main.go          # 主界面
