@@ -32,6 +32,7 @@
 #include <dirent.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
 #include <errno.h>
 
 // ---- Magic constants ----
@@ -147,6 +148,40 @@ static int dex_hit_valid(const uint8_t *buf, size_t n, size_t magic_off, uint32_
 
     *out_size = dex_size;
     return 1;
+}
+
+// ---- Anti-detection: rename our process so /proc/<pid>/comm and
+// /proc/<pid>/cmdline no longer read "nhdd ...". Defeats packers that scan
+// /proc/*/comm and /proc/*/cmdline for known tool names.
+//
+// Limitation: a packer running in the TARGET app context cannot ptrace our
+// root process, so it cannot observe our syscall sequence — only our names.
+// We can't fully hide from a detector that cross-checks comm vs path/owner,
+// but this defeats the common /proc name scanners (e.g. zero-run/bangbang).
+static void disguise_self(int argc, char **argv, const char *name) {
+    if (!name || !*name || argc < 1) return;
+
+    // 1) /proc/self/comm — 16 bytes incl. NUL (kernel truncates).
+    char comm[16];
+    snprintf(comm, sizeof(comm), "%s", name);
+    prctl(PR_SET_NAME, (unsigned long)comm, 0, 0, 0);
+
+    // 2) /proc/self/cmdline — the kernel reads the WHOLE arg region
+    // [arg_start, arg_end); NULs are separators, not terminators, so argv[1..]
+    // (target package, paths) would still be exposed. To hide them we zero the
+    // entire region argv[0]..argv[argc-1]+NUL, then write the fake name at the
+    // start. cmdline then reads only the fake name + empty args.
+    // Caller MUST have copied any argv strings it still needs (see main): we are
+    // about to destroy them.
+    char *start = argv[0];
+    char *end = argv[argc - 1] + strlen(argv[argc - 1]) + 1;
+    if (end <= start) return;
+    size_t cap = (size_t)(end - start);
+    size_t nl = strlen(name);
+    if (nl >= cap) nl = cap - 1;
+    memset(start, 0, cap);
+    memcpy(start, name, nl);
+    start[nl] = '\0';
 }
 
 // ---- Package name resolution ----
@@ -679,8 +714,10 @@ int main(int argc, char **argv) {
     int watch_dry_limit = 3;     // stop after K consecutive dry rounds
     int max_rounds = 60;         // safety cap on rounds
     int max_seconds = 120;       // safety cap on wall time
-    int stealth = 0;             // --stealth: add region delay
+    int stealth = 0;             // --stealth: add region delay + auto-disguise
     int keep = 0;                // --keep: do NOT wipe stale dex/so output
+    const char *disguise = NULL; // --name/--disguise: fake process name
+    const char *sofixer_path = NULL; // --sofixer <path>: override default lookup
 
     const char *target = NULL;
     const char *out_dir = NULL;
@@ -716,38 +753,62 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--region-delay") == 0 && i + 1 < argc) {
             g_region_delay_us = atoi(argv[++i]) * 1000; continue;  // ms -> us
         }
+        if ((strcmp(argv[i], "--name") == 0 || strcmp(argv[i], "--disguise") == 0)
+            && i + 1 < argc) { disguise = argv[++i]; continue; }
+        if (strcmp(argv[i], "--sofixer") == 0 && i + 1 < argc) {
+            sofixer_path = argv[++i]; continue;
+        }
         if (!target) { target = argv[i]; continue; }
         if (!out_dir) { out_dir = argv[i]; continue; }
     }
 
     // --stealth enables a modest region delay by default (1ms) unless set.
     if (stealth && g_region_delay_us == 0) g_region_delay_us = 1000;
+    // --stealth without an explicit name auto-disguises as a kworker thread.
+    if (stealth && !disguise) disguise = "kworker/u16:2";
+    // disguise_self() will zero the whole argv region (to hide target/paths in
+    // /proc/self/cmdline), destroying any pointers INTO argv. Copy the strings
+    // we still need first.
+    if (target) target = strdup(target);
+    if (out_dir) out_dir = strdup(out_dir);
+    if (sofixer_path) sofixer_path = strdup(sofixer_path);
+    if (disguise) disguise = strdup(disguise);
+    // Apply disguise early, before we open any target /proc files.
+    disguise_self(argc, argv, disguise);
 
     if (!target) {
         fprintf(stderr,
-            "NHDD — No-Hook DEX/SO Dumper v6.0\n"
+            "NHDD — No-Hook DEX/SO Dumper v7.0\n"
             "Usage: %s <pid|package> [output_dir] [--so|--dex|--all]\n"
             "                       [--watch [K]] [--snapshot ROUNDS] [--interval SECS]\n"
             "                       [--stealth] [--region-delay MS]\n"
-            "                       [--max-rounds N] [--max-seconds S]\n"
+            "                       [--name NAME] [--sofixer PATH]\n"
+            "                       [--max-rounds N] [--max-seconds S] [--keep]\n"
             "\n"
             "  Modes:\n"
             "    --dex  Dump DEX files only (default)\n"
             "    --so   Dump SO files only\n"
             "    --all  Dump both DEX and SO files\n"
             "\n"
-            "  Capture (key to 100%% first-gen recovery):\n"
+            "  Capture (key to ~100%% first-gen recovery):\n"
             "    --watch [K]    Keep scanning until K consecutive dry rounds (default 3).\n"
             "                   Run it, then navigate the app's feature pages on the phone —\n"
             "                   every lazily-loaded DEX gets captured as it enters memory.\n"
             "                   Caps: --max-rounds (60), --max-seconds (120).\n"
             "    --snapshot N   Fixed N rounds instead of --watch (default 1).\n"
             "    --interval T   Seconds between rounds (default 1).\n"
-            "    --stealth      Add a small delay between memory regions to lower the\n"
-            "                   chance of anti-/proc/mem detection (see --region-delay).\n"
+            "\n"
+            "  Anti-detection:\n"
+            "    --stealth      Region delay + auto-disguise as a kworker thread (see below).\n"
             "    --region-delay MS  Region pause in ms (0 = none).\n"
+            "    --name NAME    Fake /proc/self/comm AND /proc/self/cmdline to NAME (e.g.\n"
+            "                   'kworker/u17:2','gms:ui'). Defeats packers scanning /proc/*/comm\n"
+            "                   and /proc/*/cmdline for tool names. --stealth sets a default.\n"
+            "\n"
+            "  Output:\n"
             "    --keep          Do NOT wipe stale .dex/.so in the output dir before\n"
             "                   scanning (default: wipe, so re-runs don't mix old+new).\n"
+            "    --sofixer PATH  Use SoFixer at PATH (default: /data/local/tmp/sofixer).\n"
             "\n"
             "  DEX checksums (SHA-1 + Adler32) are auto-fixed; hits are validated\n"
             "  (DEX version tag + header fields) to reject false positives.\n"
@@ -873,10 +934,15 @@ int main(int argc, char **argv) {
             NULL
         };
         const char *sofixer = NULL;
-        for (int i = 0; sofixer_paths[i]; i++) {
-            if (access(sofixer_paths[i], X_OK) == 0) {
-                sofixer = sofixer_paths[i];
-                break;
+        // --sofixer <path> takes precedence over default lookup locations.
+        if (sofixer_path && access(sofixer_path, X_OK) == 0) {
+            sofixer = sofixer_path;
+        } else {
+            for (int i = 0; sofixer_paths[i]; i++) {
+                if (access(sofixer_paths[i], X_OK) == 0) {
+                    sofixer = sofixer_paths[i];
+                    break;
+                }
             }
         }
 
