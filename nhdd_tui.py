@@ -231,7 +231,9 @@ def gather_config():
                     default="su -c")
     cfg["su_cmd"] = su.strip()
     out = Prompt.ask("本地输出目录", default="./nhdd_output")
-    cfg["output_dir"] = out.strip() or "./nhdd_output"
+    # 去除首尾空白和可能的成对引号(用户手输时容易带上 "" 或 '')
+    out = out.strip().strip('"').strip("'").strip()
+    cfg["output_dir"] = out or "./nhdd_output"
     return cfg
 
 
@@ -511,6 +513,10 @@ def main():
         console.print(f"[green]输出目录(命令行指定):[/] {output_override}")
 
     st = run_dump(pkg, cfg)
+    if st.procs == 0:
+        console.print("[yellow]未扫描到任何进程(目标未运行或被杀),跳过拉取。[/]")
+        console.print("[yellow]建议:先手动打开 app 再扫,或在配置里开启「重启 app 再扫」。[/]")
+        return
     pull_and_summarize(pkg, st, cfg["output_dir"])
     console.print("\n[bold green]全部完成。[/]")
 
