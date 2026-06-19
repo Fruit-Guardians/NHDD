@@ -1,1 +1,13 @@
 nhdd
+*.apk
+*.ap_
+*.dex
+*.class
+*.jar
+local.properties
+.gradle/
+build/
+/app/build/
+.idea/
+*.iml
+.cxx/
