@@ -146,15 +146,25 @@ static uint32_t my_adler32(const uint8_t *data, size_t len) {
     return (b << 16) | a;
 }
 
-// ---- Fix DEX checksums (SHA-1 + Adler32) ----
-static void fix_dex_checksums(uint8_t *data, size_t size) {
-    if (size < 0x24 || memcmp(data, kDexMagic, 4) != 0) return;
+// ---- Fix DEX header + checksums (SHA-1 + Adler32) ----
+static void fix_dex_header_and_checksums(uint8_t *data, size_t size) {
+    if (size < 0x70 || memcmp(data, kDexMagic, 4) != 0) return;
+
+    // DEX fields are little-endian on Android.
+    uint32_t file_size = (uint32_t)size;
+    uint32_t header_size = 0x70;
+    uint32_t endian_tag = 0x12345678;
+    memcpy(data + 0x20, &file_size, 4);
+    memcpy(data + 0x24, &header_size, 4);
+    memcpy(data + 0x28, &endian_tag, 4);
+
     SHA1_CTX ctx;
     sha1_init(&ctx);
     sha1_update(&ctx, data + 0x20, size - 0x20);
     uint8_t sha1[20];
     sha1_final(&ctx, sha1);
     memcpy(data + 0x0C, sha1, 20);
+
     uint32_t cksum = my_adler32(data + 0x0C, size - 0x0C);
     memcpy(data + 0x08, &cksum, 4);
 }
@@ -327,25 +337,43 @@ int main(int argc, char **argv) {
                     snprintf(outfile, sizeof(outfile),
                              "%s/dump_%d_%d.dex", dex_dir, atoi(pid), dex_count);
 
-                    uint8_t *dex_data = (uint8_t *)malloc(dex_size);
-                    if (!dex_data) { fprintf(stderr, "[-] malloc failed\n"); continue; }
+                    uint8_t *dex_data = (uint8_t *)calloc(1, dex_size);
+                    if (!dex_data) { fprintf(stderr, "[-] calloc failed\n"); continue; }
 
-                    ssize_t read_total = 0;
-                    while (read_total < (ssize_t)dex_size) {
-                        ssize_t r = pread(mem_fd, dex_data + read_total,
-                                          dex_size - read_total,
-                                          (off_t)(dex_addr + read_total));
-                        if (r <= 0) break;
-                        read_total += r;
+                    // Read page-by-page instead of one huge contiguous pread.
+                    // Some ART/packer mappings contain unreadable holes or lazy pages;
+                    // stopping on the first failed read creates a truncated DEX.
+                    size_t readable_total = 0;
+                    int missing_pages = 0;
+                    for (size_t off = 0; off < dex_size; off += 4096) {
+                        size_t todo = dex_size - off;
+                        if (todo > 4096) todo = 4096;
+                        ssize_t r = pread(mem_fd, dex_data + off, todo, (off_t)(dex_addr + off));
+                        if (r > 0) {
+                            readable_total += (size_t)r;
+                            if ((size_t)r < todo) missing_pages++;
+                        } else {
+                            missing_pages++;
+                        }
                     }
 
-                    if (read_total > 0) {
-                        fix_dex_checksums(dex_data, read_total);
+                    if (readable_total > 0) {
+                        fix_dex_header_and_checksums(dex_data, dex_size);
                         int fd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
                         if (fd >= 0) {
-                            write(fd, dex_data, read_total);
+                            size_t written_total = 0;
+                            while (written_total < dex_size) {
+                                ssize_t w = write(fd, dex_data + written_total, dex_size - written_total);
+                                if (w <= 0) break;
+                                written_total += (size_t)w;
+                            }
                             close(fd);
-                            printf("[+] DEX: %s (%zd bytes)\n", outfile, read_total);
+                            if (written_total == dex_size) {
+                                printf("[+] DEX: %s (%u bytes, readable=%zu, zero_pages=%d)\n",
+                                       outfile, dex_size, readable_total, missing_pages);
+                            } else {
+                                fprintf(stderr, "[-] write failed/truncated for %s: %s\n", outfile, strerror(errno));
+                            }
                         }
                     }
                     free(dex_data);

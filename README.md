@@ -351,3 +351,11 @@ Offset  Size  Description
 ## License
 
 MIT
+
+## 作者与免责声明
+
+- 作者：漫宿骄盛
+- GitHub：https://github.com/mansujiaosheng/NHDD
+
+免责声明：本工具仅用于合法授权的安全研究、逆向分析与自有应用调试。使用者需确保已取得目标应用和设备授权。作者不对任何未授权使用、数据泄露、业务损失或法律责任负责。
+

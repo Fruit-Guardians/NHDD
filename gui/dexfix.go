@@ -11,10 +11,10 @@ import (
 )
 
 const (
-	dexMagic       = "dex\n"
-	dexHeaderSize  = 0x70
-	dexEndianTag   = 0x12345678
-	dexMinSize     = 0x70 // minimum valid DEX size = header size
+	dexMagic      = "dex\n"
+	dexHeaderSize = 0x70
+	dexEndianTag  = 0x12345678
+	dexMinSize    = 0x70 // minimum valid DEX size = header size
 )
 
 // FixDexFile fixes all known DEX header issues and checksums.
@@ -88,7 +88,7 @@ func FixDexFile(path string) (bool, bool, error) {
 	return fixed, false, nil
 }
 
-// FixDexDirectory fixes all .dex files in a directory (non-recursive).
+// FixDexDirectory fixes all .dex files in a directory recursively.
 // Returns (fixed_count, deleted_count, total_count, error).
 func FixDexDirectory(dir string) (int, int, int, error) {
 	dexFiles, err := findDexFiles(dir)
@@ -116,23 +116,29 @@ func FixDexDirectory(dir string) (int, int, int, error) {
 	return fixedCount, deletedCount, totalCount, nil
 }
 
-// findDexFiles finds all .dex files in a directory (non-recursive).
+// findDexFiles finds all .dex files in a directory recursively.
 func findDexFiles(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("read dir %s: %w", dir, err)
-	}
+	return findFilesByExt(dir, ".dex")
+}
 
-	var dexFiles []string
-	for _, entry := range entries {
+// findFilesByExt finds files by extension in a directory recursively.
+func findFilesByExt(dir, ext string) ([]string, error) {
+	ext = strings.ToLower(ext)
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			// Ignore unreadable children but keep walking other files.
+			return nil
+		}
 		if entry.IsDir() {
-			continue
+			return nil
 		}
-		if strings.HasSuffix(strings.ToLower(entry.Name()), ".dex") {
-			dexFiles = append(dexFiles, filepath.Join(dir, entry.Name()))
+		if strings.HasSuffix(strings.ToLower(entry.Name()), ext) {
+			files = append(files, path)
 		}
-	}
-	return dexFiles, nil
+		return nil
+	})
+	return files, err
 }
 
 // equalBytes compares two byte slices.

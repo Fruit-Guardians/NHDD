@@ -2,17 +2,22 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
-// RunADB executes an adb command with optional -H/-P flags, returns stdout.
+const deviceDumpDir = "/data/local/tmp/nhdd_dump"
+
+// RunADB executes an adb command with optional -H/-P flags, and returns stdout+stderr.
 func RunADB(adbPath string, hostPort string, args ...string) (string, error) {
 	var cmdArgs []string
 	if hostPort != "" {
 		parts := strings.SplitN(hostPort, ":", 2)
-		if len(parts) == 2 {
-			cmdArgs = append(cmdArgs, "-H", parts[0], "-P", parts[1])
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != "" {
+			cmdArgs = append(cmdArgs, "-H", strings.TrimSpace(parts[0]), "-P", strings.TrimSpace(parts[1]))
 		}
 	}
 	cmdArgs = append(cmdArgs, args...)
@@ -21,11 +26,61 @@ func RunADB(adbPath string, hostPort string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+func trimOutput(out string) string {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return ""
+	}
+	if len(out) > 800 {
+		out = out[:800] + "..."
+	}
+	return ": " + out
+}
+
+// shellQuote quotes a string for Android /system/bin/sh.
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if strings.IndexFunc(s, func(r rune) bool {
+		return !(r == '_' || r == '-' || r == '.' || r == ':' || r == '/' || r == '+' ||
+			(r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'))
+	}) < 0 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// RunShell executes an Android shell command as one shell string.
+func RunShell(adbPath, hostPort, command string) (string, error) {
+	return RunADB(adbPath, hostPort, "shell", command)
+}
+
+// RunShellMaybeRoot executes command through su/kp/ksud when suCmd is set.
+// Supported examples:
+//
+//	suCmd=""       -> <command>
+//	suCmd="su -c"  -> su -c '<command>'
+//	suCmd="kp -c"  -> kp -c '<command>'
+//	suCmd="su 0 -c" -> su 0 -c '<command>'
+//	suCmd="xxx {cmd}" -> replace {cmd} with quoted command
+func RunShellMaybeRoot(adbPath, hostPort, suCmd, command string) (string, error) {
+	suCmd = strings.TrimSpace(suCmd)
+	if suCmd == "" {
+		return RunShell(adbPath, hostPort, command)
+	}
+	quoted := shellQuote(command)
+	if strings.Contains(suCmd, "{cmd}") {
+		return RunShell(adbPath, hostPort, strings.ReplaceAll(suCmd, "{cmd}", quoted))
+	}
+	return RunShell(adbPath, hostPort, suCmd+" "+quoted)
+}
+
 // GetDeviceList returns list of connected device IDs.
 func GetDeviceList(adbPath, hostPort string) ([]string, error) {
 	out, err := RunADB(adbPath, hostPort, "devices")
 	if err != nil {
-		return nil, fmt.Errorf("adb devices failed: %w", err)
+		return nil, fmt.Errorf("adb devices failed: %w%s", err, trimOutput(out))
 	}
 	var devices []string
 	lines := strings.Split(out, "\n")
@@ -42,11 +97,11 @@ func GetDeviceList(adbPath, hostPort string) ([]string, error) {
 	return devices, nil
 }
 
-// GetAppList returns list of 3rd party package names.
+// GetAppList returns list of third-party package names.
 func GetAppList(adbPath, hostPort string) ([]string, error) {
 	out, err := RunADB(adbPath, hostPort, "shell", "pm", "list", "packages", "-3")
 	if err != nil {
-		return nil, fmt.Errorf("pm list packages failed: %w", err)
+		return nil, fmt.Errorf("pm list packages failed: %w%s", err, trimOutput(out))
 	}
 	var pkgs []string
 	for _, line := range strings.Split(out, "\n") {
@@ -55,93 +110,96 @@ func GetAppList(adbPath, hostPort string) ([]string, error) {
 			pkgs = append(pkgs, strings.TrimPrefix(line, "package:"))
 		}
 	}
+	sort.Strings(pkgs)
 	return pkgs, nil
 }
 
-// PushNhdd pushes the nhdd binary to /data/local/tmp/nhdd and chmod 755.
+// PushNhdd pushes the Android ARM64 nhdd binary to /data/local/tmp/nhdd and chmods it.
 func PushNhdd(adbPath, hostPort, localPath string) error {
-	_, err := RunADB(adbPath, hostPort, "push", localPath, "/data/local/tmp/nhdd")
-	if err != nil {
-		return fmt.Errorf("adb push nhdd failed: %w", err)
+	if _, err := os.Stat(localPath); err != nil {
+		return fmt.Errorf("local nhdd not found at %s: %w", localPath, err)
 	}
-	_, err = RunADB(adbPath, hostPort, "shell", "chmod", "755", "/data/local/tmp/nhdd")
+	out, err := RunADB(adbPath, hostPort, "push", localPath, "/data/local/tmp/nhdd")
 	if err != nil {
-		return fmt.Errorf("chmod nhdd failed: %w", err)
+		return fmt.Errorf("adb push nhdd failed: %w%s", err, trimOutput(out))
+	}
+	out, err = RunADB(adbPath, hostPort, "shell", "chmod", "755", "/data/local/tmp/nhdd")
+	if err != nil {
+		return fmt.Errorf("chmod nhdd failed: %w%s", err, trimOutput(out))
 	}
 	return nil
 }
 
-// DumpApp executes the full dump flow on the phone, returns nhdd output.
-func DumpApp(adbPath, hostPort, suCmd, pkg string, waitSec int) (string, error) {
-	// Force stop
-	_, err := RunADB(adbPath, hostPort, "shell", "am", "force-stop", pkg)
+// DumpApp executes force-stop -> clean -> launch -> wait -> nhdd on the phone.
+func DumpApp(adbPath, hostPort, suCmd, pkg string, waitSec int, mode string) (string, error) {
+	// Force stop. Failure is not fatal on all devices, but return it because the GUI logs the step explicitly.
+	out, err := RunADB(adbPath, hostPort, "shell", "am", "force-stop", pkg)
 	if err != nil {
-		return "", fmt.Errorf("force-stop failed: %w", err)
+		return out, fmt.Errorf("force-stop failed: %w%s", err, trimOutput(out))
 	}
 
-	// Clear previous dump directory
-	_, _ = RunADB(adbPath, hostPort, "shell", "rm", "-rf", "/data/local/tmp/nhdd_dump")
+	_, _ = RunShell(adbPath, hostPort, "rm -rf "+shellQuote(deviceDumpDir))
+	_, _ = RunShell(adbPath, hostPort, "mkdir -p "+shellQuote(deviceDumpDir))
 
-	// Launch app
-	_, err = RunADB(adbPath, hostPort, "shell", "monkey", "-p", pkg,
+	out, err = RunADB(adbPath, hostPort, "shell", "monkey", "-p", pkg,
 		"-c", "android.intent.category.LAUNCHER", "1")
 	if err != nil {
-		return "", fmt.Errorf("launch app failed: %w", err)
+		return out, fmt.Errorf("launch app failed: %w%s", err, trimOutput(out))
 	}
 
-	// Wait for app to load and unpack DEX
 	waitForSeconds(waitSec)
 
-	// Create dump directory on device
-	_, _ = RunADB(adbPath, hostPort, "shell", "mkdir", "-p", "/data/local/tmp/nhdd_dump")
+	modeArg := "--dex"
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "so", "--so":
+		modeArg = "--so"
+	case "all", "--all":
+		modeArg = "--all"
+	}
 
-	// Run nhdd - use PID directly to avoid pidof returning wrong process
-	// First get PID
 	pidOut, _ := RunADB(adbPath, hostPort, "shell", "pidof", pkg)
-	pid := strings.Fields(pidOut) // may return multiple PIDs, take first (main process)
-	pidStr := ""
-	if len(pid) > 0 {
-		pidStr = pid[0] // first PID is usually the main process
+	pidFields := strings.Fields(pidOut)
+	target := pkg
+	if len(pidFields) > 0 {
+		target = pidFields[0]
 	}
 
-	var nhddCmd string
-	if pidStr != "" {
-		// Use PID directly for more reliable targeting
-		nhddCmd = fmt.Sprintf("/data/local/tmp/nhdd %s /data/local/tmp/nhdd_dump", pidStr)
-	} else {
-		// Fallback to package name
-		nhddCmd = fmt.Sprintf("/data/local/tmp/nhdd %s /data/local/tmp/nhdd_dump", pkg)
-	}
-
-	var out string
-	if suCmd != "" {
-		out, err = RunADB(adbPath, hostPort, "shell", suCmd, nhddCmd)
-	} else {
-		out, err = RunADB(adbPath, hostPort, "shell", nhddCmd)
-	}
+	nhddCmd := fmt.Sprintf("/data/local/tmp/nhdd %s %s %s", shellQuote(target), shellQuote(deviceDumpDir), modeArg)
+	out, err = RunShellMaybeRoot(adbPath, hostPort, suCmd, nhddCmd)
 	if err != nil {
-		return out, fmt.Errorf("nhdd failed: %w", err)
+		return out, fmt.Errorf("nhdd failed: %w%s", err, trimOutput(out))
 	}
 	return out, nil
 }
 
-// PullDexFiles pulls /data/local/tmp/nhdd_dump/ to localDir/pkg/,
-// then cleans up the dump directory on the phone.
-// Returns count of .dex files pulled.
-func PullDexFiles(adbPath, hostPort, localDir, pkg string) (int, error) {
-	targetDir := localDir + "/" + pkg
-	_, err := RunADB(adbPath, hostPort, "pull", "/data/local/tmp/nhdd_dump/.", targetDir+"/")
-	if err != nil {
-		return 0, fmt.Errorf("adb pull failed: %w", err)
+// PullDumpFiles pulls /data/local/tmp/nhdd_dump/. to localDir/pkg/ recursively,
+// then cleans up the dump directory on the phone. Returns DEX and SO counts.
+func PullDumpFiles(adbPath, hostPort, localDir, pkg string) (int, int, error) {
+	targetDir := filepath.Join(localDir, pkg)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return 0, 0, fmt.Errorf("create output dir failed: %w", err)
 	}
 
-	// Clean up phone dump directory after successful pull
-	_, _ = RunADB(adbPath, hostPort, "shell", "rm", "-rf", "/data/local/tmp/nhdd_dump")
+	out, err := RunADB(adbPath, hostPort, "pull", deviceDumpDir+"/.", targetDir+string(os.PathSeparator))
+	if err != nil {
+		return 0, 0, fmt.Errorf("adb pull failed: %w%s", err, trimOutput(out))
+	}
 
-	// Count .dex files
+	_, _ = RunShell(adbPath, hostPort, "rm -rf "+shellQuote(deviceDumpDir))
+
 	dexFiles, err := findDexFiles(targetDir)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return len(dexFiles), nil
+	soFiles, err := findFilesByExt(targetDir, ".so")
+	if err != nil {
+		return len(dexFiles), 0, err
+	}
+	return len(dexFiles), len(soFiles), nil
+}
+
+// PullDexFiles is kept for compatibility with older callers.
+func PullDexFiles(adbPath, hostPort, localDir, pkg string) (int, error) {
+	dexCount, _, err := PullDumpFiles(adbPath, hostPort, localDir, pkg)
+	return dexCount, err
 }

@@ -58,6 +58,7 @@ type nhddApp struct {
 	// Config
 	suCmdEntry     *widget.Entry
 	outputDirEntry *widget.Entry
+	modeRadio      *widget.RadioGroup
 	waitSlider     *widget.Slider
 	waitLabel      *widget.Label
 
@@ -149,6 +150,9 @@ func (app *nhddApp) buildUI() {
 	app.outputDirEntry.SetPlaceHolder("输出目录")
 	app.outputDirEntry.SetText("./nhdd_output")
 
+	app.modeRadio = widget.NewRadioGroup([]string{"DEX", "SO", "ALL"}, nil)
+	app.modeRadio.SetSelected("DEX")
+
 	app.waitSlider = widget.NewSlider(2, 10)
 	app.waitSlider.SetValue(4)
 	app.waitSlider.Step = 1
@@ -158,14 +162,25 @@ func (app *nhddApp) buildUI() {
 	}
 
 	nhddLabel := widget.NewLabel("nhdd: " + nhddBinaryPath())
+	authorLabel := widget.NewLabel("作者：漫宿骄盛")
+	githubLabel := widget.NewLabel("GitHub：https://github.com/mansujiaosheng/NHDD")
+	disclaimerLabel := widget.NewLabel("免责声明：本工具仅用于合法授权的安全研究、逆向分析与自有应用调试。使用者需确保已取得目标应用和设备授权。作者不对任何未授权使用、数据泄露、业务损失或法律责任负责。")
+	disclaimerLabel.Wrapping = fyne.TextWrapWord
 
 	configForm := container.NewVBox(
 		widget.NewLabel("脱壳配置"),
+		widget.NewSeparator(),
+		widget.NewLabel("项目信息"),
+		authorLabel,
+		githubLabel,
+		disclaimerLabel,
 		widget.NewSeparator(),
 		widget.NewLabel("SU命令:"),
 		app.suCmdEntry,
 		widget.NewLabel("PC输出目录:"),
 		app.outputDirEntry,
+		widget.NewLabel("Dump模式:"),
+		app.modeRadio,
 		widget.NewLabel("等待时间:"),
 		container.NewBorder(nil, nil, nil, app.waitLabel, app.waitSlider),
 		widget.NewSeparator(),
@@ -301,6 +316,10 @@ func (app *nhddApp) onDump() {
 	adbPath := app.adbPath()
 	hostPort := app.hostPort()
 	nhddPath := nhddBinaryPath()
+	mode := app.modeRadio.Selected
+	if mode == "" {
+		mode = "DEX"
+	}
 
 	go func() {
 		defer func() {
@@ -321,7 +340,7 @@ func (app *nhddApp) onDump() {
 		app.log(fmt.Sprintf("[2/7] 强制停止 %s ...", pkg))
 		app.log(fmt.Sprintf("[3/7] 启动应用 %s ...", pkg))
 		app.log(fmt.Sprintf("[4/7] 等待 %d 秒让应用加载并解包DEX...", waitSec))
-		nhddOut, err := DumpApp(adbPath, hostPort, suCmd, pkg, waitSec)
+		nhddOut, err := DumpApp(adbPath, hostPort, suCmd, pkg, waitSec, mode)
 		if nhddOut != "" {
 			for _, line := range strings.Split(nhddOut, "\n") {
 				if strings.TrimSpace(line) != "" {
@@ -338,22 +357,21 @@ func (app *nhddApp) onDump() {
 		// Step 3: Create output directory
 		os.MkdirAll(filepath.Join(outputDir, pkg), 0755)
 
-		// Step 4: Pull DEX files
-		app.log(fmt.Sprintf("[6/7] 拉取DEX文件到 %s/%s/ ...", outputDir, pkg))
-		dexCount, err := PullDexFiles(adbPath, hostPort, outputDir, pkg)
+		// Step 4: Pull dump files
+		app.log(fmt.Sprintf("[6/7] 拉取dump文件到 %s ...", filepath.Join(outputDir, pkg)))
+		dexCount, soCount, err := PullDumpFiles(adbPath, hostPort, outputDir, pkg)
 		if err != nil {
-			app.log(fmt.Sprintf("拉取DEX文件失败: %v", err))
+			app.log(fmt.Sprintf("拉取dump文件失败: %v", err))
 			return
 		}
-		app.log(fmt.Sprintf("[6/7] 已拉取 %d 个DEX文件", dexCount))
+		app.log(fmt.Sprintf("[6/7] 已拉取 %d 个DEX文件, %d 个SO文件", dexCount, soCount))
 
 		if dexCount == 0 {
-			app.log("未发现DEX文件，应用可能已崩溃或壳未解包DEX")
-			return
+			app.log("未发现DEX文件：如果当前模式是 SO/ALL 外的预期结果，请检查目标是否已启动、root命令是否正确、壳是否已卸载DEX")
 		}
 
 		// Step 5: Fix DEX headers + checksums
-		app.log("[7/7] 修复DEX文件...")
+		app.log("[7/7] 递归修复DEX文件...")
 		targetDir := filepath.Join(outputDir, pkg)
 		fixedCount, deletedCount, totalCount, err := FixDexDirectory(targetDir)
 		if err != nil {
@@ -362,18 +380,26 @@ func (app *nhddApp) onDump() {
 			app.log(fmt.Sprintf("[7/7] 修复完成: %d/%d 已修复, %d 无效已删除", fixedCount, totalCount, deletedCount))
 		}
 
-		// Calculate total size (after deletion of invalid files)
+		// Calculate total size after deletion of invalid DEX files.
 		var totalSize int64
 		var validCount int
 		dexFiles, _ := findDexFiles(targetDir)
 		for _, f := range dexFiles {
-			if info, err := os.Stat(f); err == nil {
-				totalSize += info.Size()
+			if _, err := os.Stat(f); err == nil {
 				validCount++
 			}
 		}
+		_ = filepath.WalkDir(targetDir, func(path string, entry os.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return nil
+			}
+			if info, err := entry.Info(); err == nil {
+				totalSize += info.Size()
+			}
+			return nil
+		})
 
-		app.log(fmt.Sprintf("脱壳完成! %d 个有效DEX文件, 总大小: %.2f KB, 输出: %s",
-			validCount, float64(totalSize)/1024.0, targetDir))
+		app.log(fmt.Sprintf("脱壳完成! %d 个有效DEX文件, %d 个SO文件, 总大小: %.2f KB, 输出: %s",
+			validCount, soCount, float64(totalSize)/1024.0, targetDir))
 	}()
 }
