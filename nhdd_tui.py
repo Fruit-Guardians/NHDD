@@ -325,11 +325,22 @@ def render_dashboard(st: DashState, pkg: str):
     return Group(main_panel, log_panel)
 
 
+def adb_shell_root(cmd, su_cmd=""):
+    """以 root 执行 shell 命令(nhdd 用 su 写的文件需 root 才能删)。"""
+    su = (su_cmd or "").strip()
+    if not su:
+        return adb_shell(cmd)
+    if "{cmd}" in su:
+        return adb_shell(su.replace("{cmd}", repr(cmd)))
+    return adb_shell(f"{su} {cmd!r}")
+
+
 def run_dump(pkg, cfg):
     """执行 dump,带 Live 进度面板。cfg['restart'] 控制是否重启 app。"""
-    # 清理
+    # 清理:nhdd 用 su 写的文件是 root 属主,普通 shell 的 rm 会 Permission denied
+    # → 残留跨次累积,污染下一次输出。故带 su 清理。
     console.print(Rule("准备", style="cyan"))
-    adb_shell(f"rm -rf {DEVICE_DUMP_DIR}; mkdir -p {DEVICE_DUMP_DIR}")
+    adb_shell_root(f"rm -rf {DEVICE_DUMP_DIR}; mkdir -p {DEVICE_DUMP_DIR}", cfg.get("su_cmd"))
 
     if cfg.get("restart"):
         adb_shell(f"am force-stop {pkg}")
