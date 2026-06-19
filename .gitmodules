@@ -1,0 +1,3 @@
+[submodule "third_party/SoFixer"]
+	path = third_party/SoFixer
+	url = https://github.com/F8LEFT/SoFixer.git

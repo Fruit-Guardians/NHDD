@@ -505,5 +505,65 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "\n[*] Done. Found %d DEX, %d SO files in %s\n",
             dex_count, so_count, out_dir);
+
+    // ---- Auto-fix SO files with SoFixer ----
+    if (so_count > 0) {
+        // Check if sofixer binary exists
+        const char *sofixer_paths[] = {
+            "/data/local/tmp/sofixer",
+            "/data/local/tmp/SoFixer64",
+            NULL
+        };
+        const char *sofixer = NULL;
+        for (int i = 0; sofixer_paths[i]; i++) {
+            if (access(sofixer_paths[i], X_OK) == 0) {
+                sofixer = sofixer_paths[i];
+                break;
+            }
+        }
+
+        if (sofixer) {
+            fprintf(stderr, "\n[*] Fixing SO files with SoFixer...\n");
+            int fixed = 0, failed = 0;
+
+            DIR *d = opendir(so_dir);
+            if (d) {
+                struct dirent *de;
+                while ((de = readdir(d))) {
+                    if (de->d_type != DT_REG && de->d_type != DT_UNKNOWN) continue;
+                    size_t namelen = strlen(de->d_name);
+                    if (namelen < 4 || strcmp(de->d_name + namelen - 3, ".so") != 0) continue;
+
+                    char src[768], dst[768];
+                    snprintf(src, sizeof(src), "%s/%s", so_dir, de->d_name);
+                    snprintf(dst, sizeof(dst), "%s/fixed_%s", so_dir, de->d_name);
+
+                    char cmd[2048];
+                    snprintf(cmd, sizeof(cmd), "%s -s %s -o %s -m 0x0 2>/dev/null", sofixer, src, dst);
+                    int ret = system(cmd);
+                    if (ret == 0) {
+                        // Replace original with fixed version
+                        unlink(src);
+                        rename(dst, src);
+                        fixed++;
+                        fprintf(stderr, "[+] Fixed: %s\n", de->d_name);
+                    } else {
+                        // Fix failed, keep original dump
+                        unlink(dst);
+                        failed++;
+                        fprintf(stderr, "[-] Fix failed: %s (kept raw dump)\n", de->d_name);
+                    }
+                }
+                closedir(d);
+            }
+            fprintf(stderr, "[*] SoFixer: %d fixed, %d failed\n", fixed, failed);
+        } else {
+            fprintf(stderr, "[!] SoFixer not found at /data/local/tmp/sofixer. "
+                    "SO files are raw memory dumps.\n"
+                    "[!] Get SoFixer: https://github.com/F8LEFT/SoFixer\n"
+                    "[!] Usage: sofixer -s input.so -o output.so -m 0x0\n");
+        }
+    }
+
     return 0;
 }

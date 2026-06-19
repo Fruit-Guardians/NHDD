@@ -98,9 +98,9 @@ SO 文件在内存中可能被壳解密后与磁盘版本不同。NHDD 扫描 EL
 
 - **零检测风险** — 不注入、不 hook、不 ptrace，目标进程完全无感知
 - **DEX dump** — 自动扫描内存中的 DEX 文件，修复校验和
-- **SO dump** — 从内存 dump 解密后的 SO 文件
+- **SO dump** — 从内存 dump 解密后的 SO 文件，自动调用 SoFixer 修复
 - **包名解析** — 支持传入包名自动查找 PID
-- **自动修复** — SHA-1 + Adler32 + header_size + endian_tag + file_size
+- **自动修复** — DEX: SHA-1 + Adler32 + header_size + endian_tag + file_size；SO: shdr + phdr + 重定位
 - **无效文件清理** — 自动删除过小或损坏的 DEX
 - **三种使用方式** — 命令行 / Python 控制台 / GUI 桌面程序
 
@@ -131,6 +131,11 @@ NHDD/
 │   └── src/main/
 │       ├── AndroidManifest.xml
 │       └── java/com/nhdd/app/MainActivity.java
+├── third_party/
+│   └── SoFixer/         # SO 文件修复工具 (F8LEFT)
+│       ├── ElfReader.cpp
+│       ├── ElfRebuilder.cpp
+│       └── ...
 └── nhddctl.sh           # Shell 控制脚本
 ```
 
