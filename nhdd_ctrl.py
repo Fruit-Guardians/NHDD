@@ -7,6 +7,10 @@ Usage:
     python3 nhdd_ctrl.py                    # 交互式选择 app
     python3 nhdd_ctrl.py com.example.app    # 直接指定包名
     python3 nhdd_ctrl.py --list             # 列出所有第三方 app
+
+Environment:
+    NHDD_ADB    Override the adb command. Default: "adb".
+                Example: NHDD_ADB="adb -H 192.168.238.1 -P 5037" python3 nhdd_ctrl.py
 """
 
 import subprocess
@@ -16,9 +20,20 @@ import time
 import json
 import re
 
-ADB = "adb -H 192.168.238.1 -P 5037"
+# ADB command. Defaults to plain "adb" on PATH; override via NHDD_ADB env var,
+# e.g. NHDD_ADB="adb -H 192.168.238.1 -P 5037" for a network adb server.
+ADB = os.environ.get("NHDD_ADB", "adb")
 NHDD_BIN = "/data/local/tmp/nhdd"
 DEFAULT_DUMP_DIR = "/data/local/tmp/nhdd_dump"
+# Golden window: most first-gen packers unload the decrypted DEX ~6s after
+# launch. Scanning around 4s catches it; 8s is often too late (0 DEX).
+DEFAULT_WAIT_SEC = 4
+# Early-launch capture: keep scanning while the app loads and the user navigates
+# its feature pages, so lazily-loaded DEX get captured. `--watch` auto-stops
+# after K consecutive dry rounds. This is the key to ~100% first-gen recovery.
+DEFAULT_USE_WATCH = True
+DEFAULT_WATCH_DRY = 3          # stop after this many dry rounds
+DEFAULT_MAX_SECONDS = 120      # safety cap
 
 
 def adb_shell(cmd):
@@ -148,14 +163,24 @@ def select_app_interactive():
                 print("No matches.")
 
 
-def dump_app(pkg, dump_dir=None):
-    """Main dump flow: force-stop → launch → wait → nhdd scan."""
+def dump_app(pkg, dump_dir=None, wait_sec=None, snapshot=None):
+    """Main dump flow: force-stop -> launch -> watch-scan.
+
+    snapshot=True (default): watch mode — keep scanning while the app loads and
+    the user navigates its pages, auto-stop on stable set. Best for first-gen
+    shells that lazily load DEX.
+    snapshot=False: single scan after wait_sec.
+    """
     if not dump_dir:
         dump_dir = DEFAULT_DUMP_DIR
+    if wait_sec is None:
+        wait_sec = DEFAULT_WAIT_SEC
+    if snapshot is None:
+        snapshot = True
 
     print(f"\n{'='*60}")
     print(f"  NHDD Dump: {pkg}")
-    print(f"  Output: {dump_dir}")
+    print(f"  Output: {dump_dir}  (wait={wait_sec}s, snapshot={'on' if snapshot else 'off'})")
     print(f"{'='*60}\n")
 
     # Step 1: Check nhdd binary
@@ -176,12 +201,23 @@ def dump_app(pkg, dump_dir=None):
         f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 2>/dev/null"
     )
 
-    # Step 4: Wait for DEX to be unpacked
-    print("[3/5] Waiting 8s for app to load and unpack DEX...")
-    for i in range(8, 0, -1):
-        print(f"       {i}s...", end="\r")
-        time.sleep(1)
-    print("       0s... done    ")
+    if snapshot:
+        # Watch mode: keep scanning while the app loads and while the user
+        # navigates feature pages. Lazily-loaded DEX are captured as they enter
+        # memory; the scanner de-dups, so re-scanning never produces dup files.
+        print(f"[3/5] WATCH scan: auto-stop after {DEFAULT_WATCH_DRY} dry rounds "
+              f"(max {DEFAULT_MAX_SECONDS}s).")
+        print(f"      >>> 在手机上点开 app 各功能页，按需加载的 DEX 会被逐个捕获 <<<")
+        nhdd_cmd = (f"{NHDD_BIN} {pkg} {dump_dir} --watch {DEFAULT_WATCH_DRY} "
+                    f"--max-seconds {DEFAULT_MAX_SECONDS}")
+    else:
+        # Step 4: Wait for DEX to be unpacked
+        print(f"[3/5] Waiting {wait_sec}s for app to load and unpack DEX...")
+        for i in range(wait_sec, 0, -1):
+            print(f"       {i}s...", end="\r")
+            time.sleep(1)
+        print("       0s... done    ")
+        nhdd_cmd = f"{NHDD_BIN} {pkg} {dump_dir}"
 
     # Step 5: Check PID
     pid = adb_shell(f"pidof {pkg}").strip()
@@ -198,8 +234,8 @@ def dump_app(pkg, dump_dir=None):
 
     # Run nhdd and capture output
     result = subprocess.run(
-        f'{ADB} shell "{NHDD_BIN} {pkg} {dump_dir}"',
-        shell=True, capture_output=True, text=True, timeout=120
+        f'{ADB} shell "{nhdd_cmd}"',
+        shell=True, capture_output=True, text=True, timeout=180
     )
 
     output = result.stdout
@@ -212,8 +248,8 @@ def dump_app(pkg, dump_dir=None):
             if line.strip():
                 print(f"  [stderr] {line}")
 
-    # Count results
-    count_output = adb_shell(f"ls {dump_dir}/*.dex 2>/dev/null | wc -l")
+    # Count results (nhdd writes DEX under {dump_dir}/dex/)
+    count_output = adb_shell(f"ls {dump_dir}/dex/*.dex 2>/dev/null | wc -l")
     try:
         dex_count = int(count_output.strip())
     except ValueError:
