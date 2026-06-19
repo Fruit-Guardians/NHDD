@@ -651,6 +651,25 @@ static int mkdir_checked(const char *path) {
     return -1;
 }
 
+// Remove files ending in `ext` from `dir`. Prevents stale output from a
+// previous run accumulating (NHDD only mkdir's, never cleans — so re-runs
+// into the same out_dir would mix old and new dumps).
+static void clean_dir_ext(const char *dir, const char *ext) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    size_t el = strlen(ext);
+    while ((de = readdir(d))) {
+        if (de->d_type != DT_REG && de->d_type != DT_UNKNOWN) continue;
+        size_t l = strlen(de->d_name);
+        if (l < el || strcmp(de->d_name + l - el, ext) != 0) continue;
+        char p[768];
+        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+        unlink(p);
+    }
+    closedir(d);
+}
+
 // ---- Main ----
 int main(int argc, char **argv) {
     int mode = MODE_DEX;
@@ -661,6 +680,7 @@ int main(int argc, char **argv) {
     int max_rounds = 60;         // safety cap on rounds
     int max_seconds = 120;       // safety cap on wall time
     int stealth = 0;             // --stealth: add region delay
+    int keep = 0;                // --keep: do NOT wipe stale dex/so output
 
     const char *target = NULL;
     const char *out_dir = NULL;
@@ -669,6 +689,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--so") == 0) { mode = MODE_SO; continue; }
         if (strcmp(argv[i], "--dex") == 0) { mode = MODE_DEX; continue; }
         if (strcmp(argv[i], "--all") == 0) { mode = MODE_ALL; continue; }
+        if (strcmp(argv[i], "--keep") == 0) { keep = 1; continue; }
         if (strcmp(argv[i], "--snapshot") == 0 && i + 1 < argc) {
             snapshot_rounds = atoi(argv[++i]);
             if (snapshot_rounds < 1) snapshot_rounds = 1;
@@ -725,6 +746,8 @@ int main(int argc, char **argv) {
             "    --stealth      Add a small delay between memory regions to lower the\n"
             "                   chance of anti-/proc/mem detection (see --region-delay).\n"
             "    --region-delay MS  Region pause in ms (0 = none).\n"
+            "    --keep          Do NOT wipe stale .dex/.so in the output dir before\n"
+            "                   scanning (default: wipe, so re-runs don't mix old+new).\n"
             "\n"
             "  DEX checksums (SHA-1 + Adler32) are auto-fixed; hits are validated\n"
             "  (DEX version tag + header fields) to reject false positives.\n"
@@ -764,6 +787,13 @@ int main(int argc, char **argv) {
     if (mkdir_checked(out_dir)) return 1;
     if (mode & MODE_DEX) { if (mkdir_checked(dex_dir)) return 1; }
     if (mode & MODE_SO)  { if (mkdir_checked(so_dir)) return 1; }
+
+    // Wipe stale output so a re-run into the same out_dir never mixes old
+    // dumps with new ones (--keep to preserve, e.g. for incremental runs).
+    if (!keep) {
+        if (mode & MODE_DEX) clean_dir_ext(dex_dir, ".dex");
+        if (mode & MODE_SO)  clean_dir_ext(so_dir, ".so");
+    }
 
     if (mode & MODE_DEX) fprintf(stderr, "[*] Scanning for DEX files...\n");
     if (mode & MODE_SO)  fprintf(stderr, "[*] Scanning for SO files...\n");
