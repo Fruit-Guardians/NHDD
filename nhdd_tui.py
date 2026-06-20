@@ -513,6 +513,8 @@ def main():
 
     # 解析 -o/--output:指定本地输出目录(绝对路径最佳,避免随运行目录漂移)
     output_override = None
+    cli_mode = False
+    su_cmd_override = None
     filtered = []
     i = 0
     while i < len(args):
@@ -523,6 +525,18 @@ def main():
             continue
         if a.startswith("--output="):
             output_override = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a == "--cli":
+            cli_mode = True
+            i += 1
+            continue
+        if a in ("--su-cmd", "--su") and i + 1 < len(args):
+            su_cmd_override = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--su-cmd="):
+            su_cmd_override = a.split("=", 1)[1]
             i += 1
             continue
         filtered.append(a)
@@ -556,10 +570,33 @@ def main():
         return
     console.print(f"\n[bold]已选择:[/] [cyan]{pkg}[/]\n")
 
-    cfg = gather_config()
+    if cli_mode:
+        # CLI 非交互模式:使用默认最佳配置(stealth2+relaxed,适合二代壳)
+        cfg = {
+            "mode": "dex",
+            "restart": False,
+            "watch": True,
+            "dry_limit": 3,
+            "max_seconds": 120,
+            "max_rounds": 60,
+            "stealth": True,
+            "stealth2": True,
+            "relaxed": True,
+            "anon": False,
+            "region_delay_ms": 2,
+            "su_cmd": su_cmd_override or "kp -c",
+            "output_dir": "./nhdd_output",
+        }
+        console.print("[bold]CLI 模式:[/] stealth2 + relaxed + stealth (二代壳推荐)")
+    else:
+        cfg = gather_config()
+
     if output_override:
         cfg["output_dir"] = output_override
         console.print(f"[green]输出目录(命令行指定):[/] {output_override}")
+    if su_cmd_override:
+        cfg["su_cmd"] = su_cmd_override
+        console.print(f"[green]SU 命令:[/] {su_cmd_override}")
 
     st = run_dump(pkg, cfg)
     if st.processes == 0:

@@ -13,6 +13,9 @@ export namespace main {
 	    maxSeconds: number;
 	    maxRounds: number;
 	    stealth: boolean;
+	    stealth2: boolean;
+	    relaxed: boolean;
+	    anon: boolean;
 	    regionDelayMs: number;
 	
 	    static createFrom(source: any = {}) {
@@ -33,6 +36,9 @@ export namespace main {
 	        this.maxSeconds = source["maxSeconds"];
 	        this.maxRounds = source["maxRounds"];
 	        this.stealth = source["stealth"];
+	        this.stealth2 = source["stealth2"];
+	        this.relaxed = source["relaxed"];
+	        this.anon = source["anon"];
 	        this.regionDelayMs = source["regionDelayMs"];
 	    }
 	}
