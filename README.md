@@ -1,7 +1,7 @@
 # NHDD — No-Hook DEX/SO Dumper
 English | [简体中文](./README.zh-CN.md)
 
-NHDD is an Android **external-memory DEX/SO dumping tool** for authorized reverse engineering, malware analysis, app debugging, and mobile security research. The Android-side scanner, `nhdd`, runs as an independent root process. It reads `/proc/<pid>/maps` and `/proc/<pid>/mem`, scans the target process memory for DEX/ELF magic, and writes resident DEX or SO images to disk.
+NHDD is an Android **external-memory DEX/SO dumping tool** for authorized reverse engineering, malware analysis, app debugging, and mobile security research. The Android-side scanner, `nhdd`, runs as an independent root process. It reads `/proc/<pid>/maps` and `/proc/<pid>/mem` (or uses `process_vm_readv` in stealth2 mode), scans the target process memory for DEX/ELF magic, and writes resident DEX or SO images to disk.
 
 Unlike Frida/Xposed/FART/fdex2-style approaches, NHDD does **not** inject code into the target app, does **not** patch method entries, and does **not** require ART hooks. This reduces exposure to common in-process hook indicators such as injected libraries, suspicious threads, method-entry trampolines, and runtime framework modifications.
 
@@ -21,21 +21,21 @@ NHDD alone is not enough when:
 - CodeItem data is erased, virtualized, or restored only during execution.
 - You need full method-body recovery and backfilling.
 
-For second-generation extraction shells, use NHDD as a **low-intrusion auxiliary scanner**. Full recovery usually requires DefineClass/LoadMethod hooks, CodeItem capture/backfill, or a FART-style pipeline.
+For second-generation extraction shells, use NHDD with `--stealth2 --relaxed` mode. The `--stealth2` flag uses `process_vm_readv(2)` instead of opening `/proc/<pid>/mem`, which avoids detection by packers that monitor file descriptor access. The `--relaxed` flag validates DEX headers by `endian_tag` (0x12345678) and structure rather than relying on the `dex\n` magic that packers may erase. Full method-body recovery usually requires DefineClass/LoadMethod hooks, CodeItem capture/backfill, or a FART-style pipeline.
 
 ## Repository status
 
 | Component | Status | Notes |
 |---|---:|---|
-| `nhdd.c` | Ready | Core Android ARM64 scanner. Supports DEX/SO, package multi-process scanning, snapshots, watch mode, de-duplication, and DEX checksum repair. |
+| `nhdd.c` | Ready | Core Android ARM64 scanner. v8.0: supports DEX/SO, package multi-process scanning, snapshots, watch mode, de-duplication, DEX checksum repair, stealth2 (process_vm_readv), relaxed DEX validation, and anonymous mapping scan. |
 | `nhdd_tui.py` | Recommended | Terminal UI with root-command configuration, watch progress, and result pulling. Best daily entry point in this snapshot. |
 | `gui/` | Wails GUI | Go + Wails v2 desktop GUI with Web frontend. No CGO required. |
 | `fix_dex_checksum.py` | Ready | Standalone DEX header, SHA-1, and Adler32 repair tool. |
 
 ## Features
 
-- **External memory reading**: reads target process memory via `/proc/<pid>/mem`; no target-process injection.
-- **DEX dumping**: scans for `dex\n`, reads DEX `file_size`, and exports data page by page.
+- **External memory reading**: reads target process memory via `/proc/<pid>/mem` or `process_vm_readv(2)` (stealth2); no target-process injection.
+- **DEX dumping**: scans for `dex\n` magic (or `endian_tag` in relaxed mode), reads DEX `file_size`, and exports data page by page.
 - **SO dumping**: scans ELF ET_DYN mappings and optionally repairs dumps with SoFixer.
 - **Package multi-process scan**: when given a package name, scans all matching processes, including `:remote` child processes.
 - **Snapshot mode**: `--snapshot N --interval T` performs repeated fixed-round scans.
@@ -43,7 +43,7 @@ For second-generation extraction shells, use NHDD as a **low-intrusion auxiliary
 - **Content de-duplication**: DEX files are de-duplicated by recomputed SHA-1 signature across processes and scan rounds.
 - **DEX auto-repair**: fixes `file_size`, `header_size`, `endian_tag`, SHA-1 signature, and Adler32 checksum.
 - **Output isolation**: old `.dex/.so` files are removed by default before a run; use `--keep` for incremental runs.
-- **Low-intrusion runtime options**: `--region-delay`, `--stealth`, and `--name` can adjust scan timing and the scanner’s visible process name. These are not detection-bypass guarantees.
+- **Low-intrusion runtime options**: `--region-delay`, `--stealth`, `--stealth2`, `--relaxed`, `--anon`, and `--name` can adjust scan timing, memory access method, DEX validation strategy, and the scanner's visible process name. These are not detection-bypass guarantees.
 
 ## How it works
 
@@ -56,8 +56,10 @@ Target app process
 
 Independent root process: nhdd
 ├── Reads /proc/<pid>/maps
-├── Opens /proc/<pid>/mem
+├── Opens /proc/<pid>/mem  (default mode)
+│   OR uses process_vm_readv(2)  (--stealth2 mode, no fd opened)
 ├── Scans readable pages for DEX/ELF magic
+│   OR scans for endian_tag 0x12345678  (--relaxed mode)
 ├── Computes dump ranges from DEX headers or ELF program headers
 ├── Writes files under out_dir/dex and out_dir/so
 └── Repairs DEX checksums and optionally invokes SoFixer
@@ -157,6 +159,25 @@ adb shell ksud -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dum
 adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
 ```
 
+### 6. Second-generation extraction shells (anti-detection mode)
+
+For packers that detect `/proc/<pid>/mem` being opened and kill the process, use `--stealth2` to read memory via `process_vm_readv(2)` instead. Combine with `--relaxed` for packers that erase DEX magic:
+
+```bash
+adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --stealth2 --relaxed --stealth'
+```
+
+- `--stealth2`: Uses `process_vm_readv(2)` instead of opening `/proc/<pid>/mem`. No file descriptor is created, making it harder for packers to detect memory access.
+- `--relaxed`: Validates DEX headers by `endian_tag` (0x12345678) and header structure, instead of relying on `dex\n` magic that packers may erase.
+- `--anon`: Only scans anonymous memory mappings (no file-backed regions). Useful when DEX is loaded into anonymous mmap regions.
+- `--stealth`: Adds region delay and disguises the scanner process name.
+
+**Tip**: For aggressive packers, scan a single PID instead of the full package name to minimize the detection window:
+
+```bash
+adb shell kp -c '/data/local/tmp/nhdd 12345 /data/local/tmp/nhdd_dump --stealth2 --relaxed --stealth'
+```
+
 ## `nhdd` options
 
 | Option | Description |
@@ -173,6 +194,9 @@ adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump 
 | `--max-seconds S` | Maximum wall time in watch mode. Default: 120. |
 | `--keep` | Do not remove old `.dex/.so` files before scanning. |
 | `--stealth` | Enable a default region delay and a default disguised process name. |
+| `--stealth2` | Use `process_vm_readv(2)` instead of opening `/proc/<pid>/mem`. Avoids FD-based detection by packers. Recommended for second-generation shells. |
+| `--relaxed` | Validate DEX by `endian_tag` (0x12345678) and header structure instead of `dex\n` magic. For packers that erase DEX magic. |
+| `--anon` | Only scan anonymous memory mappings (skip file-backed regions). |
 | `--region-delay MS` | Sleep MS milliseconds between memory map regions. |
 | `--name NAME` / `--disguise NAME` | Change the scanner’s visible `/proc/self/comm` and `/proc/self/cmdline` name. |
 | `--sofixer PATH` | Specify SoFixer path. Defaults to `/data/local/tmp/sofixer` or `/data/local/tmp/SoFixer64`. |
@@ -272,11 +296,18 @@ Common causes:
 - The DEX exists only briefly and a single scan missed it.
 - The real DEX is in a child process, but you passed a single PID.
 - The packer is not a full-resident-DEX model and uses method-level extraction or virtualization.
+- **The packer detected `/proc/<pid>/mem` being opened and killed the process.** Use `--stealth2` mode.
 
 Start with package-name watch mode:
 
 ```bash
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch 3 --max-seconds 120'
+```
+
+If the app crashes during scanning, try anti-detection mode:
+
+```bash
+adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --stealth2 --relaxed --stealth'
 ```
 
 ### Can the Android app module be built directly?

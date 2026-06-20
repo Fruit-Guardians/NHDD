@@ -1,6 +1,6 @@
 # NHDD — No-Hook DEX/SO Dumper
 
-NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存 DEX/SO Dump 工具**。它的核心程序 `nhdd` 以独立 root 进程运行，通过读取目标进程的 `/proc/<pid>/maps` 和 `/proc/<pid>/mem`，在内存中扫描 DEX/ELF magic，并将已加载到内存中的 DEX 或 SO 导出到文件。
+NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存 DEX/SO Dump 工具**。它的核心程序 `nhdd` 以独立 root 进程运行，通过读取目标进程的 `/proc/<pid>/maps` 和 `/proc/<pid>/mem`（或使用 `process_vm_readv` 的 stealth2 模式），在内存中扫描 DEX/ELF magic，并将已加载到内存中的 DEX 或 SO 导出到文件。
 
 和 Frida/Xposed/FART/fdex2 这类"进程内 Hook/注入"路线不同，NHDD 的核心思路是：**不向目标 App 注入代码，不修改目标进程方法入口，不依赖 ART Hook**。这可以显著降低由进程内 Hook、注入库、异常线程名、方法入口跳转等特征带来的暴露面。
 
@@ -20,21 +20,21 @@ NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存
 - DEX 结构存在大量空洞、方法体被擦除、仅动态恢复指令的场景。
 - 需要完整方法体回填、ClassLinker/LoadMethod 级别采集的场景。
 
-对于二代抽取壳，NHDD 更适合作为 **低侵入辅助扫描器**，用来捕获已经驻留内存的 DEX/SO；完整恢复通常还需要 DefineClass、LoadMethod、CodeItem backfill 或 FART 类流水线配合。
+对于二代抽取壳，建议使用 `--stealth2 --relaxed` 模式。`--stealth2` 使用 `process_vm_readv(2)` 替代打开 `/proc/<pid>/mem`，避免壳通过监控文件描述符检测到内存访问；`--relaxed` 通过 `endian_tag` (0x12345678) 和 header 结构验证 DEX，不依赖被壳抹除的 `dex\n` magic。完整方法体恢复通常还需要 DefineClass、LoadMethod、CodeItem backfill 或 FART 类流水线配合。
 
 ## 当前仓库状态
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| `nhdd.c` | 可用 | 核心 Android ARM64 扫描器，支持 DEX/SO、包名多进程、快照、watch、去重、DEX 校验修复。 |
+| `nhdd.c` | 可用 | 核心 Android ARM64 扫描器 v8.0，支持 DEX/SO、包名多进程、快照、watch、去重、DEX 校验修复、stealth2 (process_vm_readv)、relaxed DEX 验证、匿名映射扫描。 |
 | `nhdd_tui.py` | 推荐 | 终端交互版，支持 root 命令配置、watch 实时进度、拉取结果。当前最适合作为日常入口。 |
 | `gui/` | Wails GUI | Go + Wails v2 桌面 GUI，Web 前端，不需要 CGO。 |
 | `fix_dex_checksum.py` | 可用 | 独立 DEX header、SHA-1、Adler32 修复工具。 |
 
 ## 核心特性
 
-- **外部读取**：通过 `/proc/<pid>/mem` 读取目标虚拟地址空间，不注入目标进程。
-- **DEX dump**：扫描 `dex\n` magic，读取 header 中的 `file_size` 并按页导出。
+- **外部读取**：通过 `/proc/<pid>/mem` 或 `process_vm_readv(2)` (stealth2) 读取目标虚拟地址空间，不注入目标进程。
+- **DEX dump**：扫描 `dex\n` magic（或 relaxed 模式下的 endian_tag），读取 header 中的 `file_size` 并按页导出。
 - **SO dump**：扫描 ELF magic，识别 ET_DYN，共享库导出后可调用 SoFixer 修复。
 - **包名多进程扫描**：传入包名时，会扫描所有 cmdline 匹配的进程，包括 `:remote` 等子进程。
 - **快照轮询**：`--snapshot N --interval T` 多轮扫描，适合捕获短暂存在的 DEX。
@@ -42,7 +42,7 @@ NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存
 - **内容去重**：DEX 按重算后的 SHA-1 signature 去重，跨进程、跨轮次重复命中不会重复写入。
 - **DEX 自动修复**：修复 `file_size`、`header_size`、`endian_tag`、SHA-1 signature 和 Adler32 checksum。
 - **输出隔离**：默认清理旧的 `.dex/.so` 输出，避免多次运行结果混在一起；可用 `--keep` 保留。
-- **低侵入运行选项**：`--region-delay`、`--stealth`、`--name` 可调整扫描节奏和自身进程名，但不保证规避所有检测。
+- **低侵入运行选项**：`--region-delay`、`--stealth`、`--stealth2`、`--relaxed`、`--anon`、`--name` 可调整扫描节奏、内存访问方式、DEX 验证策略和自身进程名，但不保证规避所有检测。
 
 ## 原理概览
 
@@ -55,8 +55,10 @@ NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存
 
 独立 root 进程：nhdd
 ├── 读取 /proc/<pid>/maps 获取可读内存区间
-├── 打开 /proc/<pid>/mem
+├── 打开 /proc/<pid>/mem  (默认模式)
+│   或使用 process_vm_readv(2)  (--stealth2 模式，不打开 fd)
 ├── 按页扫描 DEX/ELF magic
+│   或扫描 endian_tag 0x12345678  (--relaxed 模式)
 ├── 根据 DEX header 或 ELF program header 计算导出范围
 ├── 写入 out_dir/dex 或 out_dir/so
 └── 修复 DEX header/checksum，必要时调用 SoFixer
@@ -156,6 +158,25 @@ adb shell ksud -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dum
 adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
 ```
 
+### 6. 二代抽取壳（反检测模式）
+
+对于检测 `/proc/<pid>/mem` 被打开后杀死进程的壳，使用 `--stealth2` 通过 `process_vm_readv(2)` 读取内存，不需要打开 mem 文件。配合 `--relaxed` 处理壳抹除 DEX magic 的情况：
+
+```bash
+adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --stealth2 --relaxed --stealth'
+```
+
+- `--stealth2`：使用 `process_vm_readv(2)` 替代打开 `/proc/<pid>/mem`，不创建文件描述符，壳更难检测到内存访问。
+- `--relaxed`：通过 `endian_tag` (0x12345678) 和 header 结构验证 DEX，不依赖被壳抹除的 `dex\n` magic。
+- `--anon`：仅扫描匿名内存映射（跳过有文件路径的映射），适用于 DEX 被加载到匿名 mmap 区域的场景。
+- `--stealth`：添加区域间延时和伪装扫描器进程名。
+
+**技巧**：对于强对抗壳，扫描单个 PID 而非包名可以缩小检测窗口：
+
+```bash
+adb shell kp -c '/data/local/tmp/nhdd 12345 /data/local/tmp/nhdd_dump --stealth2 --relaxed --stealth'
+```
+
 ## `nhdd` 参数
 
 | 参数 | 说明 |
@@ -172,6 +193,9 @@ adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump 
 | `--max-seconds S` | watch 最大运行秒数，默认 120。 |
 | `--keep` | 不清理输出目录中旧的 `.dex/.so`。 |
 | `--stealth` | 启用默认区域延时，并使用默认伪装进程名。 |
+| `--stealth2` | 使用 `process_vm_readv(2)` 替代打开 `/proc/<pid>/mem`，避免壳通过 FD 检测到内存访问。二代壳推荐。 |
+| `--relaxed` | 通过 `endian_tag` (0x12345678) 和 header 结构验证 DEX，不依赖被壳抹除的 `dex\n` magic。 |
+| `--anon` | 仅扫描匿名内存映射（跳过有文件路径的映射）。 |
 | `--region-delay MS` | 每个 maps 区域之间延迟 MS 毫秒。 |
 | `--name NAME` / `--disguise NAME` | 修改自身 `/proc/self/comm` 和 `/proc/self/cmdline` 展示名。 |
 | `--sofixer PATH` | 指定 SoFixer 路径，默认查找 `/data/local/tmp/sofixer` 或 `/data/local/tmp/SoFixer64`。 |
@@ -271,11 +295,18 @@ adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump 
 - 目标 DEX 只短暂存在，单轮扫描错过了时机。
 - 真实 DEX 在子进程，但你传入了单个 PID。
 - 壳不是"完整 DEX 驻留内存"模型，而是方法级抽取/动态恢复。
+- **壳检测到 `/proc/<pid>/mem` 被打开后杀死了进程。** 使用 `--stealth2` 模式。
 
 建议先用包名 + watch：
 
 ```bash
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch 3 --max-seconds 120'
+```
+
+如果扫描时 App 崩溃，尝试反检测模式：
+
+```bash
+adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --stealth2 --relaxed --stealth'
 ```
 
 ### 5. Android App 能直接编译吗？

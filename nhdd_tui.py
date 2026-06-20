@@ -53,7 +53,7 @@ except ImportError:
 ADB = os.environ.get("NHDD_ADB", "adb")
 NHDD_BIN = "/data/local/tmp/nhdd"
 DEVICE_DUMP_DIR = "/data/local/tmp/nhdd_tui"
-VERSION = "6.0"
+VERSION = "8.0"
 console = Console()
 
 # 方块大字 logo (figlet ansi_shadow 字体,权威生成,确保 NHDD 正确)
@@ -66,7 +66,7 @@ LOGO = r"""
 ╚═╝  ╚═══╝╚═╝  ╚═╝╚═════╝ ╚═════╝
 """
 
-TAGLINE = "No-Hook DEX/SO Dumper   ·   无注入 · 零检测 · 一代壳"
+TAGLINE = "No-Hook DEX/SO Dumper   ·   无注入 · 反检测 · 一二代壳"
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +216,9 @@ def gather_config():
         "max_seconds": 120,
         "max_rounds": 60,
         "stealth": False,
+        "stealth2": False,
+        "relaxed": False,
+        "anon": False,
         "region_delay_ms": 0,
         "su_cmd": "",
         "output_dir": "./nhdd_output",
@@ -227,6 +230,12 @@ def gather_config():
     cfg["stealth"] = stealth
     if stealth:
         cfg["region_delay_ms"] = IntPrompt.ask("  区域延时 (ms)", default=2)
+    stealth2 = Confirm.ask("启用 stealth2(process_vm_readv 反检测,二代壳推荐)", default=False)
+    cfg["stealth2"] = stealth2
+    relaxed = Confirm.ask("启用 relaxed(宽松 DEX 验证,不依赖 magic,二代壳推荐)", default=False)
+    cfg["relaxed"] = relaxed
+    anon = Confirm.ask("启用 anon(仅扫描匿名内存映射)", default=False)
+    cfg["anon"] = anon
     su = Prompt.ask("SU 命令(读其他进程内存需要 root:留空=普通shell 或 su -c / ksud -c / kp -c)",
                     default="su -c")
     cfg["su_cmd"] = su.strip()
@@ -251,6 +260,12 @@ def build_nhdd_cmd(pkg, cfg):
         parts += ["--stealth"]
         if cfg["region_delay_ms"]:
             parts += ["--region-delay", str(cfg["region_delay_ms"])]
+    if cfg.get("stealth2"):
+        parts += ["--stealth2"]
+    if cfg.get("relaxed"):
+        parts += ["--relaxed"]
+    if cfg.get("anon"):
+        parts += ["--anon"]
     nhdd_cmd = " ".join(parts)
     # 包装到 root shell
     if cfg["su_cmd"]:
