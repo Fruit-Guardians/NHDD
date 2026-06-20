@@ -1,4 +1,5 @@
 # NHDD — No-Hook DEX/SO Dumper
+English | [简体中文](./README.zh-CN.md)
 
 NHDD is an Android **external-memory DEX/SO dumping tool** for authorized reverse engineering, malware analysis, app debugging, and mobile security research. The Android-side scanner, `nhdd`, runs as an independent root process. It reads `/proc/<pid>/maps` and `/proc/<pid>/mem`, scans the target process memory for DEX/ELF magic, and writes resident DEX or SO images to disk.
 
