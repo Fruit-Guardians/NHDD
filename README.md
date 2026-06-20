@@ -1,6 +1,7 @@
 # NHDD — No-Hook DEX/SO Dumper
 
 **无需注入、无需 Hook 的 Android DEX/SO 内存脱壳工具**
+
 已在一加lineage OS 21 ，pixel的安卓14，安卓16版本测试过，其他手机及型号未测试，不过理论上都是可行的，只要手机能root
 
 nhdd 以独立 root 进程运行，通过读取 `/proc/<pid>/mem` 直接扫描目标进程内存，找到 DEX/SO 文件并 dump。由于不注入任何代码到目标进程，加固方案无法检测到脱壳行为。
