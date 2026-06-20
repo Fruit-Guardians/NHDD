@@ -271,15 +271,6 @@ cd gui && ./nhdd-gui
 
 不同加固方案的卸载时机不同，建议 3-5 秒之间测试。
 
-## 邦邦加固 (KADP) 特殊处理
-
-邦邦加固是最难脱的壳之一，其防护机制：
-
-1. **替换 ClassLoader** — 运行时动态解密 DEX
-2. **UniverseSecNo2 安全检查** — 检测 hook 和异常内存映射
-3. **dlclose 卸载策略** — 解密执行后立即 dlclose SO 和 DEX
-4. **/proc/PID/mem 读取检测** — 监控 mem 文件描述符访问（间歇性）
-
 NHDD 的应对：
 - **不注入** → 不触发 hook 检测
 - **4 秒时机** → 在 dlclose 之前 dump
@@ -386,7 +377,7 @@ MIT
 
 ## 作者与免责声明
 
-- 作者：漫宿骄盛
+- 作者：漫宿骄盛，weixiao
 - GitHub：https://github.com/mansujiaosheng/NHDD
 
 免责声明：本工具仅用于合法授权的安全研究、逆向分析与自有应用调试。使用者需确保已取得目标应用和设备授权。作者不对任何未授权使用、数据泄露、业务损失或法律责任负责。
