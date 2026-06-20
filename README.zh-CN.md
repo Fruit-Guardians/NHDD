@@ -328,6 +328,13 @@ NHDD/
 └── BUILD_WINDOWS.md               # Windows/Linux GUI 构建说明
 ```
 
+## 作者
+
+- **漫宿骄盛**
+- **weixiao**
+
+仓库地址：https://github.com/mansujiaosheng/NHDD
+
 ## 合法使用声明
 
 本项目仅用于：

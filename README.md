@@ -329,6 +329,13 @@ NHDD/
 └── BUILD_WINDOWS.md               # Windows/Linux GUI build notes
 ```
 
+## Authors
+
+- **漫宿骄盛**
+- **weixiao**
+
+Repository: https://github.com/mansujiaosheng/NHDD
+
 ## Authorized use only
 
 This project is intended for:
