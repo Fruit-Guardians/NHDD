@@ -34,6 +34,16 @@ func FixDexFile(path string) (bool, bool, error) {
 		return false, true, fmt.Errorf("not a DEX file, deleted")
 	}
 
+	// 深度验证：检查 map_list 和 section bounds
+	if !validateDexDeep(data) {
+		// map_list 或 section 损坏，移到 invalid 子目录
+		invalidDir := filepath.Join(filepath.Dir(path), "invalid")
+		os.MkdirAll(invalidDir, 0755)
+		newPath := filepath.Join(invalidDir, filepath.Base(path))
+		os.Rename(path, newPath)
+		return false, true, fmt.Errorf("invalid DEX (map_list/section corrupted), moved to invalid/")
+	}
+
 	fixed := false
 
 	headerSize := binary.LittleEndian.Uint32(data[0x24:0x28])
@@ -137,5 +147,57 @@ func equalBytes(a, b []byte) bool {
 			return false
 		}
 	}
+	return true
+}
+
+// validateDexDeep 深度验证 DEX 文件结构
+func validateDexDeep(data []byte) bool {
+	realSize := uint32(len(data))
+	if realSize < dexHeaderSize {
+		return false
+	}
+
+	// 检查 map_list
+	mapOff := binary.LittleEndian.Uint32(data[0x34:0x38])
+	if mapOff < dexHeaderSize || mapOff >= realSize {
+		return false
+	}
+
+	// 检查 map_size 合理性
+	mapSize := binary.LittleEndian.Uint32(data[mapOff : mapOff+4])
+	if mapSize > 50 {
+		return false // 正常 DEX map_list 不超过 ~20 个条目
+	}
+
+	mapEnd := mapOff + 4 + mapSize*12
+	if mapEnd > realSize {
+		return false
+	}
+
+	// 检查关键 section 偏移是否越界
+	sections := []struct {
+		name   string
+		offOff uint32
+	}{
+		{"string_ids", 0x3C},
+		{"type_ids", 0x44},
+		{"proto_ids", 0x4C},
+		{"field_ids", 0x54},
+		{"method_ids", 0x5C},
+		{"class_defs", 0x64},
+	}
+	for _, sec := range sections {
+		secOff := binary.LittleEndian.Uint32(data[sec.offOff : sec.offOff+4])
+		secSize := binary.LittleEndian.Uint32(data[sec.offOff+4 : sec.offOff+8])
+		if secOff > 0 && secOff+secSize > realSize {
+			return false
+		}
+	}
+
+	// 检查异常大文件（> 64MB 可能是多个 DEX 拼接）
+	if realSize > 64*1024*1024 {
+		return false
+	}
+
 	return true
 }
