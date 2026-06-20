@@ -36,12 +36,22 @@ func FixDexFile(path string) (bool, bool, error) {
 
 	// 深度验证：检查 map_list 和 section bounds
 	if !validateDexDeep(data) {
-		// map_list 或 section 损坏，移到 invalid 子目录
-		invalidDir := filepath.Join(filepath.Dir(path), "invalid")
-		os.MkdirAll(invalidDir, 0755)
-		newPath := filepath.Join(invalidDir, filepath.Base(path))
-		os.Rename(path, newPath)
-		return false, true, fmt.Errorf("invalid DEX (map_list/section corrupted), moved to invalid/")
+		// 尝试重建 map_list
+		if newData := RebuildMapList(data); newData != nil {
+			data = newData
+			// 重建后重新验证
+			if !validateDexDeep(data) {
+				os.Remove(path)
+				return false, true, fmt.Errorf("still invalid after map_list rebuild, deleted")
+			}
+		} else {
+			// 无法修复，移到 invalid/ 子目录
+			invalidDir := filepath.Join(filepath.Dir(path), "invalid")
+			os.MkdirAll(invalidDir, 0755)
+			newPath := filepath.Join(invalidDir, filepath.Base(path))
+			os.Rename(path, newPath)
+			return false, true, fmt.Errorf("invalid DEX (map_list/section corrupted), moved to invalid/")
+		}
 	}
 
 	fixed := false
@@ -314,4 +324,107 @@ func validateDexDeep(data []byte) bool {
 	}
 
 	return true
+}
+
+// DEX map_list type constants
+const (
+	dexTypeHeaderItem   = 0x0000
+	dexTypeStringIdItem = 0x0001
+	dexTypeTypeIdItem   = 0x0002
+	dexTypeProtoIdItem  = 0x0003
+	dexTypeFieldIdItem  = 0x0004
+	dexTypeMethodIdItem = 0x0005
+	dexTypeClassDefItem = 0x0006
+	dexTypeMapList      = 0x1000
+)
+
+// mapEntry represents a single map_list entry
+type mapEntry struct {
+	typ   uint16
+	off   uint32
+	count uint32
+}
+
+// RebuildMapList 从 section headers 重建 map_list
+// 返回新的 data 切片，如果无法重建则返回 nil
+func RebuildMapList(data []byte) []byte {
+	realSize := uint32(len(data))
+	if realSize < dexHeaderSize {
+		return nil
+	}
+
+	// 收集 section 信息
+	var entries []mapEntry
+	entries = append(entries, mapEntry{dexTypeHeaderItem, 0, dexHeaderSize})
+
+	sections := []struct {
+		typ     uint16
+		sizeOff uint32
+		offOff  uint32
+	}{
+		{dexTypeStringIdItem, 0x38, 0x3C},
+		{dexTypeTypeIdItem, 0x40, 0x44},
+		{dexTypeProtoIdItem, 0x48, 0x4C},
+		{dexTypeFieldIdItem, 0x50, 0x54},
+		{dexTypeMethodIdItem, 0x58, 0x5C},
+		{dexTypeClassDefItem, 0x60, 0x64},
+	}
+
+	for _, s := range sections {
+		secSize := binary.LittleEndian.Uint32(data[s.sizeOff : s.sizeOff+4])
+		secOff := binary.LittleEndian.Uint32(data[s.offOff : s.offOff+4])
+		if secSize > 0 && secOff > 0 && secOff < realSize {
+			entries = append(entries, mapEntry{s.typ, secOff, secSize})
+		}
+	}
+
+	dataSectionSize := binary.LittleEndian.Uint32(data[0x68:0x6C])
+	dataSectionOff := binary.LittleEndian.Uint32(data[0x6C:0x70])
+	if dataSectionSize > 0 && dataSectionOff > 0 && dataSectionOff < realSize {
+		entries = append(entries, mapEntry{dexTypeMapList, dataSectionOff, 0})
+	}
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// 按 offset 排序
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[i].off > entries[j].off {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+
+	mapListSize := 4 + len(entries)*12
+	oldMapOff := binary.LittleEndian.Uint32(data[0x34:0x38])
+
+	var mapOff uint32
+	if oldMapOff >= dexHeaderSize && oldMapOff+uint32(mapListSize) <= realSize {
+		mapOff = oldMapOff
+	} else {
+		// 追加到文件末尾
+		mapOff = realSize
+		newData := make([]byte, realSize+uint32(mapListSize))
+		copy(newData, data)
+		data = newData
+		binary.LittleEndian.PutUint32(data[0x20:0x24], uint32(len(data)))
+	}
+
+	// 写入 map_list
+	binary.LittleEndian.PutUint32(data[mapOff:mapOff+4], uint32(len(entries)))
+	for i, e := range entries {
+		base := mapOff + 4 + uint32(i)*12
+		binary.LittleEndian.PutUint16(data[base:base+2], e.typ)
+		// unused (2 bytes) = 0
+		binary.LittleEndian.PutUint16(data[base+2:base+4], 0)
+		binary.LittleEndian.PutUint32(data[base+4:base+8], e.count)
+		binary.LittleEndian.PutUint32(data[base+8:base+12], e.off)
+	}
+
+	// 更新 header 中的 map_off
+	binary.LittleEndian.PutUint32(data[0x34:0x38], mapOff)
+
+	return data
 }

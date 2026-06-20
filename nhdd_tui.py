@@ -501,7 +501,20 @@ def auto_classify_and_fix(dex_dir, local_dir):
                 if status == "fixed":
                     stats["fixed"] += 1
                     stats["repairable"] -= 1
-                    stats["ok"] += 1
+                    # 修复后重新分类
+                    cat2, r2, _ = fix_mod.classify_dex_full(fp)
+                    if cat2 == "jadx-ready":
+                        stats["ok"] += 1
+                    else:
+                        stats["bad"] += 1
+                        bad_files.append((name, f"fix_failed: {r2}"))
+                        # 移回 bad 目录
+                        bad_dir = os.path.join(dex_dir, "bad")
+                        os.makedirs(bad_dir, exist_ok=True)
+                        try:
+                            os.rename(fp, os.path.join(bad_dir, name))
+                        except OSError:
+                            pass
             except Exception:
                 pass
 
@@ -525,10 +538,11 @@ def auto_classify_and_fix(dex_dir, local_dir):
     ct.add_column("数量", style="cyan")
     ct.add_column("说明", style="dim")
     ct.add_row("[green]OK[/]", str(stats["ok"]), "通过所有校验，可直接反编译")
-    if stats["fixed"]:
-        ct.add_row("[yellow]FIXED[/]", str(stats["fixed"]), "已自动修复 (map_list / header)")
     if stats["bad"]:
-        ct.add_row("[red]BAD[/]", str(stats["bad"]), "结构损坏，已移至 bad/ 目录")
+        fixed_note = ""
+        if stats["fixed"]:
+            fixed_note = f" (已尝试修复 {stats['fixed']} 个，map_list 已重建但内容仍损坏)"
+        ct.add_row("[red]BAD[/]", str(stats["bad"]), "结构损坏，已移至 bad/ 目录" + fixed_note)
     ct.add_row("[bold]总计[/]", str(stats["total"]), "")
     console.print()
     console.print(ct)

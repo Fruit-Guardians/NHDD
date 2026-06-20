@@ -460,28 +460,32 @@ def classify_dex_full(path):
         header_issues.append(f"SIZE_MISMATCH")
 
     # --- 3. map_list 校验 ---
+    # map_list 是派生数据，始终可以从 section headers 重建
     map_off = u32(data, 0x34)
     map_repairable = False
     if map_off < DEX_HEADER_SIZE or map_off >= real_size:
         header_issues.append(f"MAP_OFF_INVALID=0x{map_off:X}")
+        map_repairable = True
     else:
         try:
             map_size = u32(data, map_off)
-            # map_size 过大说明 map_off 指向垃圾数据，不可修复
             if map_size > 10000:
                 header_issues.append(f"MAP_SIZE_CORRUPT={map_size}")
+                map_repairable = True
             elif map_size == 0:
                 header_issues.append("MAP_SIZE_ZERO")
-            elif map_size > 50:
-                header_issues.append(f"MAP_SIZE_SUSPICIOUS={map_size}")
                 map_repairable = True
-            map_end = map_off + 4 + map_size * 12
-            if map_end > real_size:
-                header_issues.append(f"MAP_LIST_OOB")
-                if map_size <= 10000:
+            else:
+                map_end = map_off + 4 + map_size * 12
+                if map_end > real_size:
+                    header_issues.append(f"MAP_LIST_OOB")
+                    map_repairable = True
+                elif map_size > 50:
+                    header_issues.append(f"MAP_SIZE_SUSPICIOUS={map_size}")
                     map_repairable = True
         except:
             header_issues.append("MAP_READ_ERROR")
+            map_repairable = True
 
     # --- 4. section 表级越界 (检查表的字节大小，不是条目数) ---
     sections = [
@@ -522,6 +526,10 @@ def classify_dex_full(path):
     # --- 5. item 级深度校验 ---
     all_pass, deep_issues, details = validate_deep_item_level(data)
     if not all_pass:
+        # 纯 map 问题始终可修复（map_list 可从 section headers 重建）
+        map_only = all('MAP' in issue for issue in deep_issues)
+        if map_only:
+            return "repairable", f"deep_issues: {'; '.join(deep_issues[:2])}", {"repair_type": "map_list"}
         # 检查是否可修复
         can_repair, repair_reason, repair_type = assess_repairability(data)
         if can_repair:
