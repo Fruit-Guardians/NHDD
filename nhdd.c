@@ -34,10 +34,14 @@
 #include <sys/stat.h>
 #include <sys/prctl.h>
 #include <errno.h>
+#include <sys/uio.h>    // process_vm_readv
 
 // ---- Magic constants ----
 static const uint8_t kDexMagic[] = {0x64, 0x65, 0x78, 0x0a}; // "dex\n"
 static const uint8_t kElfMagic[] = {0x7f, 0x45, 0x4c, 0x46}; // \x7fELF
+// DEX endian_tag at offset 0x28 — always 0x12345678 for a valid DEX.
+// Second-gen packers often erase the "dex\n" magic but rarely touch this.
+static const uint32_t kDexEndianTag = 0x12345678;
 
 // ---- Dump mode ----
 #define MODE_DEX 1
@@ -102,6 +106,9 @@ static void so_path_remember(const char *path) {
 
 // ---- Scan configuration (set in main, read by scan_pid) ----
 static int g_region_delay_us = 0;  // usleep between regions (stealth mode)
+static int g_relaxed = 0;          // --relaxed: scan for DEX without magic (endian_tag based)
+static int g_anon_only = 0;        // --anon: only scan anonymous mappings (faster, less crash-prone)
+static int g_use_vm_readv = 0;     // --stealth2: use process_vm_readv instead of /proc/pid/mem
 
 // pread with EINTR retry. Returns total bytes read into buf (<=want), or -1 on
 // hard error before any byte. Avoids treating a transient signal as EOF.
@@ -112,6 +119,26 @@ static ssize_t pread_retry(int fd, void *buf, size_t want, off_t off) {
         if (r > 0) { got += (size_t)r; continue; }
         if (r < 0 && errno == EINTR) continue;
         break;  // r==0 (EOF/hole) or hard error
+    }
+    return (ssize_t)got;
+}
+
+// Read remote process memory via process_vm_readv(2).
+// Does NOT require opening /proc/<pid>/mem — much harder for packers to detect.
+// Returns bytes read, or -1 on error.
+static ssize_t vm_readv_retry(pid_t pid, void *buf, size_t want, uintptr_t remote_addr) {
+    struct iovec local = { .iov_base = buf, .iov_len = want };
+    struct iovec remote = { .iov_base = (void *)remote_addr, .iov_len = want };
+    size_t got = 0;
+    while (got < want) {
+        local.iov_base = (char *)buf + got;
+        local.iov_len = want - got;
+        remote.iov_base = (void *)(remote_addr + got);
+        remote.iov_len = want - got;
+        ssize_t r = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+        if (r > 0) { got += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        break;
     }
     return (ssize_t)got;
 }
@@ -147,6 +174,77 @@ static int dex_hit_valid(const uint8_t *buf, size_t n, size_t magic_off, uint32_
     if (class_defs_off >= dex_size) return 0;
 
     *out_size = dex_size;
+    return 1;
+}
+
+// Validate a DEX header by structural features alone (no magic required).
+// Used for second-gen extraction shells that erase the "dex\n" magic.
+// Checks: endian_tag == 0x12345678, header_size == 0x70, file_size sane,
+// key section offsets within file, section counts reasonable.
+// DEX header layout (from art/libdexfile/dex/dex_file.h):
+//   0x00 magic[8], 0x08 checksum, 0x0C signature[20],
+//   0x20 file_size, 0x24 header_size, 0x28 endian_tag,
+//   0x2C link_size, 0x30 link_off, 0x34 map_off,
+//   0x38 string_ids_size, 0x3C string_ids_off,
+//   0x40 type_ids_size,   0x44 type_ids_off,
+//   0x48 proto_ids_size,  0x4C proto_ids_off,
+//   0x50 field_ids_size,  0x54 field_ids_off,
+//   0x58 method_ids_size, 0x5C method_ids_off,
+//   0x60 class_defs_size, 0x64 class_defs_off,
+//   0x68 data_size,       0x6C data_off
+static int dex_header_relaxed_valid(const uint8_t *hdr, size_t hdr_len, uint32_t *out_size) {
+    if (hdr_len < 0x70) return 0;
+
+    // endian_tag at offset 0x28 must be 0x12345678
+    uint32_t endian_tag = 0;
+    memcpy(&endian_tag, hdr + 0x28, 4);
+    if (endian_tag != kDexEndianTag) return 0;
+
+    // header_size at offset 0x24 must be 0x70
+    uint32_t header_size = 0;
+    memcpy(&header_size, hdr + 0x24, 4);
+    if (header_size != 0x70) return 0;
+
+    // file_size at offset 0x20 must be reasonable
+    uint32_t file_size = 0;
+    memcpy(&file_size, hdr + 0x20, 4);
+    if (file_size < 0x70 || file_size > 0x10000000) return 0;
+
+    // Read key section fields
+    uint32_t string_ids_size = 0, string_ids_off = 0;
+    uint32_t type_ids_size = 0,   type_ids_off = 0;
+    uint32_t method_ids_size = 0, method_ids_off = 0;
+    uint32_t class_defs_size = 0, class_defs_off = 0;
+    uint32_t data_size = 0,       data_off = 0;
+    memcpy(&string_ids_size, hdr + 0x38, 4);
+    memcpy(&string_ids_off,  hdr + 0x3C, 4);
+    memcpy(&type_ids_size,   hdr + 0x40, 4);
+    memcpy(&type_ids_off,    hdr + 0x44, 4);
+    memcpy(&method_ids_size, hdr + 0x58, 4);
+    memcpy(&method_ids_off,  hdr + 0x5C, 4);
+    memcpy(&class_defs_size, hdr + 0x60, 4);
+    memcpy(&class_defs_off,  hdr + 0x64, 4);
+    memcpy(&data_size,       hdr + 0x68, 4);
+    memcpy(&data_off,        hdr + 0x6C, 4);
+
+    // class_defs must be present — a DEX without classes is useless
+    if (class_defs_size == 0) return 0;
+    if (class_defs_off == 0 || class_defs_off >= file_size) return 0;
+
+    // class_defs occupy class_defs_size * 32 bytes, must fit in file
+    uint32_t class_defs_bytes = class_defs_size * 32;
+    if (class_defs_off + class_defs_bytes > file_size) return 0;
+
+    // string_ids and type_ids offsets must be within file (if present)
+    if (string_ids_off != 0 && string_ids_off >= file_size) return 0;
+    if (type_ids_off != 0 && type_ids_off >= file_size) return 0;
+
+    // data section should fit within file (if present)
+    if (data_off != 0 && data_size != 0) {
+        if (data_off >= file_size || data_off + data_size > file_size) return 0;
+    }
+
+    *out_size = file_size;
     return 1;
 }
 
@@ -432,17 +530,37 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
         fprintf(stderr, "[-] PID %s (%s): process gone (cannot read maps)\n", pid, pkg);
         return 0;
     }
-    char path[256];
-    snprintf(path, sizeof(path), "/proc/%s/mem", pid);
-    int mem_fd = open(path, O_RDONLY);
-    if (mem_fd < 0) {
-        fprintf(stderr, "[-] PID %s (%s): process gone (cannot open mem): %s\n", pid, pkg, strerror(errno));
-        free_maps(ml);
-        return 0;
+
+    pid_t target_pid = (pid_t)atoi(pid);
+    int mem_fd = -1;
+
+    // --stealth2: use process_vm_readv instead of /proc/pid/mem
+    // This avoids opening the mem file, which packers can detect via /proc/self/fd.
+    if (!g_use_vm_readv) {
+        char path[256];
+        snprintf(path, sizeof(path), "/proc/%s/mem", pid);
+        mem_fd = open(path, O_RDONLY);
+        if (mem_fd < 0) {
+            fprintf(stderr, "[-] PID %s (%s): cannot open mem: %s\n", pid, pkg, strerror(errno));
+            free_maps(ml);
+            return 0;
+        }
     }
 
+    // Helper macro: read remote memory using the selected method
+    #define READ_REMOTE(buf, size, addr) ({ \
+        ssize_t _rr; \
+        if (g_use_vm_readv) { \
+            _rr = vm_readv_retry(target_pid, (buf), (size), (addr)); \
+        } else { \
+            _rr = pread_retry(mem_fd, (buf), (size), (off_t)(addr)); \
+        } \
+        _rr; \
+    })
+
     c->procs++;
-    fprintf(stderr, "[*] Scanning PID %s (%s): %zu regions\n", pid, pkg, ml->count);
+    fprintf(stderr, "[*] Scanning PID %s (%s): %zu regions%s\n", pid, pkg, ml->count,
+            g_use_vm_readv ? " (stealth2: vm_readv)" : "");
 
     uint8_t buf[4096];
     // Per-PID SO base de-dup (same base within one process is the same SO).
@@ -457,15 +575,19 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
         size_t region_size = r->end - r->start;
         if (region_size < 64 || region_size > 0x40000000) continue;
 
+        // --anon: skip regions backed by a file (system libs, OAT, VDEX, etc.)
+        // DEX loaded by packers is almost always in anonymous memory.
+        if (g_anon_only && r->path[0] != '\0') continue;
+
         // Stealth: brief pause between regions to look less like bulk extraction.
         if (g_region_delay_us > 0) usleep((useconds_t)g_region_delay_us);
 
         for (uintptr_t addr = r->start; addr < r->end; addr += 4096) {
-            ssize_t n = pread_retry(mem_fd, buf, sizeof(buf), (off_t)addr);
+            ssize_t n = READ_REMOTE(buf, sizeof(buf), addr);
             if (n < 64) continue;
 
             for (int i = 0; i <= n - 4; i++) {
-                // ---- DEX scanning ----
+                // ---- DEX scanning (standard: "dex\n" magic) ----
                 if ((mode & MODE_DEX) && memcmp(buf + i, kDexMagic, 4) == 0) {
                     uintptr_t dex_addr = addr + i;
 
@@ -475,7 +597,7 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                     if (!dex_hit_valid(buf, (size_t)n, (size_t)i, &dex_size)) {
                         // Header may cross the page; re-read a full 0x70 header.
                         uint8_t hdr[0x70];
-                        if (pread_retry(mem_fd, hdr, 0x70, (off_t)dex_addr) == 0x70) {
+                        if (READ_REMOTE(hdr, 0x70, dex_addr) == 0x70) {
                             if (dex_hit_valid(hdr, 0x70, 0, &dex_size)) goto dex_accept;
                         }
                         continue;
@@ -499,7 +621,7 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                     for (size_t off = 0; off < dex_size; off += 4096) {
                         size_t todo = dex_size - off;
                         if (todo > 4096) todo = 4096;
-                        ssize_t rr = pread_retry(mem_fd, dex_data + off, todo, (off_t)(dex_addr + off));
+                        ssize_t rr = READ_REMOTE(dex_data + off, todo, dex_addr + off);
                         if (rr > 0) {
                             readable_total += (size_t)rr;
                             if ((size_t)rr < todo) missing_pages++;
@@ -563,7 +685,7 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                     if (already) continue;
 
                     uint8_t elf_hdr[64];
-                    if (pread(mem_fd, elf_hdr, 64, (off_t)elf_addr) < 64) continue;
+                    if (READ_REMOTE(elf_hdr, 64, elf_addr) < 64) continue;
 
                     int is_64 = (elf_hdr[4] == 2);
                     if (elf_hdr[4] != 1 && elf_hdr[4] != 2) continue;
@@ -595,7 +717,7 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                         uint64_t max_addr = 0;
                         for (int p = 0; p < e_phnum && p < 32; p++) {
                             uint8_t phdr[56];
-                            if (pread(mem_fd, phdr, 56, (off_t)(elf_addr + e_phoff + p * e_phentsize)) < 56) break;
+                            if (READ_REMOTE(phdr, 56, elf_addr + e_phoff + p * e_phentsize) < 56) break;
                             uint32_t p_type = 0;
                             memcpy(&p_type, phdr, 4);
                             if (p_type != 1) continue;
@@ -614,7 +736,7 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                         uint32_t max_addr = 0;
                         for (int p = 0; p < e_phnum && p < 32; p++) {
                             uint8_t phdr[32];
-                            if (pread(mem_fd, phdr, 32, (off_t)(elf_addr + e_phoff + p * e_phentsize)) < 32) break;
+                            if (READ_REMOTE(phdr, 32, elf_addr + e_phoff + p * e_phentsize) < 32) break;
                             uint32_t p_type = 0;
                             memcpy(&p_type, phdr, 4);
                             if (p_type != 1) continue;
@@ -643,9 +765,9 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
 
                     ssize_t read_total = 0;
                     while (read_total < (ssize_t)so_size) {
-                        ssize_t rr = pread(mem_fd, so_data + read_total,
+                        ssize_t rr = READ_REMOTE(so_data + read_total,
                                           so_size - read_total,
-                                          (off_t)(elf_addr + read_total));
+                                          elf_addr + read_total);
                         if (rr <= 0) break;
                         read_total += rr;
                     }
@@ -663,11 +785,112 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                     free(so_data);
                     i += 4096;
                 }
+
+                // ---- Relaxed DEX scanning (endian_tag based, no magic) ----
+                // For second-gen shells that erase "dex\n" but keep the header structure.
+                // endian_tag 0x12345678 at offset 0x28 from DEX start.
+                // We scan for this 4-byte pattern, then back up 0x28 bytes to
+                // check the full header. Only active with --relaxed flag.
+                if (g_relaxed && (mode & MODE_DEX) && i + 4 <= n) {
+                    uint32_t val = 0;
+                    memcpy(&val, buf + i, 4);
+                    if (val == kDexEndianTag && i >= 0x28) {
+                        // Potential DEX: endian_tag at buf[i] means DEX starts at buf[i - 0x28]
+                        size_t dex_start_in_buf = (size_t)(i - 0x28);
+                        uintptr_t dex_addr = addr + dex_start_in_buf;
+
+                        // Read a full 0x70 header from the candidate DEX start
+                        uint8_t hdr[0x70];
+                        if (READ_REMOTE(hdr, 0x70, dex_addr) == 0x70) {
+                            uint32_t dex_size = 0;
+                            if (dex_header_relaxed_valid(hdr, 0x70, &dex_size)) {
+                                // Skip if this was already found by standard magic scan
+                                // (check if the magic is intact — if so, it was already handled)
+                                if (memcmp(hdr, kDexMagic, 4) == 0) {
+                                    i += 4; // skip this endian_tag, standard scan already got it
+                                    continue;
+                                }
+
+                                // Magic was erased — restore it before dumping
+                                c->dex_total++;
+                                pid_dex_seen++;
+                                fprintf(stderr, "[+] PID %s: DEX (relaxed, magic erased) at 0x%lx size=%u\n",
+                                       pid, (unsigned long)dex_addr, dex_size);
+
+                                uint8_t *dex_data = (uint8_t *)calloc(1, dex_size);
+                                if (!dex_data) { fprintf(stderr, "[-] calloc failed\n"); i += 4; continue; }
+
+                                size_t readable_total = 0;
+                                int missing_pages = 0;
+                                for (size_t off = 0; off < dex_size; off += 4096) {
+                                    size_t todo = dex_size - off;
+                                    if (todo > 4096) todo = 4096;
+                                    ssize_t rr = READ_REMOTE(dex_data + off, todo, dex_addr + off);
+                                    if (rr > 0) {
+                                        readable_total += (size_t)rr;
+                                        if ((size_t)rr < todo) missing_pages++;
+                                    } else {
+                                        missing_pages++;
+                                    }
+                                }
+
+                                if (readable_total == 0) { free(dex_data); i += 4; continue; }
+
+                                // Restore the "dex\n" magic + version tag in the dump
+                                // Version: try to infer from file_size and structure.
+                                // Default to "039\0" (Android 10+, most common for current apps).
+                                memcpy(dex_data, kDexMagic, 4);
+                                dex_data[4] = '0'; dex_data[5] = '3';
+                                dex_data[6] = '9'; dex_data[7] = '\0';
+
+                                fix_dex_header_and_checksums(dex_data, dex_size);
+
+                                // De-dup by recomputed SHA-1 signature
+                                const uint8_t *sig = dex_data + 0x0C;
+                                if (dex_sig_seen(sig)) {
+                                    c->dex_dedup++;
+                                    fprintf(stderr, "[=] PID %s: DEX (relaxed) at 0x%lx is a duplicate, skipped\n",
+                                           pid, (unsigned long)dex_addr);
+                                    free(dex_data);
+                                    i += (dex_size > 4096 ? 4096 : dex_size);
+                                    continue;
+                                }
+                                dex_sig_remember(sig);
+                                pid_dex_unique++;
+
+                                char outfile[768];
+                                snprintf(outfile, sizeof(outfile),
+                                         "%s/dump_%s_%d.dex", dex_dir, pid, pid_dex_seen);
+
+                                int fd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                                if (fd >= 0) {
+                                    size_t written_total = 0;
+                                    while (written_total < dex_size) {
+                                        ssize_t w = write(fd, dex_data + written_total, dex_size - written_total);
+                                        if (w <= 0) break;
+                                        written_total += (size_t)w;
+                                    }
+                                    close(fd);
+                                    if (written_total == dex_size) {
+                                        c->dex_unique++;
+                                        printf("[+] DEX(relaxed): %s (%u bytes, readable=%zu, zero_pages=%d) pid=%s\n",
+                                               outfile, dex_size, readable_total, missing_pages, pid);
+                                    }
+                                }
+                                free(dex_data);
+                                i += (dex_size > 4096 ? 4096 : dex_size);
+                            }
+                        }
+                        // Whether valid or not, skip past this endian_tag
+                        i += 3; // +1 will be added by the for loop
+                    }
+                }
             }
         }
     }
 
-    close(mem_fd);
+    if (mem_fd >= 0) close(mem_fd);
+    #undef READ_REMOTE
     free_maps(ml);
     fprintf(stderr, "[*] PID %s (%s): %d DEX (%d new), running totals: unique=%d dedup=%d\n",
            pid, pkg, pid_dex_seen, pid_dex_unique, c->dex_unique, c->dex_dedup);
@@ -750,6 +973,9 @@ int main(int argc, char **argv) {
             max_seconds = atoi(argv[++i]); if (max_seconds < 1) max_seconds = 120; continue;
         }
         if (strcmp(argv[i], "--stealth") == 0) { stealth = 1; continue; }
+        if (strcmp(argv[i], "--stealth2") == 0) { g_use_vm_readv = 1; continue; }
+        if (strcmp(argv[i], "--relaxed") == 0) { g_relaxed = 1; continue; }
+        if (strcmp(argv[i], "--anon") == 0) { g_anon_only = 1; continue; }
         if (strcmp(argv[i], "--region-delay") == 0 && i + 1 < argc) {
             g_region_delay_us = atoi(argv[++i]) * 1000; continue;  // ms -> us
         }
@@ -778,11 +1004,11 @@ int main(int argc, char **argv) {
 
     if (!target) {
         fprintf(stderr,
-            "NHDD — No-Hook DEX/SO Dumper v7.0\n"
+            "NHDD — No-Hook DEX/SO Dumper v8.0\n"
             "Usage: %s <pid|package> [output_dir] [--so|--dex|--all]\n"
             "                       [--watch [K]] [--snapshot ROUNDS] [--interval SECS]\n"
-            "                       [--stealth] [--region-delay MS]\n"
-            "                       [--name NAME] [--sofixer PATH]\n"
+            "                       [--stealth] [--stealth2] [--relaxed] [--anon]\n"
+            "                       [--region-delay MS] [--name NAME] [--sofixer PATH]\n"
             "                       [--max-rounds N] [--max-seconds S] [--keep]\n"
             "\n"
             "  Modes:\n"
@@ -800,6 +1026,16 @@ int main(int argc, char **argv) {
             "\n"
             "  Anti-detection:\n"
             "    --stealth      Region delay + auto-disguise as a kworker thread (see below).\n"
+            "    --stealth2     Use process_vm_readv() instead of /proc/pid/mem. Avoids\n"
+            "                   opening the mem file, which packers can detect via /proc/self/fd.\n"
+            "                   Combine with --stealth for best anti-detection.\n"
+            "    --relaxed      Relaxed DEX scan: also detect DEX files whose \"dex\\n\" magic\n"
+            "                   has been erased by second-gen extraction shells. Uses endian_tag\n"
+            "                   (0x12345678) + header structure to identify DEX. Restores magic\n"
+            "                   in the dump. Use with --watch for best results.\n"
+            "    --anon         Only scan anonymous memory mappings (skip file-backed regions\n"
+            "                   like system libs, OAT, VDEX). Much faster, less likely to crash\n"
+            "                   anti-dump packers that monitor reads of their mapped files.\n"
             "    --region-delay MS  Region pause in ms (0 = none).\n"
             "    --name NAME    Fake /proc/self/comm AND /proc/self/cmdline to NAME (e.g.\n"
             "                   'kworker/u17:2','gms:ui'). Defeats packers scanning /proc/*/comm\n"
