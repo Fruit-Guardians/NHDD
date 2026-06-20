@@ -449,6 +449,114 @@ def _pump(stream, st: DashState, is_stderr):
 # ---------------------------------------------------------------------------
 # 结果:pull + 统计
 # ---------------------------------------------------------------------------
+def auto_classify_and_fix(dex_dir, local_dir):
+    """自动修复DEX文件头 + 校验 + 三级分类，显示统计"""
+    try:
+        # 动态导入 fix_dex_checksum
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "fix_dex", os.path.join(os.path.dirname(os.path.abspath(__file__)), "fix_dex_checksum.py"))
+        fix_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fix_mod)
+    except Exception as e:
+        console.print(f"[yellow]无法加载 fix_dex_checksum: {e}[/]")
+        return
+
+    import glob as _glob
+    dex_files = sorted(_glob.glob(os.path.join(dex_dir, "*.dex")))
+    if not dex_files:
+        return
+
+    # 统计
+    stats = {"ok": 0, "bad": 0, "fixed": 0, "repairable": 0, "total": len(dex_files)}
+    bad_files = []
+    repairable_files = []
+
+    for fp in dex_files:
+        name = os.path.basename(fp)
+        try:
+            # 先分类
+            category, reason, details = fix_mod.classify_dex_full(fp)
+            if category == "jadx-ready":
+                stats["ok"] += 1
+            elif category == "repairable":
+                stats["repairable"] += 1
+                repairable_files.append((name, reason, details))
+            elif category == "bad":
+                stats["bad"] += 1
+                bad_files.append((name, reason))
+            else:
+                stats["bad"] += 1
+                bad_files.append((name, reason))
+        except Exception:
+            stats["bad"] += 1
+            bad_files.append((name, "classify_error"))
+
+    # 尝试修复 repairable 文件
+    if repairable_files:
+        for name, reason, details in repairable_files:
+            fp = os.path.join(dex_dir, name)
+            try:
+                status, msg = fix_mod.fix_dex(fp, deep=True)
+                if status == "fixed":
+                    stats["fixed"] += 1
+                    stats["repairable"] -= 1
+                    stats["ok"] += 1
+            except Exception:
+                pass
+
+    # 移动 bad 文件到 bad/ 子目录
+    if bad_files:
+        bad_dir = os.path.join(dex_dir, "bad")
+        os.makedirs(bad_dir, exist_ok=True)
+        for name, reason in bad_files:
+            src = os.path.join(dex_dir, name)
+            dst = os.path.join(bad_dir, name)
+            try:
+                os.rename(src, dst)
+            except OSError:
+                pass
+
+    # 显示分类统计
+    from rich.table import Table as Tbl
+    from rich import box as bx
+    ct = Tbl(title="DEX 校验分类", box=bx.ROUNDED, border_style="cyan")
+    ct.add_column("类别", style="bold")
+    ct.add_column("数量", style="cyan")
+    ct.add_column("说明", style="dim")
+    ct.add_row("[green]OK[/]", str(stats["ok"]), "通过所有校验，可直接反编译")
+    if stats["fixed"]:
+        ct.add_row("[yellow]FIXED[/]", str(stats["fixed"]), "已自动修复 (map_list / header)")
+    if stats["bad"]:
+        ct.add_row("[red]BAD[/]", str(stats["bad"]), "结构损坏，已移至 bad/ 目录")
+    ct.add_row("[bold]总计[/]", str(stats["total"]), "")
+    console.print()
+    console.print(ct)
+
+    if bad_files:
+        console.print(f"\n[red]已隔离 {len(bad_files)} 个损坏文件到 bad/ 目录[/]")
+    if stats["ok"] == stats["total"]:
+        console.print("\n[bold green]全部 DEX 通过校验！[/]")
+
+    # 写日志
+    log_path = os.path.join(local_dir, "log.txt")
+    try:
+        with open(log_path, "w", encoding="utf-8") as lf:
+            lf.write(f"DEX Validation Report\n")
+            lf.write(f"{'='*40}\n")
+            lf.write(f"Total: {stats['total']}  OK: {stats['ok']}  Fixed: {stats['fixed']}  Bad: {stats['bad']}\n\n")
+            if bad_files:
+                lf.write("Bad files:\n")
+                for name, reason in bad_files:
+                    lf.write(f"  {name}: {reason}\n")
+            if repairable_files:
+                lf.write("\nRepairable files:\n")
+                for name, reason, _ in repairable_files:
+                    lf.write(f"  {name}: {reason}\n")
+    except OSError:
+        pass
+
+
 def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd=""):
     local = os.path.join(output_dir, pkg)
     os.makedirs(local, exist_ok=True)
@@ -494,6 +602,11 @@ def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd=""):
     tbl.add_row("本地路径", local)
     console.print()
     console.print(tbl)
+
+    # 自动修复 + 分类
+    dex_dir = os.path.join(local, "dex")
+    if os.path.isdir(dex_dir) and dex_count > 0:
+        auto_classify_and_fix(dex_dir, local)
     if not pulled_ok:
         console.print(f"[yellow]注意: adb pull 返回非零,文件可能仍在设备 {DEVICE_DUMP_DIR}[/]")
     return local

@@ -89,31 +89,50 @@ func FixDexFile(path string) (bool, bool, error) {
 	return fixed, false, nil
 }
 
-// FixDexDirectory 递归修复目录中所有 .dex 文件
-func FixDexDirectory(dir string) (int, int, int, error) {
+// DexStats DEX 修复统计
+type DexStats struct {
+	Total    int
+	OK       int
+	Fixed    int
+	Bad      int
+	BadFiles []string
+}
+
+// FixDexDirectory 递归修复目录中所有 .dex 文件，返回分类统计
+func FixDexDirectory(dir string) (*DexStats, error) {
 	dexFiles, err := findDexFiles(dir)
 	if err != nil {
-		return 0, 0, 0, err
+		return nil, err
 	}
 
-	totalCount := len(dexFiles)
-	fixedCount := 0
-	deletedCount := 0
+	stats := &DexStats{Total: len(dexFiles)}
+	badDir := filepath.Join(dir, "bad")
 
 	for _, f := range dexFiles {
 		fixed, deleted, err := FixDexFile(f)
 		if err != nil {
 			if deleted {
-				deletedCount++
+				stats.Bad++
+				stats.BadFiles = append(stats.BadFiles, filepath.Base(f))
 			}
 			continue
 		}
 		if fixed {
-			fixedCount++
+			stats.Fixed++
+		}
+		stats.OK++
+	}
+
+	// 统计 bad/ 目录
+	if entries, err := os.ReadDir(badDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".dex") {
+				stats.BadFiles = append(stats.BadFiles, e.Name())
+			}
 		}
 	}
 
-	return fixedCount, deletedCount, totalCount, nil
+	return stats, nil
 }
 
 func findDexFiles(dir string) ([]string, error) {

@@ -95,15 +95,17 @@ type DumpParams struct {
 
 // DumpResult 脱壳结果
 type DumpResult struct {
-	Success    bool   `json:"success"`
-	Message    string `json:"message"`
-	DexCount   int    `json:"dexCount"`
-	SoCount    int    `json:"soCount"`
-	FixedCount int    `json:"fixedCount"`
-	TotalSize  int64  `json:"totalSize"`
-	OutputDir  string `json:"outputDir"`
-	Rounds     int    `json:"rounds"`
-	Processes  int    `json:"processes"`
+	Success    bool     `json:"success"`
+	Message    string   `json:"message"`
+	DexCount   int      `json:"dexCount"`
+	SoCount    int      `json:"soCount"`
+	FixedCount int      `json:"fixedCount"`
+	BadCount   int      `json:"badCount"`
+	BadFiles   []string `json:"badFiles"`
+	TotalSize  int64    `json:"totalSize"`
+	OutputDir  string   `json:"outputDir"`
+	Rounds     int      `json:"rounds"`
+	Processes  int      `json:"processes"`
 }
 
 // WatchProgress watch 实时进度
@@ -309,11 +311,22 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 
 	// Step 6: 修复 DEX
 	a.log("[6/6] 修复 DEX 文件...")
-	fixedCount, deletedCount, totalCount, err := FixDexDirectory(targetDir)
+	stats, err := FixDexDirectory(targetDir)
 	if err != nil {
 		a.log(fmt.Sprintf("修复 DEX 出错: %v", err))
 	} else {
-		a.log(fmt.Sprintf("[6/6] 修复完成: %d/%d 已修复, %d 无效已删除", fixedCount, totalCount, deletedCount))
+		a.log(fmt.Sprintf("[6/6] 修复完成: %d OK, %d 修复, %d 损坏已隔离", stats.OK, stats.Fixed, stats.Bad))
+		if stats.Bad > 0 {
+			a.log(fmt.Sprintf("  [警告] 损坏文件: %v", stats.BadFiles))
+		}
+	}
+	fixedCount := 0
+	badCount := 0
+	var badFiles []string
+	if stats != nil {
+		fixedCount = stats.Fixed
+		badCount = stats.Bad
+		badFiles = stats.BadFiles
 	}
 
 	// 计算总大小
@@ -336,6 +349,8 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 		DexCount:   dexCount,
 		SoCount:    soCount,
 		FixedCount: fixedCount,
+		BadCount:   badCount,
+		BadFiles:   badFiles,
 		TotalSize:  totalSize,
 		OutputDir:  targetDir,
 		Rounds:     progress.Round,

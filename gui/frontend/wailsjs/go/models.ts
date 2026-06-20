@@ -48,6 +48,8 @@ export namespace main {
 	    dexCount: number;
 	    soCount: number;
 	    fixedCount: number;
+	    badCount: number;
+	    badFiles: string[];
 	    totalSize: number;
 	    outputDir: string;
 	    rounds: number;
@@ -64,6 +66,8 @@ export namespace main {
 	        this.dexCount = source["dexCount"];
 	        this.soCount = source["soCount"];
 	        this.fixedCount = source["fixedCount"];
+	        this.badCount = source["badCount"];
+	        this.badFiles = source["badFiles"];
 	        this.totalSize = source["totalSize"];
 	        this.outputDir = source["outputDir"];
 	        this.rounds = source["rounds"];
