@@ -150,7 +150,7 @@ func equalBytes(a, b []byte) bool {
 	return true
 }
 
-// validateDexDeep 深度验证 DEX 文件结构
+// validateDexDeep 深度验证 DEX 文件结构（item 级偏移越界检查，不做 MUTF-8 验证）
 func validateDexDeep(data []byte) bool {
 	realSize := uint32(len(data))
 	if realSize < dexHeaderSize {
@@ -163,10 +163,9 @@ func validateDexDeep(data []byte) bool {
 		return false
 	}
 
-	// 检查 map_size 合理性
 	mapSize := binary.LittleEndian.Uint32(data[mapOff : mapOff+4])
 	if mapSize > 50 {
-		return false // 正常 DEX map_list 不超过 ~20 个条目
+		return false
 	}
 
 	mapEnd := mapOff + 4 + mapSize*12
@@ -174,29 +173,125 @@ func validateDexDeep(data []byte) bool {
 		return false
 	}
 
-	// 检查关键 section 偏移是否越界
-	sections := []struct {
-		name   string
-		offOff uint32
-	}{
-		{"string_ids", 0x3C},
-		{"type_ids", 0x44},
-		{"proto_ids", 0x4C},
-		{"field_ids", 0x54},
-		{"method_ids", 0x5C},
-		{"class_defs", 0x64},
+	// 检查异常大文件（> 64MB）
+	if realSize > 64*1024*1024 {
+		return false
 	}
-	for _, sec := range sections {
-		secOff := binary.LittleEndian.Uint32(data[sec.offOff : sec.offOff+4])
-		secSize := binary.LittleEndian.Uint32(data[sec.offOff+4 : sec.offOff+8])
-		if secOff > 0 && secOff+secSize > realSize {
-			return false
+
+	// 读取 section 信息
+	sidsSize := binary.LittleEndian.Uint32(data[0x38:0x3C])
+	sidsOff := binary.LittleEndian.Uint32(data[0x3C:0x40])
+	tidsSize := binary.LittleEndian.Uint32(data[0x40:0x44])
+	tidsOff := binary.LittleEndian.Uint32(data[0x44:0x48])
+	pidsSize := binary.LittleEndian.Uint32(data[0x48:0x4C])
+	pidsOff := binary.LittleEndian.Uint32(data[0x4C:0x50])
+	fidsSize := binary.LittleEndian.Uint32(data[0x50:0x54])
+	fidsOff := binary.LittleEndian.Uint32(data[0x54:0x58])
+	midsSize := binary.LittleEndian.Uint32(data[0x58:0x5C])
+	midsOff := binary.LittleEndian.Uint32(data[0x5C:0x60])
+	clsSize := binary.LittleEndian.Uint32(data[0x60:0x64])
+	clsOff := binary.LittleEndian.Uint32(data[0x64:0x68])
+
+	// 检查 section 表是否越界
+	if sidsSize > 0 && sidsOff > 0 && sidsOff+sidsSize*4 > realSize {
+		return false
+	}
+	if tidsSize > 0 && tidsOff > 0 && tidsOff+tidsSize*4 > realSize {
+		return false
+	}
+	if pidsSize > 0 && pidsOff > 0 && pidsOff+pidsSize*12 > realSize {
+		return false
+	}
+	if fidsSize > 0 && fidsOff > 0 && fidsOff+fidsSize*8 > realSize {
+		return false
+	}
+	if midsSize > 0 && midsOff > 0 && midsOff+midsSize*8 > realSize {
+		return false
+	}
+	if clsSize > 0 && clsOff > 0 && clsOff+clsSize*32 > realSize {
+		return false
+	}
+
+	// 1. string_ids 逐项检查：string_data_off 必须在文件内
+	if sidsSize > 0 && sidsOff > 0 {
+		for i := uint32(0); i < sidsSize; i++ {
+			sdataOff := binary.LittleEndian.Uint32(data[sidsOff+i*4 : sidsOff+i*4+4])
+			if sdataOff >= realSize {
+				return false
+			}
 		}
 	}
 
-	// 检查异常大文件（> 64MB 可能是多个 DEX 拼接）
-	if realSize > 64*1024*1024 {
-		return false
+	// 2. type_ids 逐项检查：desc_idx 必须在 string_ids 范围内
+	if tidsSize > 0 && tidsOff > 0 {
+		for i := uint32(0); i < tidsSize; i++ {
+			descIdx := binary.LittleEndian.Uint32(data[tidsOff+i*4 : tidsOff+i*4+4])
+			if descIdx >= sidsSize {
+				return false
+			}
+		}
+	}
+
+	// 3. proto_ids 逐项检查
+	if pidsSize > 0 && pidsOff > 0 {
+		for i := uint32(0); i < pidsSize; i++ {
+			base := pidsOff + i*12
+			shorty := binary.LittleEndian.Uint32(data[base : base+4])
+			ret := binary.LittleEndian.Uint32(data[base+4 : base+8])
+			params := binary.LittleEndian.Uint32(data[base+8 : base+12])
+			if shorty >= sidsSize || ret >= tidsSize || (params > 0 && params >= realSize) {
+				return false
+			}
+		}
+	}
+
+	// 4. field_ids 逐项检查
+	if fidsSize > 0 && fidsOff > 0 {
+		for i := uint32(0); i < fidsSize; i++ {
+			base := fidsOff + i*8
+			cls := binary.LittleEndian.Uint16(data[base : base+2])
+			typ := binary.LittleEndian.Uint16(data[base+2 : base+4])
+			name := binary.LittleEndian.Uint32(data[base+4 : base+8])
+			if uint32(cls) >= tidsSize || uint32(typ) >= tidsSize || name >= sidsSize {
+				return false
+			}
+		}
+	}
+
+	// 5. method_ids 逐项检查
+	if midsSize > 0 && midsOff > 0 {
+		for i := uint32(0); i < midsSize; i++ {
+			base := midsOff + i*8
+			cls := binary.LittleEndian.Uint16(data[base : base+2])
+			proto := binary.LittleEndian.Uint16(data[base+2 : base+4])
+			name := binary.LittleEndian.Uint32(data[base+4 : base+8])
+			if uint32(cls) >= tidsSize || uint32(proto) >= pidsSize || name >= sidsSize {
+				return false
+			}
+		}
+	}
+
+	// 6. class_defs 逐项检查：annotations_off / class_data_off / static_values_off
+	if clsSize > 0 && clsOff > 0 {
+		for i := uint32(0); i < clsSize; i++ {
+			base := clsOff + i*32
+			classIdx := binary.LittleEndian.Uint32(data[base : base+4])
+			annotOff := binary.LittleEndian.Uint32(data[base+20 : base+24])
+			cdOff := binary.LittleEndian.Uint32(data[base+24 : base+28])
+			svOff := binary.LittleEndian.Uint32(data[base+28 : base+32])
+			if classIdx >= tidsSize {
+				return false
+			}
+			if annotOff > 0 && annotOff >= realSize {
+				return false
+			}
+			if cdOff > 0 && cdOff >= realSize {
+				return false
+			}
+			if svOff > 0 && svOff >= realSize {
+				return false
+			}
+		}
 	}
 
 	return true
