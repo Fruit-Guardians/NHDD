@@ -1,552 +1,331 @@
 # NHDD — No-Hook DEX/SO Dumper
 
-> An Android DEX / SO memory dumping tool for **authorized security research, reverse engineering, and debugging of your own applications**.
->
-> NHDD runs as an independent root process. It scans a target process from the outside via `/proc/<pid>/maps` and `/proc/<pid>/mem`, looking for DEX and ELF data in memory. It does not inject code into the target process and does not install runtime hooks.
+NHDD is an Android **external-memory DEX/SO dumping tool** for authorized reverse engineering, malware analysis, app debugging, and mobile security research. The Android-side scanner, `nhdd`, runs as an independent root process. It reads `/proc/<pid>/maps` and `/proc/<pid>/mem`, scans the target process memory for DEX/ELF magic, and writes resident DEX or SO images to disk.
 
-English | [简体中文](./README.zh-CN.md)
+Unlike Frida/Xposed/FART/fdex2-style approaches, NHDD does **not** inject code into the target app, does **not** patch method entries, and does **not** require ART hooks. This reduces exposure to common in-process hook indicators such as injected libraries, suspicious threads, method-entry trampolines, and runtime framework modifications.
 
----
+> Important: no-hook does not mean “impossible to detect.” A target app, system policy, packer, or root environment can still affect results through process termination, permission restrictions, SELinux policy, root detection, or other side effects. NHDD’s practical advantage is low intrusiveness and simple deployment, not a guarantee of universal or risk-free dumping.
 
-## Important Notice
+## Scope
 
-NHDD should only be used in the following scenarios:
+NHDD works best when:
 
-- Devices, applications, and test environments that you own or are explicitly authorized to analyze;
-- Mobile application security research, hardening assessment, compatibility analysis, vulnerability reproduction, and defensive validation;
-- Internal enterprise security testing or educational lab environments.
+- The protected app loads a complete or near-complete DEX into memory at runtime.
+- You need a fast root-based scanner for DEX/SO files already resident in an app process.
+- You want to avoid Frida agents, Xposed modules, Zygisk modules, or ART patching in the target process.
 
-Do not use this tool against unauthorized applications, commercial software, copyrighted content, or in any way that violates local laws, platform rules, or contractual terms. The authors are not responsible for unauthorized use, legal consequences, data leakage, business losses, or any other damages.
+NHDD alone is not enough when:
 
----
+- The packer decrypts method bodies only on demand.
+- CodeItem data is erased, virtualized, or restored only during execution.
+- You need full method-body recovery and backfilling.
 
-## Overview
+For second-generation extraction shells, use NHDD as a **low-intrusion auxiliary scanner**. Full recovery usually requires DefineClass/LoadMethod hooks, CodeItem capture/backfill, or a FART-style pipeline.
 
-Many Android unpacking tools rely on Frida, Xposed, Zygisk, ART hooks, or ClassLoader hooks. These approaches are powerful, but they also introduce detectable artifacts inside the target process, such as injected libraries, modified method entries, suspicious threads, abnormal call stacks, or runtime state changes.
+## Repository status
 
-NHDD takes a different approach:
-
-1. It does not enter the target process;
-2. It does not modify ART, ClassLoader, or application method entries;
-3. It does not inject Frida / Xposed / Zygisk agents;
-4. It reads the target process virtual memory externally with root privileges;
-5. It scans memory for DEX magic and ELF magic;
-6. It dumps matched DEX / SO data to files;
-7. It automatically fixes DEX headers, SHA-1 signatures, and Adler32 checksums;
-8. It can dump in-memory SO files and work with SoFixer for reconstruction.
-
-NHDD is designed for cases where the real DEX / SO is already decrypted and mapped into memory at runtime. It is not a universal unpacker and does not guarantee complete recovery across all protectors, devices, ROMs, or Android versions.
-
----
-
-## Tested Environments
-
-NHDD has been tested on:
-
-- OnePlus 9 + LineageOS 21 / Android 14;
-- Pixel devices running Android 14;
-- Pixel devices running Android 16.
-
-Other devices, ROMs, kernels, root solutions, and Android versions may behave differently. In theory, NHDD can work when the device has usable root privileges and allows reading the target process via `/proc/<pid>/mem`, but compatibility is not guaranteed.
-
----
-
-## Scope and Limitations
-
-NHDD is suitable when:
-
-- The real DEX / SO appears in memory in plaintext or in a parseable form;
-- The corresponding memory pages can be read with root privileges;
-- The DEX pages are still resident or readable when dumping;
-- The DEX structure is not severely corrupted, or can be repaired later.
-
-NHDD may not fully handle cases where:
-
-- The real code only exists as interpreter-private structures, JIT code, native bridge code, or a custom VM format;
-- DEX headers are intentionally damaged, or critical fields such as `file_size`, `map_off`, or `class_data_off` point to invalid regions;
-- The protector loads, decrypts, and unloads DEX fragments very quickly;
-- The target monitors `/proc` access, suspicious timing, system calls, or process state changes;
-- The kernel, SELinux policy, root solution, or ROM restricts cross-process memory reads.
-
----
-
-## How It Works
-
-### Why many traditional approaches are detectable
-
-| Approach | Common implementation | Possible detection surface |
-|----------|-----------------------|-----------------------------|
-| Frida | Injects an agent into the target process | Injected libraries, threads, ports, symbols, call stacks, memory artifacts |
-| Xposed / LSPosed | Modifies Java / ART call paths | Framework traces, method entry changes, module lists |
-| Zygisk modules | Loads modules during Zygote / app lifecycle | Module traces, maps entries, abnormal native stacks |
-| FART-style tools | Modify or hook ART internals | ART symbols, entry instructions, system component differences |
-| ClassLoader hooks | Intercept DEX loading | Java hooks, native hooks, abnormal call paths |
-
-NHDD does not claim to be “undetectable”. Its advantage is that it avoids installing hooks or injected libraries inside the target process, which reduces common in-process hook / injection detection surfaces. Cross-process memory reading can still be indirectly observed by system policy, behavior monitoring, or anti-debugging logic.
-
-### External memory scanning model
-
-```text
-┌─────────────────────────────────────────────────────────┐
-│  Target process: protected app                           │
-│                                                         │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │ Protector / packer logic                           │  │
-│  │                                                   │  │
-│  │ Runtime-decrypted DEX / SO                         │  │
-│  │ 0x7f8a001000: "dex\n035\0..."                    │  │
-│  │ 0x7f8b200000: "\x7fELF..."                        │  │
-│  └───────────────────────────────────────────────────┘  │
-│                                                         │
-│  Inside target: no Frida agent, no Xposed hook,          │
-│  no method entry patch                                  │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         │ root process reads /proc/<pid>/mem
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│  Independent NHDD process                                │
-│                                                         │
-│  1. Read /proc/<pid>/maps for memory layout              │
-│  2. Scan readable memory regions page by page            │
-│  3. Match DEX / ELF magic                                │
-│  4. Parse headers and size fields                         │
-│  5. Dump DEX / SO to output directory                    │
-│  6. Fix DEX checksum / signature                          │
-│  7. Deduplicate and clean invalid outputs                 │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Page-by-page scanning
-
-```text
-for each readable region in /proc/<pid>/maps:
-    for addr in region.start .. region.end step 4096:
-        page = pread(mem_fd, 4096, addr)
-
-        if page starts with "dex\n":
-            parse DEX header
-            validate version, header_size, file_size, endian_tag
-            dump DEX
-            fix SHA-1 and Adler32
-
-        if page starts with "\x7fELF":
-            parse ELF header and program headers
-            estimate mapped SO size
-            dump SO
-```
-
-Advantages of page-by-page scanning:
-
-- Small read size per operation;
-- No need to read huge memory regions at once;
-- Easier handling of unreadable or sparse pages;
-- Better fit for demand-paged and short-lived DEX mappings.
-
----
+| Component | Status | Notes |
+|---|---:|---|
+| `nhdd.c` | Ready | Core Android ARM64 scanner. Supports DEX/SO, package multi-process scanning, snapshots, watch mode, de-duplication, and DEX checksum repair. |
+| `nhdd_tui.py` | Recommended | Terminal UI with root-command configuration, watch progress, and result pulling. Best daily entry point in this snapshot. |
+| `nhdd_ctrl.py` | Basic | Simple Python controller. Defaults to force-stop, launch, and watch. Root wrapping is limited; use the TUI for complex root setups. |
+| `gui_web/` | Usable | Dependency-free Go local web UI, suitable for Windows packaging. Current flow is fixed-wait based, not a full TUI/watch replacement. |
+| `gui/` | Optional | Go/Fyne native GUI. Requires Fyne dependencies and a generated `go.sum`. |
+| `fix_dex_checksum.py` | Ready | Standalone DEX header, SHA-1, and Adler32 repair tool. |
+| `app/` | Incomplete | This snapshot contains Manifest/resources only and is missing `MainActivity.java`; do not document it as a ready-to-build Android app yet. |
 
 ## Features
 
-- **Out-of-process scanning**: no injection and no runtime hook inside the target process;
-- **DEX dumping**: scans in-memory DEX files and fixes header / SHA-1 / Adler32 automatically;
-- **SO dumping**: scans ELF magic and exports decrypted in-memory shared objects;
-- **Multi-process support**: scans the main process and `:remote` child processes when a package name is provided;
-- **PID mode**: scans a single process when a numeric PID is provided;
-- **Snapshot polling**: uses `--snapshot` to scan multiple rounds and catch short-lived DEX mappings;
-- **Watch mode**: uses `--watch` to support lazy-loaded or feature-triggered DEX files;
-- **Content deduplication**: deduplicates DEX files across processes and rounds based on fixed SHA-1;
-- **Output cleanup**: filters obviously small or malformed DEX files;
-- **SO repair integration**: can work with `third_party/SoFixer` for post-dump reconstruction;
-- **Multiple frontends**: command line, Python controller, TUI, GUI, and Android controller app.
+- **External memory reading**: reads target process memory via `/proc/<pid>/mem`; no target-process injection.
+- **DEX dumping**: scans for `dex\n`, reads DEX `file_size`, and exports data page by page.
+- **SO dumping**: scans ELF ET_DYN mappings and optionally repairs dumps with SoFixer.
+- **Package multi-process scan**: when given a package name, scans all matching processes, including `:remote` child processes.
+- **Snapshot mode**: `--snapshot N --interval T` performs repeated fixed-round scans.
+- **Watch mode**: `--watch [K]` scans until K consecutive dry rounds, useful for lazy-loaded DEX while you navigate the app.
+- **Content de-duplication**: DEX files are de-duplicated by recomputed SHA-1 signature across processes and scan rounds.
+- **DEX auto-repair**: fixes `file_size`, `header_size`, `endian_tag`, SHA-1 signature, and Adler32 checksum.
+- **Output isolation**: old `.dex/.so` files are removed by default before a run; use `--keep` for incremental runs.
+- **Low-intrusion runtime options**: `--region-delay`, `--stealth`, and `--name` can adjust scan timing and the scanner’s visible process name. These are not detection-bypass guarantees.
 
----
-
-## Project Layout
+## How it works
 
 ```text
-NHDD/
-├── nhdd.c              # Core engine, C implementation, statically built for Android ARM64
-├── Makefile            # Build configuration
-├── nhdd_ctrl.py        # PC-side Python controller
-├── nhdd_tui.py         # Terminal TUI with rich output and watch progress
-├── fix_dex_checksum.py # Standalone DEX checksum fixer
-├── nhddctl.sh          # Shell controller script
-├── gui/                # Desktop GUI, implemented with Go / Fyne
-│   ├── main.go
-│   ├── adb.go
-│   └── dexfix.go
-├── app/                # Android controller app, Java / libsu
-│   └── src/main/
-│       ├── AndroidManifest.xml
-│       └── java/com/nhdd/app/MainActivity.java
-└── third_party/
-    └── SoFixer/        # SO reconstruction tool
+Target app process
+├── Packer/protection logic
+├── ART/ClassLoader
+├── Resident DEX memory regions
+└── Mapped SO regions
+
+Independent root process: nhdd
+├── Reads /proc/<pid>/maps
+├── Opens /proc/<pid>/mem
+├── Scans readable pages for DEX/ELF magic
+├── Computes dump ranges from DEX headers or ELF program headers
+├── Writes files under out_dir/dex and out_dir/so
+└── Repairs DEX checksums and optionally invokes SoFixer
 ```
 
----
+`pread(/proc/<pid>/mem, ..., virtual_address)` uses the target process virtual address as the file offset. If root permissions and system policy allow it, the scanner can read bytes from the target process address space without executing code inside that process.
 
-## Build
+## Build Android-side `nhdd`
 
-### 1. Build the core `nhdd` binary
-
-Android NDK r25 or later is required.
+Requirements: Android NDK r25+ and an ARM64 Android target.
 
 ```bash
-export NDK=/path/to/android-ndk-r27
-export CC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang
+# Recommended helper script
+NDK=/path/to/android-ndk-r27 API=34 ./scripts/build_nhdd_android.sh
 
-$CC -O2 -static -o nhdd nhdd.c
+# Manual command
+/path/to/android-ndk-r27/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang \
+  -O2 -static -Wall -Wextra -o nhdd nhdd.c
 ```
 
-Or use the Makefile:
+Push to the device:
 
 ```bash
-make
-```
-
-### 2. Build the desktop GUI
-
-Go 1.21+ and Fyne dependencies are required.
-
-```bash
-cd gui
-go build -o nhdd-gui .
-```
-
-### 3. Build the Android controller app
-
-Android SDK and JDK 17+ are required.
-
-```bash
-./gradlew assembleDebug
-```
-
-Or use the project script:
-
-```bash
-./build_manual.sh
-```
-
----
-
-## Usage
-
-### Option 1: ADB command line
-
-#### 1. Push the binary
-
-```bash
-adb push nhdd /data/local/tmp/nhdd
+adb push ./nhdd /data/local/tmp/nhdd
 adb shell chmod 755 /data/local/tmp/nhdd
 ```
 
-#### 2. Launch the target app
+If you want automatic SO repair, also push a SoFixer binary:
 
 ```bash
-adb shell monkey -p com.example.app -c android.intent.category.LAUNCHER 1
+adb push ./sofixer /data/local/tmp/sofixer
+adb shell chmod 755 /data/local/tmp/sofixer
 ```
 
-#### 3. Basic DEX dump
+## Command-line usage
+
+### 1. Recommended: scan a running app with watch mode
+
+Open the target app manually and let it reach a stable state, then run:
 
 ```bash
-adb shell "/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump"
+adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch 3 --max-seconds 120'
+```
+
+While NHDD is running, navigate through important app pages such as login, home, search, profile, payment, order, or plugin-related screens. Lazy-loaded DEX files can be captured as they enter memory.
+
+Pull results:
+
+```bash
+adb pull /data/local/tmp/nhdd_dump ./nhdd_output/com.example.app
 ```
 
 Output layout:
 
 ```text
-/data/local/tmp/nhdd_dump/
+nhdd_dump/
 ├── dex/
-│   ├── *.dex
-│   └── ...
+│   ├── dump_<pid>_1.dex
+│   └── dump_<pid>_2.dex
 └── so/
-    ├── *.so
-    └── ...
+    ├── libxxx.so
+    └── libyyy.so
 ```
 
-#### 4. Snapshot polling mode
-
-Useful when DEX files only appear in memory for a short time.
+### 2. Fixed wait after cold launch
 
 ```bash
-adb shell "monkey -p com.example.app -c android.intent.category.LAUNCHER 1 ; \
-           /data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump \
-           --snapshot 5 --interval 1"
+adb shell am force-stop com.example.app
+adb shell monkey -p com.example.app -c android.intent.category.LAUNCHER 1
+sleep 4
+adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --dex'
 ```
 
-Parameters:
+Fixed waits are simple, but not always stable against aggressive packers. In many cases, scanning an already running process with watch mode is more reliable than force-stopping and relying on a 4-second window.
 
-- `--snapshot 5`: scan 5 rounds;
-- `--interval 1`: wait 1 second between rounds;
-- the process list is resolved again in every round;
-- useful when main and child processes change frequently.
-
-#### 5. Watch mode
-
-Useful for applications that lazy-load DEX files only after specific features are opened.
+### 3. Snapshot mode
 
 ```bash
-adb shell "monkey -p com.example.app -c android.intent.category.LAUNCHER 1 ; \
-           /data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch"
+adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --snapshot 5 --interval 1'
 ```
 
-Recommended workflow:
+This scans five rounds with a one-second interval between rounds.
 
-1. Start `--watch`;
-2. Open important feature pages on the device, such as login, home, payment, settings, WebView, IM, or media playback;
-3. NHDD captures newly appeared DEX files in each scan round;
-4. It stops automatically after several rounds with no new results.
-
-Optional parameters:
+### 4. Dump both DEX and SO
 
 ```bash
---watch [K]          # stop after K consecutive rounds with no new results, default 3
---max-rounds N       # maximum scan rounds, default 60
---max-seconds N      # maximum running time in seconds, default 120
---interval SECS      # interval between rounds, default 1
+adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --all'
 ```
 
-#### 6. Dump SO files
+### 5. KernelSU / APatch / other root commands
+
+Different root setups may expose different command wrappers:
 
 ```bash
-adb shell "/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --so"
+adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
+adb shell ksud -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
+adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
 ```
 
-#### 7. Dump both DEX and SO files
+## `nhdd` options
+
+| Option | Description |
+|---|---|
+| `<pid\|package>` | Numeric PID scans one process; package name scans all matching processes. |
+| `[output_dir]` | Output directory. Default: `/data/local/tmp/nhdd_dump`. |
+| `--dex` | Dump DEX only. Default mode. |
+| `--so` | Dump SO only. |
+| `--all` | Dump both DEX and SO. |
+| `--snapshot N` | Run N fixed scan rounds. |
+| `--interval T` | Seconds between rounds. Default: 1. |
+| `--watch [K]` | Keep scanning until K consecutive dry rounds. Default K: 3. |
+| `--max-rounds N` | Maximum rounds in watch mode. Default: 60. |
+| `--max-seconds S` | Maximum wall time in watch mode. Default: 120. |
+| `--keep` | Do not remove old `.dex/.so` files before scanning. |
+| `--stealth` | Enable a default region delay and a default disguised process name. |
+| `--region-delay MS` | Sleep MS milliseconds between memory map regions. |
+| `--name NAME` / `--disguise NAME` | Change the scanner’s visible `/proc/self/comm` and `/proc/self/cmdline` name. |
+| `--sofixer PATH` | Specify SoFixer path. Defaults to `/data/local/tmp/sofixer` or `/data/local/tmp/SoFixer64`. |
+
+## Recommended TUI workflow
+
+Install dependency:
 
 ```bash
-adb shell "/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --all"
+python3 -m pip install rich
 ```
 
-#### 8. Pull results
-
-```bash
-adb pull /data/local/tmp/nhdd_dump ./output
-```
-
----
-
-## Python Controller
-
-```bash
-python3 nhdd_ctrl.py
-python3 nhdd_ctrl.py com.example.app
-```
-
-The controller usually handles:
-
-1. Checking ADB connectivity;
-2. Pushing `nhdd` to the device;
-3. Launching or restarting the target app;
-4. Running the dump command;
-5. Pulling results to the host;
-6. Fixing or cleaning output files.
-
----
-
-## Terminal TUI
+Run:
 
 ```bash
 python3 nhdd_tui.py
+python3 nhdd_tui.py com.example.app -o ./nhdd_output
 ```
 
-This is useful when you want to observe scan rounds, hit counts, and output paths in real time.
+If your ADB server runs on another host or on the Windows host from a VM:
 
----
+```bash
+NHDD_ADB='adb -H 192.168.238.1 -P 5037' python3 nhdd_tui.py com.example.app -o ./nhdd_output
+```
 
-## Desktop GUI
+The TUI lets you configure:
+
+- Whether to restart the app.
+- Whether to use watch mode.
+- Root command: `su -c`, `kp -c`, `ksud -c`, or empty.
+- Dump mode: DEX, SO, or ALL.
+- Local output directory.
+
+## Web GUI workflow
+
+`gui_web/` is a local browser-based GUI built with the Go standard library. It is useful for Windows packaging and does not depend on Fyne.
+
+Build:
+
+```bash
+cd gui_web
+go build -trimpath -ldflags='-s -w' -o nhdd-gui-web .
+```
+
+Place the Android ARM64 `nhdd` binary next to the GUI executable:
+
+```text
+NHDD-run/
+├── nhdd-gui-web.exe
+└── nhdd
+```
+
+Current limitation: the Web GUI uses a fixed-wait flow: force-stop, launch, wait, dump, pull. It is not equivalent to the TUI’s full watch workflow. For multi-process packers or lazy-loaded DEX, prefer the command line or `nhdd_tui.py`.
+
+## Fyne GUI workflow
 
 ```bash
 cd gui
-./nhdd-gui
+go mod tidy
+go build -o nhdd-gui .
 ```
 
-Typical workflow:
+If Go reports missing `go.sum` entries, run `go mod tidy` first. The Fyne GUI requires CGO and graphical dependencies. See `BUILD_WINDOWS.md` for Windows packaging notes.
 
-1. Enter or select an ADB device;
-2. Select the target package name;
-3. Choose DEX / SO / ALL mode;
-4. Click DUMP;
-5. Wait for results to be pulled to the host.
+## Standalone DEX repair
 
----
-
-## Common Options
-
-| Option | Description |
-|--------|-------------|
-| `<package>` | Target package name. Scans all matching processes. |
-| `<pid>` | Target PID. Scans only that process. |
-| `<out_dir>` | Output directory on the device. |
-| `--dex` | Dump DEX only. |
-| `--so` | Dump SO only. |
-| `--all` | Dump both DEX and SO. |
-| `--snapshot N` | Scan N rounds and exit. |
-| `--interval SECS` | Interval between scan rounds. |
-| `--watch [K]` | Keep scanning and stop after K rounds with no new results. |
-| `--max-rounds N` | Maximum rounds in watch mode. |
-| `--max-seconds N` | Maximum running time in watch mode. |
-| `--stealth` | Add a default delay between memory regions to reduce abrupt scan behavior. |
-| `--region-delay MS` | Customize delay between memory regions. |
-
----
-
-## DEX Fixing
-
-Relevant DEX header fields:
-
-```text
-0x08    Adler32 checksum    covers 0x0C to EOF
-0x0C    SHA-1 signature     covers 0x20 to EOF
-0x20    file_size
-0x24    header_size
-0x28    endian_tag
-```
-
-NHDD fixes DEX files in this order:
-
-1. Set `header_size` to `0x70`;
-2. Set `endian_tag` to `0x12345678`;
-3. Set `file_size` to the actual dumped size;
-4. Recalculate the SHA-1 signature;
-5. Recalculate the Adler32 checksum.
-
-The order matters because the Adler32 range includes the SHA-1 signature.
-
-You can also run the fixer manually:
+`nhdd` already repairs DEX files during dumping. To repair existing dumps manually:
 
 ```bash
-python3 fix_dex_checksum.py classes.dex
+python3 fix_dex_checksum.py path/to/classes.dex
 ```
 
----
+Repair order:
+
+1. `header_size -> 0x70`
+2. `endian_tag -> 0x12345678`
+3. `file_size -> actual file length`
+4. SHA-1 signature over `data[0x20:]`
+5. Adler32 checksum over `data[0x0c:]`
 
 ## FAQ
 
-### Q: No DEX files were dumped. What should I check?
+### Why is package-name mode recommended over PID mode?
 
-Check the following first:
+Many Android apps run multiple processes. The actual decrypted DEX may live in a `:remote`, `:push`, or sandbox child process. Package-name mode scans all matching cmdline entries. PID mode scans only one process and may miss the important one.
 
-1. Whether the target app was launched successfully;
-2. Whether the device has usable root privileges;
-3. Whether `/proc/<pid>/mem` is readable;
-4. Whether the real DEX exists only in a child process;
-5. Whether the DEX is loaded and then quickly unloaded;
-6. Whether a specific feature page must be opened to trigger lazy loading;
-7. Whether `--snapshot` or `--watch` should be used.
+### Why can the GUI produce fewer results than command line or TUI?
 
-Recommended command:
+In this repository snapshot, `gui/` and `gui_web/` use a fixed-wait flow, and parts of the GUI logic prefer the first PID returned by `pidof`. That can bypass the core scanner’s package multi-process mode. For multi-process or lazy-load targets, use:
 
 ```bash
-adb shell "monkey -p com.example.app -c android.intent.category.LAUNCHER 1 ; \
-           /data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump \
-           --snapshot 8 --interval 1"
+adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
 ```
 
-### Q: jadx cannot open the dumped DEX. Why?
+or use `nhdd_tui.py`.
 
-Possible reasons:
+### Why can a dumped DEX open but still have incomplete code?
 
-- The DEX pages were incomplete during dumping;
-- The header was damaged by the protector;
-- fields such as `map_off`, `class_data_off`, or `string_ids_off` point to invalid regions;
-- the dumped file is only a stub DEX, while the real code is in another dynamically loaded DEX;
-- the file needs deeper DEX repair, not only checksum fixing.
+NHDD exports according to the DEX `file_size`. If some pages cannot be read, the current implementation keeps the file size and zero-fills missing pages. This helps preserve structure and offsets, but it does not guarantee that every method body is present. Extraction shells may require method-level capture and backfill.
 
-Try first:
+### Why did NHDD find zero DEX files?
+
+Common causes:
+
+- The app is not running or is killed during scanning.
+- Your root command does not actually allow reading `/proc/<pid>/mem`.
+- The DEX exists only briefly and a single scan missed it.
+- The real DEX is in a child process, but you passed a single PID.
+- The packer is not a full-resident-DEX model and uses method-level extraction or virtualization.
+
+Start with package-name watch mode:
 
 ```bash
-python3 fix_dex_checksum.py your.dex
+adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch 3 --max-seconds 120'
 ```
 
-### Q: Why is package-name mode recommended over PID mode?
+### Can the Android app module be built directly?
 
-Many apps run multiple processes, for example:
+Not in this snapshot. The `app/` module is missing `app/src/main/java/com/nhdd/app/MainActivity.java`, so it should be treated as an unfinished scaffold.
+
+## Project layout
 
 ```text
-com.example.app
-com.example.app:remote
-com.example.app:push
-com.example.app:worker
+NHDD/
+├── nhdd.c                         # Android-side core scanner
+├── fix_dex_checksum.py            # Standalone DEX repair tool
+├── nhdd_tui.py                    # Recommended TUI controller
+├── nhdd_ctrl.py                   # Simple Python controller
+├── nhddctl.sh                     # Android shell wrapper
+├── scripts/
+│   ├── build_nhdd_android.sh      # Build Android ARM64 nhdd
+│   ├── build_webgui_windows.ps1
+│   ├── build_webgui_windows_from_linux.sh
+│   ├── build_fyne_windows.ps1
+│   └── build_fyne_windows_from_linux.sh
+├── gui_web/                       # Go standard-library web GUI
+├── gui/                           # Go/Fyne native GUI
+├── app/                           # Android app scaffold; missing MainActivity.java in this snapshot
+└── BUILD_WINDOWS.md               # Windows/Linux GUI build notes
 ```
 
-The decrypted DEX is not always in the main process. When a package name is provided, NHDD scans all matching processes. When a PID is provided, it only scans that single process.
+## Authorized use only
 
-### Q: Do I need to wait exactly 4 seconds after launch?
+This project is intended for:
 
-Relying on a fixed delay is not recommended. Loading timing varies across protectors, devices, and launch paths. Older workflows often used “dump 3–5 seconds after launch” as a rule of thumb, but the recommended approaches are now:
+- Debugging and analyzing your own apps.
+- Authorized mobile security testing.
+- Malware analysis, packer evaluation, reverse-engineering education, and research.
 
-- `--snapshot`: covers a short time window;
-- `--watch`: covers lazy-loaded scenarios;
-- manually open important feature pages to bring lazy-loaded DEX files into memory.
-
-### Q: Does it work with APatch, Magisk, or KernelSU?
-
-It depends on the root shell permissions, mount namespace, SELinux policy, and ROM restrictions. If the Android controller app cannot access `/data/local/tmp/nhdd`, use ADB instead:
-
-```bash
-adb shell su -c "/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch"
-```
-
-### Q: Can NHDD replace FART?
-
-Not directly. They target different layers:
-
-- NHDD is good at scanning DEX / SO files that are already present in memory;
-- FART-style tools are better at collecting fine-grained information during ART method loading, resolution, and invocation;
-- protectors based on method-level extraction, dynamic restoration, interpreter-private structures, or heavily damaged DEX layouts may require CodeItem dumping, DEX repair, ART hooks, or other analysis techniques.
-
----
-
-## Test Report Template
-
-To avoid exposing unnecessary third-party application information in the README, use a generic template in issues or reports:
-
-| Sample type | Protection type | DEX count | SO count | jadx readable | Core logic visible | Notes |
-|-------------|-----------------|-----------|----------|---------------|--------------------|-------|
-| Authorized sample A | Commercial protector / extraction shell | 76 | 4 | Yes | Yes | Needs watch mode and feature-page triggering |
-| Authorized sample B | Custom protection | 28 | 1 | Yes | Partial | Needs further DEX repair |
-| Authorized sample C | Hotfix / plugin framework | 79 | 0 | Yes | Yes | Hit in multiple processes |
-
----
-
-## Positioning Compared with Common Approaches
-
-| Dimension | NHDD | Frida-dexdump | FART-style tools | fdex2 / ClassLoader hooks |
-|----------|------|---------------|------------------|---------------------------|
-| Core method | External memory read | Target-process injection | ART modification / hook | ClassLoader hook |
-| Enters target process | No | Yes | Yes | Yes |
-| Requires root | Yes | Usually | Usually | Usually |
-| DEX dump | Yes | Yes | Yes | Yes |
-| SO dump | Yes | Usually no | Usually no | Usually no |
-| Lazy-load support | Watch mode | Depends on script | Strong | Depends on hook point |
-| In-process detection surface | Low | High | Medium to high | High |
-| Dependence on DEX repair | Medium | Medium | Low to medium | Medium |
-
-This table describes technical positioning only. It is not a guarantee of stable bypass capability against any specific protector.
-
----
-
-## Roadmap
-
-- [ ] Improve DEX structure validation and corrupted-field diagnostics;
-- [ ] Generate more complete scan reports;
-- [ ] Add DEX coverage statistics;
-- [ ] Improve automatic SO reconstruction after dumping;
-- [ ] Test more Android versions and root solutions;
-- [ ] Improve GUI / TUI device selection and log rendering;
-- [ ] Add more fine-grained failure reason classification.
-
----
+Do not use this project for unauthorized access, bypassing commercial licensing, stealing code or data, or violating third-party rights. Users are responsible for complying with applicable laws, permissions, and testing boundaries. The authors are not responsible for misuse.
 
 ## License
 
-MIT License
-
----
-
-## Authors
-
-- Authors: mansujiaosheng, weixiao
-- GitHub: `https://github.com/mansujiaosheng/NHDD`
-
+MIT
