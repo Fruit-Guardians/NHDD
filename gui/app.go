@@ -74,19 +74,22 @@ func (a *App) GetAppList(adbPath, hostPort string) *GetAppListResult {
 
 // DumpParams 脱壳参数（对齐 TUI 的全部配置）
 type DumpParams struct {
-	Package        string `json:"package"`
-	SuCmd          string `json:"suCmd"`
-	OutputDir      string `json:"outputDir"`
-	AdbPath        string `json:"adbPath"`
-	HostPort       string `json:"hostPort"`
-	Mode           string `json:"mode"`           // dex, so, all
-	Restart        bool   `json:"restart"`        // 是否重启 app
-	Watch          bool   `json:"watch"`          // 是否启用 watch
-	DryLimit       int    `json:"dryLimit"`       // watch 连续几轮无新 DEX 停止
-	MaxSeconds     int    `json:"maxSeconds"`     // watch 最大运行秒数
-	MaxRounds      int    `json:"maxRounds"`      // watch 最大轮数
-	Stealth        bool   `json:"stealth"`        // 是否启用 stealth
-	RegionDelayMs  int    `json:"regionDelayMs"`  // 区域延时毫秒
+	Package       string `json:"package"`
+	SuCmd         string `json:"suCmd"`
+	OutputDir     string `json:"outputDir"`
+	AdbPath       string `json:"adbPath"`
+	HostPort      string `json:"hostPort"`
+	Mode          string `json:"mode"`          // dex, so, all
+	Restart       bool   `json:"restart"`       // 是否重启 app
+	Watch         bool   `json:"watch"`         // 是否启用 watch
+	DryLimit      int    `json:"dryLimit"`      // watch 连续几轮无新 DEX 停止
+	MaxSeconds    int    `json:"maxSeconds"`    // watch 最大运行秒数
+	MaxRounds     int    `json:"maxRounds"`     // watch 最大轮数
+	Stealth       bool   `json:"stealth"`       // 是否启用 stealth
+	Stealth2      bool   `json:"stealth2"`      // 使用 process_vm_readv 替代 /proc/pid/mem（反检测）
+	Relaxed       bool   `json:"relaxed"`       // 宽松 DEX 验证（endian_tag，不依赖 magic）
+	Anon          bool   `json:"anon"`          // 仅扫描匿名内存映射
+	RegionDelayMs int    `json:"regionDelayMs"` // 区域延时毫秒
 }
 
 // DumpResult 脱壳结果
@@ -104,23 +107,23 @@ type DumpResult struct {
 
 // WatchProgress watch 实时进度
 type WatchProgress struct {
-	Round      int  `json:"round"`
-	NewThis    int  `json:"newThis"`
-	Total      int  `json:"total"`
-	Dedup      int  `json:"dedup"`
-	Dry        int  `json:"dry"`
-	DryLimit   int  `json:"dryLimit"`
-	Processes  int  `json:"processes"`
-	DexFiles   int  `json:"dexFiles"`
-	SoFiles    int  `json:"soFiles"`
-	Done       bool `json:"done"`
+	Round     int  `json:"round"`
+	NewThis   int  `json:"newThis"`
+	Total     int  `json:"total"`
+	Dedup     int  `json:"dedup"`
+	Dry       int  `json:"dry"`
+	DryLimit  int  `json:"dryLimit"`
+	Processes int  `json:"processes"`
+	DexFiles  int  `json:"dexFiles"`
+	SoFiles   int  `json:"soFiles"`
+	Done      bool `json:"done"`
 }
 
 // nhdd 输出解析正则
 var (
-	reRound  = regexp.MustCompile(`round\s+(\d+):\s*\+(\d+)\s+new unique DEX\s+\(total=(\d+),\s*dry=(\d+)/(\d+)`)
-	reProc   = regexp.MustCompile(`Resolved.*->\s*(\d+)\s+process`)
-	reDone   = regexp.MustCompile(`Done\..*DEX unique=(\d+).*dedup_skipped=(\d+).*SO=(\d+)`)
+	reRound   = regexp.MustCompile(`round\s+(\d+):\s*\+(\d+)\s+new unique DEX\s+\(total=(\d+),\s*dry=(\d+)/(\d+)`)
+	reProc    = regexp.MustCompile(`Resolved.*->\s*(\d+)\s+process`)
+	reDone    = regexp.MustCompile(`Done\..*DEX unique=(\d+).*dedup_skipped=(\d+).*SO=(\d+)`)
 	reDexFile = regexp.MustCompile(`^\[\+\]\s+DEX:`)
 	reSoFile  = regexp.MustCompile(`^\[\+\]\s+SO:`)
 )
@@ -211,6 +214,15 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 		if params.RegionDelayMs > 0 {
 			nhddCmdParts = append(nhddCmdParts, "--region-delay", strconv.Itoa(params.RegionDelayMs))
 		}
+	}
+	if params.Stealth2 {
+		nhddCmdParts = append(nhddCmdParts, "--stealth2")
+	}
+	if params.Relaxed {
+		nhddCmdParts = append(nhddCmdParts, "--relaxed")
+	}
+	if params.Anon {
+		nhddCmdParts = append(nhddCmdParts, "--anon")
 	}
 
 	nhddCmdStr := strings.Join(nhddCmdParts, " ")

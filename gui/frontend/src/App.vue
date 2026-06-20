@@ -98,6 +98,17 @@
             <input type="number" v-model.number="regionDelayMs" min="0" max="100" />
           </div>
         </div>
+        <div class="form-group">
+          <label><input type="checkbox" v-model="stealth2" /> stealth2(process_vm_readv反检测)</label>
+          <span class="hint">避免壳检测/proc/pid/mem被打开，二代壳推荐</span>
+        </div>
+        <div class="form-group">
+          <label><input type="checkbox" v-model="relaxed" /> relaxed(宽松DEX验证)</label>
+          <span class="hint">通过endian_tag验证，不依赖被抹除的magic</span>
+        </div>
+        <div class="form-group">
+          <label><input type="checkbox" v-model="anon" /> anon(仅扫描匿名映射)</label>
+        </div>
 
         <div class="info-section">
           <span class="info-label">nhdd: {{ nhddPath }}</span>
@@ -198,6 +209,9 @@ export default {
       maxSeconds: 120,
       maxRounds: 60,
       stealth: false,
+      stealth2: false,
+      relaxed: false,
+      anon: false,
       regionDelayMs: 2,
 
       // State
@@ -317,6 +331,9 @@ export default {
           maxSeconds: this.maxSeconds,
           maxRounds: this.maxRounds,
           stealth: this.stealth,
+          stealth2: this.stealth2,
+          relaxed: this.relaxed,
+          anon: this.anon,
           regionDelayMs: this.regionDelayMs,
         })
 
