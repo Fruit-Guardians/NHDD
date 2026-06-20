@@ -29,11 +29,8 @@ For second-generation extraction shells, use NHDD as a **low-intrusion auxiliary
 |---|---:|---|
 | `nhdd.c` | Ready | Core Android ARM64 scanner. Supports DEX/SO, package multi-process scanning, snapshots, watch mode, de-duplication, and DEX checksum repair. |
 | `nhdd_tui.py` | Recommended | Terminal UI with root-command configuration, watch progress, and result pulling. Best daily entry point in this snapshot. |
-| `nhdd_ctrl.py` | Basic | Simple Python controller. Defaults to force-stop, launch, and watch. Root wrapping is limited; use the TUI for complex root setups. |
-| `gui_web/` | Usable | Dependency-free Go local web UI, suitable for Windows packaging. Current flow is fixed-wait based, not a full TUI/watch replacement. |
-| `gui/` | Optional | Go/Fyne native GUI. Requires Fyne dependencies and a generated `go.sum`. |
+| `gui/` | Wails GUI | Go + Wails v2 desktop GUI with Web frontend. No CGO required. |
 | `fix_dex_checksum.py` | Ready | Standalone DEX header, SHA-1, and Adler32 repair tool. |
-| `app/` | Incomplete | This snapshot contains Manifest/resources only and is missing `MainActivity.java`; do not document it as a ready-to-build Android app yet. |
 
 ## Features
 
@@ -209,36 +206,26 @@ The TUI lets you configure:
 - Dump mode: DEX, SO, or ALL.
 - Local output directory.
 
-## Web GUI workflow
+## Desktop GUI workflow
 
-`gui_web/` is a local browser-based GUI built with the Go standard library. It is useful for Windows packaging and does not depend on Fyne.
+The desktop GUI is built with Go + Wails v2, providing a native window with a Web frontend. No CGO or GCC required.
 
 Build:
 
 ```bash
-cd gui_web
-go build -trimpath -ldflags='-s -w' -o nhdd-gui-web .
+cd gui
+wails build
 ```
 
 Place the Android ARM64 `nhdd` binary next to the GUI executable:
 
 ```text
 NHDD-run/
-├── nhdd-gui-web.exe
+├── nhdd-gui.exe
 └── nhdd
 ```
 
-Current limitation: the Web GUI uses a fixed-wait flow: force-stop, launch, wait, dump, pull. It is not equivalent to the TUI’s full watch workflow. For multi-process packers or lazy-loaded DEX, prefer the command line or `nhdd_tui.py`.
-
-## Fyne GUI workflow
-
-```bash
-cd gui
-go mod tidy
-go build -o nhdd-gui .
-```
-
-If Go reports missing `go.sum` entries, run `go mod tidy` first. The Fyne GUI requires CGO and graphical dependencies. See `BUILD_WINDOWS.md` for Windows packaging notes.
+The GUI supports: ADB connection, app list, root command configuration, dump mode (DEX/SO/ALL), watch mode, and result pulling.
 
 ## Standalone DEX repair
 
@@ -264,7 +251,7 @@ Many Android apps run multiple processes. The actual decrypted DEX may live in a
 
 ### Why can the GUI produce fewer results than command line or TUI?
 
-In this repository snapshot, `gui/` and `gui_web/` use a fixed-wait flow, and parts of the GUI logic prefer the first PID returned by `pidof`. That can bypass the core scanner’s package multi-process mode. For multi-process or lazy-load targets, use:
+The GUI may use a fixed-wait flow in some scenarios. For multi-process or lazy-load targets, use:
 
 ```bash
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
@@ -294,7 +281,7 @@ adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump 
 
 ### Can the Android app module be built directly?
 
-Not in this snapshot. The `app/` module is missing `app/src/main/java/com/nhdd/app/MainActivity.java`, so it should be treated as an unfinished scaffold.
+Not in this snapshot. The `app/` module is not included in this repository.
 
 ## Project layout
 
@@ -303,17 +290,11 @@ NHDD/
 ├── nhdd.c                         # Android-side core scanner
 ├── fix_dex_checksum.py            # Standalone DEX repair tool
 ├── nhdd_tui.py                    # Recommended TUI controller
-├── nhdd_ctrl.py                   # Simple Python controller
-├── nhddctl.sh                     # Android shell wrapper
 ├── scripts/
 │   ├── build_nhdd_android.sh      # Build Android ARM64 nhdd
-│   ├── build_webgui_windows.ps1
-│   ├── build_webgui_windows_from_linux.sh
 │   ├── build_fyne_windows.ps1
 │   └── build_fyne_windows_from_linux.sh
-├── gui_web/                       # Go standard-library web GUI
-├── gui/                           # Go/Fyne native GUI
-├── app/                           # Android app scaffold; missing MainActivity.java in this snapshot
+├── gui/                           # Go/Wails v2 desktop GUI
 └── BUILD_WINDOWS.md               # Windows/Linux GUI build notes
 ```
 

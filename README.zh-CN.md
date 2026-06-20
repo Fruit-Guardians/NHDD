@@ -2,9 +2,9 @@
 
 NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存 DEX/SO Dump 工具**。它的核心程序 `nhdd` 以独立 root 进程运行，通过读取目标进程的 `/proc/<pid>/maps` 和 `/proc/<pid>/mem`，在内存中扫描 DEX/ELF magic，并将已加载到内存中的 DEX 或 SO 导出到文件。
 
-和 Frida/Xposed/FART/fdex2 这类“进程内 Hook/注入”路线不同，NHDD 的核心思路是：**不向目标 App 注入代码，不修改目标进程方法入口，不依赖 ART Hook**。这可以显著降低由进程内 Hook、注入库、异常线程名、方法入口跳转等特征带来的暴露面。
+和 Frida/Xposed/FART/fdex2 这类"进程内 Hook/注入"路线不同，NHDD 的核心思路是：**不向目标 App 注入代码，不修改目标进程方法入口，不依赖 ART Hook**。这可以显著降低由进程内 Hook、注入库、异常线程名、方法入口跳转等特征带来的暴露面。
 
-> 重要说明：No-Hook 不等于“绝对无法检测”。目标 App、系统策略或加固方案仍可能通过进程状态变化、外部访问副作用、root 环境、SELinux 策略、进程被杀等方式影响结果。NHDD 的优势是低侵入、外部读取、部署简单，而不是承诺零风险或万能脱壳。
+> 重要说明：No-Hook 不等于"绝对无法检测"。目标 App、系统策略或加固方案仍可能通过进程状态变化、外部访问副作用、root 环境、SELinux 策略、进程被杀等方式影响结果。NHDD 的优势是低侵入、外部读取、部署简单，而不是承诺零风险或万能脱壳。
 
 ## 适用范围
 
@@ -25,14 +25,11 @@ NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存
 ## 当前仓库状态
 
 | 模块 | 状态 | 说明 |
-|---|---:|---|
+|---|---|---|
 | `nhdd.c` | 可用 | 核心 Android ARM64 扫描器，支持 DEX/SO、包名多进程、快照、watch、去重、DEX 校验修复。 |
 | `nhdd_tui.py` | 推荐 | 终端交互版，支持 root 命令配置、watch 实时进度、拉取结果。当前最适合作为日常入口。 |
-| `nhdd_ctrl.py` | 可用但简单 | 电脑端 Python 控制脚本，默认 force-stop、启动、watch；root 包装能力弱，复杂 root 环境建议用 TUI。 |
-| `gui_web/` | 可用 | Go 标准库 Web GUI，适合 Windows 打包；当前是固定等待模型，不是完整 watch/TUI 能力。 |
-| `gui/` | 可选 | Go/Fyne 原生 GUI，需要补齐/生成 `go.sum` 并安装 Fyne 依赖。 |
+| `gui/` | Wails GUI | Go + Wails v2 桌面 GUI，Web 前端，不需要 CGO。 |
 | `fix_dex_checksum.py` | 可用 | 独立 DEX header、SHA-1、Adler32 修复工具。 |
-| `app/` | 未完成 | 当前仓库只有 Manifest 和资源，缺少 `MainActivity.java`，不应按“可直接构建 Android App”宣传。 |
 
 ## 核心特性
 
@@ -133,7 +130,7 @@ sleep 4
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --dex'
 ```
 
-固定等待适合简单场景，但对强对抗壳不一定稳定。很多时候“扫已运行进程 + watch”比“强制重启 + 等 4 秒”更稳。
+固定等待适合简单场景，但对强对抗壳不一定稳定。很多时候"扫已运行进程 + watch"比"强制重启 + 等 4 秒"更稳。
 
 ### 3. 快照轮询
 
@@ -208,36 +205,26 @@ TUI 会提示：
 - dump 模式选择 DEX、SO 或 ALL。
 - 本地输出目录。
 
-## Web GUI 使用方式
+## 桌面 GUI 使用方式
 
-`gui_web/` 是基于 Go 标准库的本地 Web GUI，适合 Windows 打包，不依赖 Fyne。
+桌面 GUI 基于 Go + Wails v2，提供原生窗口 + Web 前端，不需要 CGO 或 GCC。
 
 构建：
 
 ```bash
-cd gui_web
-go build -trimpath -ldflags='-s -w' -o nhdd-gui-web .
+cd gui
+wails build
 ```
 
 运行时把 Android ARM64 版 `nhdd` 放在 GUI 可执行文件同目录：
 
 ```text
 NHDD-run/
-├── nhdd-gui-web.exe
+├── nhdd-gui.exe
 └── nhdd
 ```
 
-说明：当前 Web GUI 主要是“force-stop → launch → wait → dump → pull”的固定等待流程，不等价于 TUI 的完整 watch 交互能力。若目标存在多进程或 lazy-load，优先使用命令行或 `nhdd_tui.py`。
-
-## Fyne GUI 使用方式（可选）
-
-```bash
-cd gui
-go mod tidy
-go build -o nhdd-gui .
-```
-
-如果构建时报 `missing go.sum entry`，先执行 `go mod tidy`。Fyne 版本需要 CGO 和图形依赖，Windows 打包可参考 `BUILD_WINDOWS.md`。
+GUI 支持：ADB 连接、应用列表、root 命令配置、dump 模式（DEX/SO/ALL）、watch 模式、结果拉取。
 
 ## 独立修复 DEX
 
@@ -263,7 +250,7 @@ python3 fix_dex_checksum.py path/to/classes.dex
 
 ### 2. 为什么 GUI 结果比命令行/TUI 少？
 
-当前 `gui/` 和 `gui_web/` 的流程偏固定等待，并且部分逻辑会优先使用 `pidof` 返回的第一个 PID。这样可能绕过 `nhdd` 的包名多进程扫描能力。遇到多进程壳或 lazy-load 场景，建议用：
+GUI 在某些场景下可能使用固定等待流程。遇到多进程壳或 lazy-load 场景，建议用：
 
 ```bash
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
@@ -283,7 +270,7 @@ adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump 
 - root 命令没有真正获得读取 `/proc/<pid>/mem` 的权限。
 - 目标 DEX 只短暂存在，单轮扫描错过了时机。
 - 真实 DEX 在子进程，但你传入了单个 PID。
-- 壳不是“完整 DEX 驻留内存”模型，而是方法级抽取/动态恢复。
+- 壳不是"完整 DEX 驻留内存"模型，而是方法级抽取/动态恢复。
 
 建议先用包名 + watch：
 
@@ -293,7 +280,7 @@ adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump 
 
 ### 5. Android App 能直接编译吗？
 
-当前仓库快照中 `app/` 缺少 `app/src/main/java/com/nhdd/app/MainActivity.java`，因此 Android App 模块不是可直接构建状态。README 不建议把它作为当前可用入口宣传。
+当前仓库不包含 `app/` 模块。
 
 ## 项目结构
 
@@ -302,17 +289,11 @@ NHDD/
 ├── nhdd.c                         # Android 端核心扫描器
 ├── fix_dex_checksum.py            # 独立 DEX 修复工具
 ├── nhdd_tui.py                    # 推荐 TUI 控制器
-├── nhdd_ctrl.py                   # 简单 Python 控制器
-├── nhddctl.sh                     # 设备端 shell 包装脚本
 ├── scripts/
 │   ├── build_nhdd_android.sh      # 构建 Android ARM64 nhdd
-│   ├── build_webgui_windows.ps1
-│   ├── build_webgui_windows_from_linux.sh
 │   ├── build_fyne_windows.ps1
 │   └── build_fyne_windows_from_linux.sh
-├── gui_web/                       # Go 标准库 Web GUI
-├── gui/                           # Go/Fyne 原生 GUI
-├── app/                           # Android App 脚手架，当前缺 MainActivity.java
+├── gui/                           # Go/Wails v2 桌面 GUI
 └── BUILD_WINDOWS.md               # Windows/Linux GUI 构建说明
 ```
 

@@ -7,11 +7,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 const deviceDumpDir = "/data/local/tmp/nhdd_dump"
 
-// RunADB executes an adb command with optional -H/-P flags, and returns stdout+stderr.
+// RunADB 执行 adb 命令，支持可选的 -H/-P 参数
 func RunADB(adbPath string, hostPort string, args ...string) (string, error) {
 	var cmdArgs []string
 	if hostPort != "" {
@@ -37,7 +38,7 @@ func trimOutput(out string) string {
 	return ": " + out
 }
 
-// shellQuote quotes a string for Android /system/bin/sh.
+// shellQuote 为 Android /system/bin/sh 引用字符串
 func shellQuote(s string) string {
 	if s == "" {
 		return "''"
@@ -51,19 +52,12 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
-// RunShell executes an Android shell command as one shell string.
+// RunShell 执行 Android shell 命令
 func RunShell(adbPath, hostPort, command string) (string, error) {
 	return RunADB(adbPath, hostPort, "shell", command)
 }
 
-// RunShellMaybeRoot executes command through su/kp/ksud when suCmd is set.
-// Supported examples:
-//
-//	suCmd=""       -> <command>
-//	suCmd="su -c"  -> su -c '<command>'
-//	suCmd="kp -c"  -> kp -c '<command>'
-//	suCmd="su 0 -c" -> su 0 -c '<command>'
-//	suCmd="xxx {cmd}" -> replace {cmd} with quoted command
+// RunShellMaybeRoot 通过 su/kp/ksud 执行命令
 func RunShellMaybeRoot(adbPath, hostPort, suCmd, command string) (string, error) {
 	suCmd = strings.TrimSpace(suCmd)
 	if suCmd == "" {
@@ -76,7 +70,7 @@ func RunShellMaybeRoot(adbPath, hostPort, suCmd, command string) (string, error)
 	return RunShell(adbPath, hostPort, suCmd+" "+quoted)
 }
 
-// GetDeviceList returns list of connected device IDs.
+// GetDeviceList 返回已连接设备列表
 func GetDeviceList(adbPath, hostPort string) ([]string, error) {
 	out, err := RunADB(adbPath, hostPort, "devices")
 	if err != nil {
@@ -97,8 +91,8 @@ func GetDeviceList(adbPath, hostPort string) ([]string, error) {
 	return devices, nil
 }
 
-// GetAppList returns list of third-party package names.
-func GetAppList(adbPath, hostPort string) ([]string, error) {
+// GetAppListInternal 返回第三方应用包名列表
+func GetAppListInternal(adbPath, hostPort string) ([]string, error) {
 	out, err := RunADB(adbPath, hostPort, "shell", "pm", "list", "packages", "-3")
 	if err != nil {
 		return nil, fmt.Errorf("pm list packages failed: %w%s", err, trimOutput(out))
@@ -114,7 +108,7 @@ func GetAppList(adbPath, hostPort string) ([]string, error) {
 	return pkgs, nil
 }
 
-// PushNhdd pushes the Android ARM64 nhdd binary to /data/local/tmp/nhdd and chmods it.
+// PushNhdd 推送 nhdd 二进制到设备
 func PushNhdd(adbPath, hostPort, localPath string) error {
 	if _, err := os.Stat(localPath); err != nil {
 		return fmt.Errorf("local nhdd not found at %s: %w", localPath, err)
@@ -130,9 +124,8 @@ func PushNhdd(adbPath, hostPort, localPath string) error {
 	return nil
 }
 
-// DumpApp executes force-stop -> clean -> launch -> wait -> nhdd on the phone.
+// DumpApp 执行 force-stop -> clean -> launch -> wait -> nhdd
 func DumpApp(adbPath, hostPort, suCmd, pkg string, waitSec int, mode string) (string, error) {
-	// Force stop. Failure is not fatal on all devices, but return it because the GUI logs the step explicitly.
 	out, err := RunADB(adbPath, hostPort, "shell", "am", "force-stop", pkg)
 	if err != nil {
 		return out, fmt.Errorf("force-stop failed: %w%s", err, trimOutput(out))
@@ -147,7 +140,7 @@ func DumpApp(adbPath, hostPort, suCmd, pkg string, waitSec int, mode string) (st
 		return out, fmt.Errorf("launch app failed: %w%s", err, trimOutput(out))
 	}
 
-	waitForSeconds(waitSec)
+	time.Sleep(time.Duration(waitSec) * time.Second)
 
 	modeArg := "--dex"
 	switch strings.ToLower(strings.TrimSpace(mode)) {
@@ -172,8 +165,7 @@ func DumpApp(adbPath, hostPort, suCmd, pkg string, waitSec int, mode string) (st
 	return out, nil
 }
 
-// PullDumpFiles pulls /data/local/tmp/nhdd_dump/. to localDir/pkg/ recursively,
-// then cleans up the dump directory on the phone. Returns DEX and SO counts.
+// PullDumpFiles 拉取 dump 文件到本地，返回 DEX 和 SO 数量
 func PullDumpFiles(adbPath, hostPort, localDir, pkg string) (int, int, error) {
 	targetDir := filepath.Join(localDir, pkg)
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
@@ -196,10 +188,4 @@ func PullDumpFiles(adbPath, hostPort, localDir, pkg string) (int, int, error) {
 		return len(dexFiles), 0, err
 	}
 	return len(dexFiles), len(soFiles), nil
-}
-
-// PullDexFiles is kept for compatibility with older callers.
-func PullDexFiles(adbPath, hostPort, localDir, pkg string) (int, error) {
-	dexCount, _, err := PullDumpFiles(adbPath, hostPort, localDir, pkg)
-	return dexCount, err
 }

@@ -6,15 +6,11 @@ nhdd
 *.jar
 *.so
 local.properties
-.gradle/
 build/
-/app/build/
 .idea/
 *.iml
 .cxx/
 nhdd_output/
-gui/nhdd-gui
 gui/nhdd_output/
-gui/go.sum
 third_party/SoFixer/build_android64/
 third_party/SoFixer/build/
