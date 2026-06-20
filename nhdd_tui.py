@@ -449,7 +449,7 @@ def _pump(stream, st: DashState, is_stderr):
 # ---------------------------------------------------------------------------
 # 结果:pull + 统计
 # ---------------------------------------------------------------------------
-def pull_and_summarize(pkg, st: DashState, output_dir):
+def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd=""):
     local = os.path.join(output_dir, pkg)
     os.makedirs(local, exist_ok=True)
     # 防御:拉取前清空本地 dex/so 子目录的旧文件,避免上次同 app 结果残留合并进来。
@@ -462,6 +462,12 @@ def pull_and_summarize(pkg, st: DashState, output_dir):
                     except OSError: pass
     rc, out = adb("pull", f"{DEVICE_DUMP_DIR}/.", local + os.sep)
     pulled_ok = rc == 0
+
+    # 拉取成功后清理设备端 dump 文件
+    if pulled_ok:
+        console.print("[dim]清理设备端 dump 文件...[/]")
+        adb_shell_root(f"rm -rf {DEVICE_DUMP_DIR}", su_cmd)
+        console.print("[dim]设备端 dump 文件已清理[/]")
 
     # 统计本地文件
     dex_count = so_count = 0
@@ -556,11 +562,11 @@ def main():
         console.print(f"[green]输出目录(命令行指定):[/] {output_override}")
 
     st = run_dump(pkg, cfg)
-    if st.procs == 0:
+    if st.processes == 0:
         console.print("[yellow]未扫描到任何进程(目标未运行或被杀),跳过拉取。[/]")
         console.print("[yellow]建议:先手动打开 app 再扫,或在配置里开启「重启 app 再扫」。[/]")
         return
-    pull_and_summarize(pkg, st, cfg["output_dir"])
+    pull_and_summarize(pkg, st, cfg["output_dir"], cfg.get("su_cmd", ""))
     console.print("\n[bold green]全部完成。[/]")
 
 

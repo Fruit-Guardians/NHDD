@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -254,6 +255,7 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 	cmdArgs = append(cmdArgs, "shell", fullShellCmd)
 
 	cmd := exec.Command(adbPath, cmdArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	cmd.Start()
@@ -294,7 +296,7 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 	targetDir := filepath.Join(outputDir, pkg)
 	os.MkdirAll(targetDir, 0755)
 
-	dexCount, soCount, err := PullDumpFiles(adbPath, hostPort, outputDir, pkg)
+	dexCount, soCount, err := PullDumpFiles(adbPath, hostPort, outputDir, pkg, suCmd)
 	if err != nil {
 		a.log(fmt.Sprintf("拉取 dump 文件失败: %v", err))
 		return &DumpResult{Success: false, Message: fmt.Sprintf("拉取失败: %v", err)}

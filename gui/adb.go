@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -23,6 +24,7 @@ func RunADB(adbPath string, hostPort string, args ...string) (string, error) {
 	}
 	cmdArgs = append(cmdArgs, args...)
 	cmd := exec.Command(adbPath, cmdArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
@@ -166,7 +168,7 @@ func DumpApp(adbPath, hostPort, suCmd, pkg string, waitSec int, mode string) (st
 }
 
 // PullDumpFiles 拉取 dump 文件到本地，返回 DEX 和 SO 数量
-func PullDumpFiles(adbPath, hostPort, localDir, pkg string) (int, int, error) {
+func PullDumpFiles(adbPath, hostPort, localDir, pkg, suCmd string) (int, int, error) {
 	targetDir := filepath.Join(localDir, pkg)
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return 0, 0, fmt.Errorf("create output dir failed: %w", err)
@@ -177,7 +179,8 @@ func PullDumpFiles(adbPath, hostPort, localDir, pkg string) (int, int, error) {
 		return 0, 0, fmt.Errorf("adb pull failed: %w%s", err, trimOutput(out))
 	}
 
-	_, _ = RunShell(adbPath, hostPort, "rm -rf "+shellQuote(deviceDumpDir))
+	// 用 root 删除设备端 dump 文件（nhdd 用 root 写的文件需 root 才能删）
+	_, _ = RunShellMaybeRoot(adbPath, hostPort, suCmd, "rm -rf "+shellQuote(deviceDumpDir))
 
 	dexFiles, err := findDexFiles(targetDir)
 	if err != nil {
