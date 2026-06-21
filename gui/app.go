@@ -329,6 +329,23 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 		badFiles = stats.BadFiles
 	}
 
+	// Step 6b: 修复 SO (内建 ELF 修复, 替代外部 SoFixer)
+	if soCount > 0 {
+		a.log("[6b] 修复 SO 文件...")
+		soStats, soErr := FixSoDirectory(targetDir)
+		if soErr != nil {
+			a.log(fmt.Sprintf("修复 SO 出错: %v", soErr))
+		} else {
+			a.log(fmt.Sprintf("[6b] SO 修复完成: %d OK, %d 修复, %d 损坏已隔离", soStats.OK, soStats.Fixed, soStats.Bad))
+			if soStats.Bad > 0 {
+				a.log(fmt.Sprintf("  [警告] 损坏 SO: %v", soStats.BadFiles))
+			}
+			fixedCount += soStats.Fixed
+			badCount += soStats.Bad
+			badFiles = append(badFiles, soStats.BadFiles...)
+		}
+	}
+
 	// 计算总大小
 	var totalSize int64
 	filepath.WalkDir(targetDir, func(path string, entry os.DirEntry, err error) error {
