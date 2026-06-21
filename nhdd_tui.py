@@ -505,6 +505,61 @@ def auto_classify_and_fix(dex_dir, local_dir):
         pass
 
 
+def auto_classify_and_fix_so(so_dir, local_dir):
+    """对齐 fix_so.py:校验→修复(p_offset=p_vaddr,补magic)→重校验→落盘。
+
+    文件处置:过小/非ELF 且结构无效删除,不可修移 invalid/,否则修 p_offset。
+    统计口径与 DEX 一致:OK(含已修复)/修复/损坏已隔离。
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "fix_so", os.path.join(os.path.dirname(os.path.abspath(__file__)), "fix_so.py"))
+        fix_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fix_mod)
+    except Exception as e:
+        console.print(f"[yellow]无法加载 fix_so: {e}[/]")
+        return
+
+    stats = fix_mod.fix_directory_aligned(so_dir)
+    if stats["total"] == 0:
+        return
+
+    ct = Table(title="SO 校验分类", box=box.ROUNDED, border_style="magenta")
+    ct.add_column("类别", style="bold")
+    ct.add_column("数量", style="cyan")
+    ct.add_column("说明", style="dim")
+    ct.add_row("[green]OK[/]", str(stats["ok"]),
+               "PHT/LOAD/.dynamic 有效,可加载 IDA(含已修复)")
+    ct.add_row("[yellow]修复[/]", str(stats["fixed"]),
+               "p_offset=p_vaddr 对齐 / magic 已补回")
+    ct.add_row("[red]损坏已隔离[/]", str(stats["bad"]),
+               "过小/非ELF 已删除,不可修已移至 invalid/")
+    ct.add_row("[bold]总计[/]", str(stats["total"]), "")
+    console.print()
+    console.print(ct)
+
+    if stats["bad"]:
+        console.print(f"\n[red]损坏文件:[/] {', '.join(stats['bad_files'])}")
+    if stats["bad"] == 0:
+        console.print("\n[bold green]全部 SO 通过校验！[/]")
+
+    # 追加到同一日志
+    log_path = os.path.join(local_dir, "log.txt")
+    try:
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write(f"\nSO Validation Report\n")
+            lf.write(f"{'='*40}\n")
+            lf.write(f"Total: {stats['total']}  OK: {stats['ok']}  "
+                     f"Fixed: {stats['fixed']}  Bad: {stats['bad']}\n\n")
+            if stats["bad_files"]:
+                lf.write("Bad files:\n")
+                for name in stats["bad_files"]:
+                    lf.write(f"  {name}\n")
+    except OSError:
+        pass
+
+
 def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd=""):
     local = os.path.join(output_dir, pkg)
     os.makedirs(local, exist_ok=True)
@@ -555,6 +610,9 @@ def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd=""):
     dex_dir = os.path.join(local, "dex")
     if os.path.isdir(dex_dir) and dex_count > 0:
         auto_classify_and_fix(dex_dir, local)
+    so_dir = os.path.join(local, "so")
+    if os.path.isdir(so_dir) and so_count > 0:
+        auto_classify_and_fix_so(so_dir, local)
     if not pulled_ok:
         console.print(f"[yellow]注意: adb pull 返回非零,文件可能仍在设备 {DEVICE_DUMP_DIR}[/]")
     return local

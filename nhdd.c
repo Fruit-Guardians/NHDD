@@ -43,6 +43,32 @@ static const uint8_t kElfMagic[] = {0x7f, 0x45, 0x4c, 0x46}; // \x7fELF
 // Second-gen packers often erase the "dex\n" magic but rarely touch this.
 static const uint32_t kDexEndianTag = 0x12345678;
 
+// ---- DEX map_list item sizes (bytes per entry) for each section type ----
+// Used to recover DEX extent when file_size is erased (FRIDA-DEXDump approach:
+// walk map_list, take max(offset + count*item_size) over all entries).
+// map_list type codes (DexFile.h): 0x0000 header, 0x0001 string_id, 0x0002 type_id,
+// 0x0003 proto_id, 0x0004 field_id, 0x0005 method_id, 0x0006 class_def,
+// 0x0007 call_site_id, 0x0008 method_handle, 0x1000 map_list, 0x1001 type_list,
+// 0x1002 anno_set_ref_list, 0x1003 anno_set_item, 0x1004 class_data_item,
+// 0x1005 code_item, 0x1006 string_data_item, 0x1007 debug_info, 0x1008 anno_item,
+// 0x1009 encoded_array, 0x100A annotations_directory.
+#define DEX_TYPE_MAP_LIST 0x1000
+static uint32_t dex_map_item_size(uint16_t type) {
+    switch (type) {
+        case 0x0000: return 0x70;        // header
+        case 0x0001: return 4;          // string_id
+        case 0x0002: return 4;          // type_id
+        case 0x0003: return 12;         // proto_id
+        case 0x0004: return 8;          // field_id
+        case 0x0005: return 8;          // method_id
+        case 0x0006: return 32;         // class_def
+        case 0x0007: return 4;          // call_site_id
+        case 0x0008: return 8;          // method_handle
+        case DEX_TYPE_MAP_LIST: return 0; // map_list entry itself (count is the list)
+        default:    return 0;          // variable-size / unknown (string_data, code_item, ...)
+    }
+}
+
 // ---- Dump mode ----
 #define MODE_DEX 1
 #define MODE_SO  2
@@ -146,6 +172,77 @@ static ssize_t vm_readv_retry(pid_t pid, void *buf, size_t want, uintptr_t remot
 // Validate a DEX hit to filter false-positive magic in random data.
 // `magic_off` points at the "dex\n" within `buf` (n bytes available there).
 // Returns 1 if the version tag + size + header fields look like a real DEX.
+// Recover DEX file_size when the header field is erased/zero (FRIDA-DEXDump idea).
+// `hdr` is a full 0x70 DEX header. We can't read the map_list from `hdr` alone
+// (it lives at map_off, beyond the header), so this returns a *provisional* extent
+// derived from the data section (data_off + data_size) when file_size is bad.
+// The caller must then read the map_list from memory and finalize the real size
+// via dex_recover_size_from_map_buf(). Returns 0 if no provisional size can be found.
+static uint32_t dex_recover_size_provisional(const uint8_t *hdr) {
+    uint32_t data_size = 0, data_off = 0;
+    memcpy(&data_size, hdr + 0x68, 4);
+    memcpy(&data_off,  hdr + 0x6C, 4);
+    if (data_off == 0 || data_size == 0) return 0;
+    uint64_t end = (uint64_t)data_off + (uint64_t)data_size;
+    if (end < 0x70 || end > 0x10000000) return 0;
+    return (uint32_t)end;
+}
+
+// Given a DEX memory image of `cap` bytes (read into a buffer by the caller),
+// walk the map_list at map_off and compute the real extent = max over entries of
+// (offset + count*item_size), including the map_list itself. Returns 0 on failure.
+static uint32_t dex_recover_size_from_map_buf(const uint8_t *img, size_t cap, uint32_t map_off) {
+    if (map_off < 0x70 || map_off + 4 > cap) return 0;
+    uint32_t count = 0;
+    memcpy(&count, img + map_off, 4);
+    if (count == 0 || count > 50) return 0;  // a real DEX has <50 distinct section types
+    uint32_t map_end = map_off + 4 + count * 12;
+    if (map_end > cap) return 0;
+
+    uint32_t extent = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *ent = img + map_off + 4 + i * 12;
+        uint16_t type = 0;
+        uint32_t ecount = 0, eoff = 0;
+        memcpy(&type, ent, 2);
+        memcpy(&ecount, ent + 4, 4);
+        memcpy(&eoff, ent + 8, 4);
+        uint32_t isz = dex_map_item_size(type);
+        if (isz == 0) continue;  // variable-size section: skip (can't compute extent)
+        if (eoff == 0) continue;
+        uint64_t end = (uint64_t)eoff + (uint64_t)ecount * (uint64_t)isz;
+        if (end > extent && end <= 0x10000000) extent = (uint32_t)end;
+    }
+    if (map_end > extent) extent = map_end;  // map_list itself is part of the file
+    if (extent < 0x70 || extent > 0x10000000) return 0;
+    return extent;
+}
+
+// Strong confirmation that a candidate region is a real DEX (FRIDA-DEXDump keys):
+//   (1) string_ids_off == 0x70  (string_ids table immediately follows the header)
+//   (2) map_list contains a TYPE_MAP_LIST(0x1000) entry whose offset == header.map_off
+// `img` is the DEX memory image (at least up to map_end), `cap` its readable size.
+// These are the structural signals FRIDA-DEXDump uses to confirm a DEX when the
+// magic has been erased; they cut false positives vs endian_tag alone.
+static int dex_confirm_by_map_list(const uint8_t *img, size_t cap, uint32_t map_off,
+                                   uint32_t string_ids_off) {
+    if (string_ids_off != 0x70) return 0;  // (1) header immediately followed by string_ids
+    if (map_off < 0x70 || map_off + 4 > cap) return 0;
+    uint32_t count = 0;
+    memcpy(&count, img + map_off, 4);
+    if (count == 0 || count > 50) return 0;
+    if (map_off + 4 + (size_t)count * 12 > cap) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *ent = img + map_off + 4 + i * 12;
+        uint16_t type = 0;
+        uint32_t eoff = 0;
+        memcpy(&type, ent, 2);
+        memcpy(&eoff, ent + 8, 4);
+        if (type == DEX_TYPE_MAP_LIST && eoff == map_off) return 1;  // (2) self-reference
+    }
+    return 0;
+}
+
 static int dex_hit_valid(const uint8_t *buf, size_t n, size_t magic_off, uint32_t *out_size) {
     // version tag: bytes after magic must start with a digit (covers 035..041).
     size_t v = magic_off + 4;
@@ -162,7 +259,6 @@ static int dex_hit_valid(const uint8_t *buf, size_t n, size_t magic_off, uint32_
         *out_size = 0;
         return 1;
     }
-    if (dex_size < 0x70 || dex_size > 0x10000000) return 0;
 
     // Header cross-checks (sanity): header_size==0x70, key offsets within file.
     uint32_t header_size = 0, string_ids_off = 0, class_defs_off = 0;
@@ -170,6 +266,17 @@ static int dex_hit_valid(const uint8_t *buf, size_t n, size_t magic_off, uint32_
     memcpy(&string_ids_off, buf + magic_off + 0x3c, 4);
     memcpy(&class_defs_off, buf + magic_off + 0x64, 4);
     if (header_size != 0x70) return 0;
+
+    // file_size erased/zero (FRIDA-DEXDump case): defer — caller recovers size
+    // from the map_list via dex_recover_size_from_map(). Signal with *out_size = 0
+    // and return 1, but only if the structural cross-checks still hold against a
+    // generous upper bound (we can't trust file_size here, so check < 0x10000000).
+    if (dex_size == 0 || dex_size < 0x70 || dex_size > 0x10000000) {
+        // Use the in-page map_off if available to sanity-check structure; otherwise
+        // require the caller to re-read a full header. Accept deferred recovery.
+        *out_size = 0;
+        return 1;
+    }
     if (string_ids_off >= dex_size) return 0;
     if (class_defs_off >= dex_size) return 0;
 
@@ -205,10 +312,13 @@ static int dex_header_relaxed_valid(const uint8_t *hdr, size_t hdr_len, uint32_t
     memcpy(&header_size, hdr + 0x24, 4);
     if (header_size != 0x70) return 0;
 
-    // file_size at offset 0x20 must be reasonable
+    // file_size at offset 0x20: if erased/zero (FRIDA-DEXDump case), defer — the
+    // caller recovers the real size from the map_list. Require it to be 0 or sane
+    // (reject clearly-garbage values like 1..0x6F or >0x10000000).
     uint32_t file_size = 0;
     memcpy(&file_size, hdr + 0x20, 4);
-    if (file_size < 0x70 || file_size > 0x10000000) return 0;
+    if (file_size != 0 && (file_size < 0x70 || file_size > 0x10000000)) return 0;
+    uint32_t size_cap = (file_size != 0) ? file_size : 0x10000000;  // generous bound when erased
 
     // Read key section fields
     uint32_t string_ids_size = 0, string_ids_off = 0;
@@ -229,21 +339,24 @@ static int dex_header_relaxed_valid(const uint8_t *hdr, size_t hdr_len, uint32_t
 
     // class_defs must be present — a DEX without classes is useless
     if (class_defs_size == 0) return 0;
-    if (class_defs_off == 0 || class_defs_off >= file_size) return 0;
+    if (class_defs_off == 0 || class_defs_off >= size_cap) return 0;
 
     // class_defs occupy class_defs_size * 32 bytes, must fit in file
     uint32_t class_defs_bytes = class_defs_size * 32;
-    if (class_defs_off + class_defs_bytes > file_size) return 0;
+    if (class_defs_off + class_defs_bytes > size_cap) return 0;
 
     // string_ids and type_ids offsets must be within file (if present)
-    if (string_ids_off != 0 && string_ids_off >= file_size) return 0;
-    if (type_ids_off != 0 && type_ids_off >= file_size) return 0;
+    if (string_ids_off != 0 && string_ids_off >= size_cap) return 0;
+    if (type_ids_off != 0 && type_ids_off >= size_cap) return 0;
 
     // data section should fit within file (if present)
     if (data_off != 0 && data_size != 0) {
-        if (data_off >= file_size || data_off + data_size > file_size) return 0;
+        if (data_off >= size_cap || data_off + data_size > size_cap) return 0;
     }
 
+    // file_size erased → defer (caller recovers from map_list). A2 confirmation
+    // (map_list self-reference) happens at the call site, so returning size 0 here
+    // is safe — the caller only trusts it after dex_confirm_by_map_list passes.
     *out_size = file_size;
     return 1;
 }
@@ -603,6 +716,37 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                         continue;
                     }
                 dex_accept:;
+                    // file_size erased (FRIDA-DEXDump case): dex_hit_valid deferred
+                    // with *out_size = 0. Recover the real size from the map_list.
+                    if (dex_size == 0) {
+                        uint8_t hdr[0x70];
+                        if (READ_REMOTE(hdr, 0x70, dex_addr) != 0x70) continue;
+                        uint32_t map_off = 0;
+                        memcpy(&map_off, hdr + 0x34, 4);
+                        // Provisional extent from the data section, to bound our read.
+                        uint32_t prov = dex_recover_size_provisional(hdr);
+                        if (prov < 0x70) {
+                            // No data section hint: fall back to scanning up to 1MB.
+                            prov = 0x100000;
+                        }
+                        // Read that much of the DEX image to walk its map_list.
+                        uint8_t *img = (uint8_t *)calloc(1, prov);
+                        if (!img) continue;
+                        size_t got = 0;
+                        while (got < prov) {
+                            ssize_t rr = READ_REMOTE(img + got, prov - got, dex_addr + got);
+                            if (rr <= 0) break;
+                            got += (size_t)rr;
+                        }
+                        uint32_t recovered = dex_recover_size_from_map_buf(img, got, map_off);
+                        uint32_t string_ids_off = 0;
+                        memcpy(&string_ids_off, hdr + 0x3C, 4);
+                        // A2: confirm it's really a DEX via the map_list self-reference.
+                        int confirmed = dex_confirm_by_map_list(img, got, map_off, string_ids_off);
+                        free(img);
+                        if (recovered == 0 || !confirmed) continue;
+                        dex_size = recovered;
+                    }
                     if (dex_size < 0x70 || dex_size > 0x10000000) continue;
 
                     c->dex_total++;
@@ -810,6 +954,33 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                                     i += 4; // skip this endian_tag, standard scan already got it
                                     continue;
                                 }
+
+                                // A2: magic was erased — strongly confirm this is a real DEX
+                                // via the map_list self-reference (FRIDA-DEXDump keys) before
+                                // trusting it. This avoids false positives from random endian_tag.
+                                uint32_t map_off = 0, string_ids_off = 0;
+                                memcpy(&map_off, hdr + 0x34, 4);
+                                memcpy(&string_ids_off, hdr + 0x3C, 4);
+                                uint32_t prov = dex_recover_size_provisional(hdr);
+                                if (prov < 0x70) prov = 0x100000;
+                                uint8_t *img = (uint8_t *)calloc(1, prov);
+                                if (img) {
+                                    size_t got = 0;
+                                    while (got < prov) {
+                                        ssize_t rr = READ_REMOTE(img + got, prov - got, dex_addr + got);
+                                        if (rr <= 0) break;
+                                        got += (size_t)rr;
+                                    }
+                                    int confirmed = dex_confirm_by_map_list(img, got, map_off, string_ids_off);
+                                    // If file_size was also erased, recover the real size now.
+                                    if (confirmed && dex_size == 0) {
+                                        uint32_t recovered = dex_recover_size_from_map_buf(img, got, map_off);
+                                        if (recovered) dex_size = recovered;
+                                        else confirmed = 0;
+                                    }
+                                    free(img);
+                                    if (!confirmed) { i += 4; continue; }
+                                } else { i += 4; continue; }
 
                                 // Magic was erased — restore it before dumping
                                 c->dex_total++;
