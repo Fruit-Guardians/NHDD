@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>      // log() for Shannon entropy (B5 decryption-state scoring)
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -130,9 +131,150 @@ static void so_path_remember(const char *path) {
     }
 }
 
+// ---- B5: decryption-state selection across watch rounds ----
+// A packer may leave a SO's .text encrypted at scan time (or re-encrypt it). Across
+// watch rounds the same SO base may appear in different states. We keep the snapshot
+// whose executable segment looks most like real code: low Shannon entropy + many ARM
+// prologue patterns. Encrypted/compressed text has entropy ~7.5-8.0 and ~random
+// prologue hits; real ARM64 code has entropy ~5.5-6.8 and dense prologues.
+//
+// Per dumped SO we store {key, outfile, score}; on re-encounter we overwrite the file
+// only if the new snapshot scores higher (more decrypted). Anonymous SOs key on a
+// content hash of their first executable page instead of a path.
+
+#define SO_BEST_MAX 512
+typedef struct {
+    char     key[512];     // maps path, or hex content-hash for anonymous SOs
+    char     outfile[768];
+    double   score;        // higher = more decrypted
+    int      have;
+} so_best;
+static so_best g_so_best[SO_BEST_MAX];
+static int    g_so_best_count = 0;
+
+// Shannon entropy (bits/byte) over a buffer. 0..8.
+static double buf_entropy(const uint8_t *p, size_t n) {
+    if (n == 0) return 8.0;
+    size_t hist[256] = {0};
+    for (size_t i = 0; i < n; i++) hist[p[i]]++;
+    double h = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (hist[i] == 0) continue;
+        double pr = (double)hist[i] / (double)n;
+        h -= pr * (log(pr) / log(2.0));
+    }
+    return h;
+}
+
+// Count ARM64 function-prologue-ish words in the text. Real code starts many
+// functions with STP X29,X30,[SP,#imm] frame pushes. The store-STP family encodes
+// with the high byte 0xA9; when Rt/Rt2 are X29(29)/X30(30) the low two bytes are
+// 0xFD 0x7B (or 0x7B 0xFD if operand order is swapped). We also count SUB sp,sp,#imm.
+// This is a cheap density signal: decrypted code is dense in these; encrypted/compressed
+// text matches at ~random rates.
+static size_t arm_prologue_hits(const uint8_t *p, size_t n) {
+    size_t hits = 0;
+    for (size_t i = 0; i + 4 <= n; i += 4) {
+        uint8_t b0 = p[i], b1 = p[i+1], b3 = p[i+3];
+        // STP X29, X30, [SP, #imm] (store): high byte 0xA9, low pair {0xFD,0x7B}
+        if (b3 == 0xA9 &&
+            ((b0 == 0xFD && b1 == 0x7B) || (b0 == 0x7B && b1 == 0xFD))) {
+            hits++;
+            continue;
+        }
+        // SUB sp, sp, #imm: 0xD1xxxxFF with Rd=31 (sp) in low 5 bits -> low byte 0xFF,
+        // opcode bits 30..23 = 1001001 -> high byte 0xD1.
+        if (b3 == 0xD1 && b0 == 0xFF) {
+            hits++;
+        }
+    }
+    return hits;
+}
+
+// Score a dumped SO's decryption state. Higher = more decrypted.
+// `data`/`size` is the full SO image; `is_64` selects program-header layout.
+// Finds the first executable PT_LOAD, scores its text: prologue_density - entropy.
+// Returns -1.0 if no executable segment can be located (treat as neutral/keep).
+static double so_text_score(const uint8_t *data, size_t size, int is_64) {
+    if (size < 64) return -1.0;
+    uint64_t e_phoff = 0; uint16_t e_phentsize = 0, e_phnum = 0;
+    if (is_64) {
+        memcpy(&e_phoff, data + 32, 8);
+        e_phentsize = data[54] | (data[55] << 8);
+        e_phnum = data[56] | (data[57] << 8);
+    } else {
+        uint32_t ph32 = 0; memcpy(&ph32, data + 28, 4); e_phoff = ph32;
+        e_phentsize = data[42] | (data[43] << 8);
+        e_phnum = data[44] | (data[45] << 8);
+    }
+    if (e_phnum == 0 || e_phentsize == 0 || e_phoff >= size) return -1.0;
+    if (e_phoff + (uint64_t)e_phnum * (uint64_t)e_phentsize > size) return -1.0;
+
+    for (int p = 0; p < e_phnum && p < 64; p++) {
+        uint64_t base = e_phoff + (uint64_t)p * (uint64_t)e_phentsize;
+        uint32_t p_type = 0, p_flags = 0;
+        uint64_t p_vaddr = 0, p_filesz = 0;
+        if (is_64) {
+            memcpy(&p_type, data + base + 0, 4);
+            memcpy(&p_flags, data + base + 4, 4);
+            memcpy(&p_vaddr, data + base + 16, 8);
+            memcpy(&p_filesz, data + base + 32, 8);
+        } else {
+            memcpy(&p_type, data + base + 0, 4);
+            memcpy(&p_flags, data + base + 24, 4);
+            uint32_t v32 = 0, f32 = 0;
+            memcpy(&v32, data + base + 8, 4); p_vaddr = v32;
+            memcpy(&f32, data + base + 16, 4); p_filesz = f32;
+        }
+        if (p_type != 1) continue;            // PT_LOAD
+        if (!(p_flags & 0x1)) continue;        // PF_X (executable)
+        if (p_filesz < 64) continue;
+        if (p_vaddr + p_filesz > size) p_filesz = size - p_vaddr;  // clamp
+        const uint8_t *text = data + p_vaddr;
+        double ent = buf_entropy(text, (size_t)p_filesz);
+        size_t hits = arm_prologue_hits(text, (size_t)p_filesz);
+        double prologue_density = (double)hits / ((double)p_filesz / 4.0);
+        // Higher prologue density and lower entropy => more decrypted.
+        return prologue_density * 100.0 - ent;
+    }
+    return -1.0;
+}
+
+// Look up the best snapshot for a key. Returns the entry or NULL.
+static so_best *so_best_find(const char *key) {
+    if (key[0] == '\0') return NULL;
+    for (int i = 0; i < g_so_best_count; i++)
+        if (strcmp(g_so_best[i].key, key) == 0) return &g_so_best[i];
+    return NULL;
+}
+
+// Record/update the best snapshot for a key. Returns 1 if this snapshot was kept
+// (new best or first), 0 if discarded (an equal-or-better snapshot already exists).
+static int so_best_record(const char *key, const char *outfile, double score) {
+    so_best *e = so_best_find(key);
+    if (e) {
+        if (score > e->score) {
+            e->score = score;
+            strncpy(e->outfile, outfile, sizeof(e->outfile) - 1);
+            e->outfile[sizeof(e->outfile) - 1] = '\0';
+            return 1;  // replaced
+        }
+        return 0;  // kept existing (better) snapshot
+    }
+    if (g_so_best_count < SO_BEST_MAX) {
+        so_best *n = &g_so_best[g_so_best_count++];
+        strncpy(n->key, key, sizeof(n->key) - 1); n->key[sizeof(n->key) - 1] = '\0';
+        strncpy(n->outfile, outfile, sizeof(n->outfile) - 1); n->outfile[sizeof(n->outfile) - 1] = '\0';
+        n->score = score; n->have = 1;
+        return 1;
+    }
+    return 1;  // table full: keep (best-effort)
+}
+
 // ---- Scan configuration (set in main, read by scan_pid) ----
 static int g_region_delay_us = 0;  // usleep between regions (stealth mode)
 static int g_relaxed = 0;          // --relaxed: scan for DEX without magic (endian_tag based)
+static int g_relaxed_so = 0;       // --relaxed-so: scan for SO without ELF magic (structure based)
 static int g_anon_only = 0;        // --anon: only scan anonymous mappings (faster, less crash-prone)
 static int g_use_vm_readv = 0;     // --stealth2: use process_vm_readv instead of /proc/pid/mem
 
@@ -241,6 +383,46 @@ static int dex_confirm_by_map_list(const uint8_t *img, size_t cap, uint32_t map_
         if (type == DEX_TYPE_MAP_LIST && eoff == map_off) return 1;  // (2) self-reference
     }
     return 0;
+}
+
+// Identify an ELF SO at a page boundary even when the "\x7fELF" magic has been
+// erased by a packer (B4, SO-side equivalent of DEX --relaxed). Header-level
+// structural check (full PT_LOAD validation happens later in fix_so.py):
+//   - EI_CLASS (byte 4) == 1 or 2 (32/64-bit)
+//   - e_type (offset 16) == ET_DYN(3)
+//   - e_machine (offset 18) == EM_ARM(40) or EM_AARCH64(183)
+//   - e_phoff/e_phentsize/e_phnum sane
+// Returns 1 and fills *out_is_64 if the header looks like a magic-erased SO.
+// (If the magic is intact, the standard scan already handled it; callers skip those.)
+static int elf_so_struct_valid(const uint8_t *hdr, size_t hdr_len, int *out_is_64) {
+    if (hdr_len < 64) return 0;
+    uint8_t ei_class = hdr[4];
+    if (ei_class != 1 && ei_class != 2) return 0;
+    int is_64 = (ei_class == 2);
+    uint16_t e_type = hdr[16] | (hdr[17] << 8);
+    if (e_type != 3) return 0;  // ET_DYN
+    uint16_t e_machine = hdr[18] | (hdr[19] << 8);
+    if (e_machine != 40 && e_machine != 183) return 0;  // EM_ARM / EM_AARCH64
+
+    uint64_t e_phoff = 0;
+    uint16_t e_phentsize = 0, e_phnum = 0;
+    if (is_64) {
+        memcpy(&e_phoff, hdr + 32, 8);
+        e_phentsize = hdr[54] | (hdr[55] << 8);
+        e_phnum = hdr[56] | (hdr[57] << 8);
+    } else {
+        uint32_t ph32 = 0;
+        memcpy(&ph32, hdr + 28, 4);
+        e_phoff = ph32;
+        e_phentsize = hdr[42] | (hdr[43] << 8);
+        e_phnum = hdr[44] | (hdr[45] << 8);
+    }
+    if (e_phnum == 0 || e_phnum > 64) return 0;
+    if (e_phentsize == 0) return 0;
+    if (e_phoff < 64 || e_phoff > 0x100000) return 0;
+
+    if (out_is_64) *out_is_64 = is_64;
+    return 1;
 }
 
 static int dex_hit_valid(const uint8_t *buf, size_t n, size_t magic_off, uint32_t *out_size) {
@@ -839,11 +1021,9 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
 
                     // SO name from the maps region we are inside.
                     const char *so_path = r->path;
-                    // Cross-process de-dup by path (anonymous SOs cannot dedup globally).
-                    if (so_path_seen(so_path)) {
-                        i += 4096;
-                        continue;
-                    }
+                    // B5: no longer skip-by-path here. We dump into a buffer, score its
+                    // decryption state, and keep the best snapshot across watch rounds.
+                    // (Anonymous SOs key on a content hash below.)
 
                     // SO extent = contiguous same-path regions, not just this line.
                     uintptr_t so_end = so_extent_end(ml, ri, r->end);
@@ -894,7 +1074,6 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                     }
 
                     if (dumped_so_base_count < 256) dumped_so_bases[dumped_so_base_count++] = elf_addr;
-                    so_path_remember(so_path);
 
                     char outfile[768];
                     if (so_path[0] != '\0') {
@@ -917,17 +1096,137 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                     }
 
                     if (read_total > 0) {
-                        int fd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-                        if (fd >= 0) {
-                            write(fd, so_data, read_total);
-                            close(fd);
-                            c->so_count++;
-                            printf("[+] SO: %s (%zd bytes) from %s pid=%s\n", outfile, read_total,
-                                   so_path[0] ? so_path : "(anon)", pid);
+                        // B5: score this snapshot's decryption state (text entropy +
+                        // ARM prologue density). Keep the best across watch rounds.
+                        double score = so_text_score(so_data, (size_t)read_total, is_64);
+                        const char *key = so_path[0] ? so_path : outfile;  // anon SOs key on outfile name
+                        int kept = so_best_record(key, outfile, score);
+                        if (kept) {
+                            int fd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                            if (fd >= 0) {
+                                write(fd, so_data, read_total);
+                                close(fd);
+                                so_path_remember(so_path);
+                                c->so_count++;
+                                printf("[+] SO: %s (%zd bytes) score=%.1f from %s pid=%s\n",
+                                       outfile, read_total, score, so_path[0] ? so_path : "(anon)", pid);
+                            }
+                        } else {
+                            // A better (more decrypted) snapshot already exists; discard this one.
+                            fprintf(stderr, "[=] PID %s: SO at 0x%lx score=%.1f not better than existing, skipped\n",
+                                   pid, (unsigned long)elf_addr, score);
                         }
                     }
                     free(so_data);
                     i += 4096;
+                }
+
+                // ---- Relaxed SO scanning (ELF magic erased, structure-based) ----
+                // B4: for packers that erase the "\x7fELF" magic. At each page start,
+                // if --relaxed-so is on and the magic is NOT intact, check whether the
+                // 64-byte header is structurally a valid ET_DYN SO. If so, dump it; the
+                // dumped file will have a zeroed magic, which fix_so.py restores.
+                if (g_relaxed_so && (mode & MODE_SO) && i == 0 &&
+                    memcmp(buf, kElfMagic, 4) != 0) {
+                    uintptr_t elf_addr = addr;
+
+                    // Per-PID base de-dup.
+                    int already = 0;
+                    for (int j = 0; j < dumped_so_base_count; j++)
+                        if (dumped_so_bases[j] == elf_addr) { already = 1; break; }
+                    if (!already) {
+                        uint8_t elf_hdr[64];
+                        int is_64 = 0;
+                        if (READ_REMOTE(elf_hdr, 64, elf_addr) == 64 &&
+                            elf_so_struct_valid(elf_hdr, 64, &is_64)) {
+                            const char *so_path = r->path;
+                            // B5: don't skip-by-path; score & keep best snapshot instead.
+                            {
+                                // SO extent = contiguous same-path regions.
+                                uintptr_t so_end = so_extent_end(ml, ri, r->end);
+                                size_t max_so_size = 64 * 1024 * 1024;
+                                size_t so_size = so_end - elf_addr;
+                                if (so_size > max_so_size) so_size = max_so_size;
+
+                                // Refine size from program headers (same logic as standard scan).
+                                if (is_64) {
+                                    uint64_t e_phoff = 0; memcpy(&e_phoff, elf_hdr + 32, 8);
+                                    uint16_t e_phentsize = elf_hdr[54] | (elf_hdr[55] << 8);
+                                    uint16_t e_phnum = elf_hdr[56] | (elf_hdr[57] << 8);
+                                    uint64_t max_addr = 0;
+                                    for (int p = 0; p < e_phnum && p < 32; p++) {
+                                        uint8_t phdr[56];
+                                        if (READ_REMOTE(phdr, 56, elf_addr + e_phoff + p * e_phentsize) < 56) break;
+                                        uint32_t p_type = 0; memcpy(&p_type, phdr, 4);
+                                        if (p_type != 1) continue;
+                                        uint64_t p_vaddr = 0, p_memsz = 0;
+                                        memcpy(&p_vaddr, phdr + 16, 8);
+                                        memcpy(&p_memsz, phdr + 40, 8);
+                                        uint64_t seg_end = p_vaddr + p_memsz;
+                                        if (seg_end > max_addr) max_addr = seg_end;
+                                    }
+                                    if (max_addr > 0 && max_addr < so_size) so_size = (size_t)max_addr;
+                                } else {
+                                    uint32_t e_phoff = 0; memcpy(&e_phoff, elf_hdr + 28, 4);
+                                    uint16_t e_phentsize = elf_hdr[42] | (elf_hdr[43] << 8);
+                                    uint16_t e_phnum = elf_hdr[44] | (elf_hdr[45] << 8);
+                                    uint32_t max_addr = 0;
+                                    for (int p = 0; p < e_phnum && p < 32; p++) {
+                                        uint8_t phdr[32];
+                                        if (READ_REMOTE(phdr, 32, elf_addr + e_phoff + p * e_phentsize) < 32) break;
+                                        uint32_t p_type = 0; memcpy(&p_type, phdr, 4);
+                                        if (p_type != 1) continue;
+                                        uint32_t p_vaddr = 0, p_memsz = 0;
+                                        memcpy(&p_vaddr, phdr + 12, 4);
+                                        memcpy(&p_memsz, phdr + 20, 4);
+                                        uint32_t seg_end = p_vaddr + p_memsz;
+                                        if (seg_end > max_addr) max_addr = seg_end;
+                                    }
+                                    if (max_addr > 0 && max_addr < so_size) so_size = (size_t)max_addr;
+                                }
+
+                                if (dumped_so_base_count < 256) dumped_so_bases[dumped_so_base_count++] = elf_addr;
+
+                                char outfile[768];
+                                if (so_path[0] != '\0') {
+                                    const char *bname = my_basename(so_path);
+                                    snprintf(outfile, sizeof(outfile), "%s/%s", so_dir, bname);
+                                } else {
+                                    snprintf(outfile, sizeof(outfile), "%s/so_%s_%d.so", so_dir, pid, c->so_count + 1);
+                                }
+
+                                uint8_t *so_data = (uint8_t *)malloc(so_size);
+                                if (so_data) {
+                                    ssize_t read_total = 0;
+                                    while (read_total < (ssize_t)so_size) {
+                                        ssize_t rr = READ_REMOTE(so_data + read_total, so_size - read_total,
+                                                 elf_addr + read_total);
+                                        if (rr <= 0) break;
+                                        read_total += rr;
+                                    }
+                                    if (read_total > 0) {
+                                        // B5: score & keep best decryption-state snapshot.
+                                        double score = so_text_score(so_data, (size_t)read_total, is_64);
+                                        const char *key = so_path[0] ? so_path : outfile;
+                                        int kept = so_best_record(key, outfile, score);
+                                        if (kept) {
+                                            int fd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                                            if (fd >= 0) {
+                                                write(fd, so_data, read_total);
+                                                close(fd);
+                                                so_path_remember(so_path);
+                                                c->so_count++;
+                                                printf("[+] SO(relaxed, magic erased): %s (%zd bytes) score=%.1f from %s pid=%s\n",
+                                                       outfile, read_total, score, so_path[0] ? so_path : "(anon)", pid);
+                                            }
+                                        }
+                                    }
+                                    free(so_data);
+                                }
+                            }
+                        }
+                    }
+                    i += 4096;  // page-aligned SO; skip the rest of this page
                 }
 
                 // ---- Relaxed DEX scanning (endian_tag based, no magic) ----
@@ -1146,6 +1445,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--stealth") == 0) { stealth = 1; continue; }
         if (strcmp(argv[i], "--stealth2") == 0) { g_use_vm_readv = 1; continue; }
         if (strcmp(argv[i], "--relaxed") == 0) { g_relaxed = 1; continue; }
+        if (strcmp(argv[i], "--relaxed-so") == 0) { g_relaxed_so = 1; continue; }
         if (strcmp(argv[i], "--anon") == 0) { g_anon_only = 1; continue; }
         if (strcmp(argv[i], "--region-delay") == 0 && i + 1 < argc) {
             g_region_delay_us = atoi(argv[++i]) * 1000; continue;  // ms -> us
@@ -1178,7 +1478,7 @@ int main(int argc, char **argv) {
             "NHDD — No-Hook DEX/SO Dumper v8.0\n"
             "Usage: %s <pid|package> [output_dir] [--so|--dex|--all]\n"
             "                       [--watch [K]] [--snapshot ROUNDS] [--interval SECS]\n"
-            "                       [--stealth] [--stealth2] [--relaxed] [--anon]\n"
+            "                       [--stealth] [--stealth2] [--relaxed] [--relaxed-so] [--anon]\n"
             "                       [--region-delay MS] [--name NAME] [--sofixer PATH]\n"
             "                       [--max-rounds N] [--max-seconds S] [--keep]\n"
             "\n"
@@ -1204,6 +1504,9 @@ int main(int argc, char **argv) {
             "                   has been erased by second-gen extraction shells. Uses endian_tag\n"
             "                   (0x12345678) + header structure to identify DEX. Restores magic\n"
             "                   in the dump. Use with --watch for best results.\n"
+            "    --relaxed-so   Relaxed SO scan: also detect SO files whose \"\\x7fELF\" magic\n"
+            "                   has been erased. Uses e_type==ET_DYN + e_machine + program-header\n"
+            "                   structure to identify SO. fix_so.py restores the magic post-dump.\n"
             "    --anon         Only scan anonymous memory mappings (skip file-backed regions\n"
             "                   like system libs, OAT, VDEX). Much faster, less likely to crash\n"
             "                   anti-dump packers that monitor reads of their mapped files.\n"

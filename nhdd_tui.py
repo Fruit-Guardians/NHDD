@@ -227,6 +227,7 @@ def gather_config():
         "stealth": False,
         "stealth2": False,
         "relaxed": False,
+        "relaxed_so": False,
         "anon": False,
         "region_delay_ms": 0,
         "su_cmd": "",
@@ -243,6 +244,8 @@ def gather_config():
     cfg["stealth2"] = stealth2
     relaxed = Confirm.ask("启用 relaxed(宽松 DEX 验证,不依赖 magic,二代壳推荐)", default=False)
     cfg["relaxed"] = relaxed
+    relaxed_so = Confirm.ask("启用 relaxed-so(宽松 SO 识别,ELF magic 抹除时用结构识别)", default=False)
+    cfg["relaxed_so"] = relaxed_so
     anon = Confirm.ask("启用 anon(仅扫描匿名内存映射)", default=False)
     cfg["anon"] = anon
     su = Prompt.ask("SU 命令(读其他进程内存需要 root:留空=普通shell 或 su -c / ksud -c / kp -c)",
@@ -273,6 +276,8 @@ def build_nhdd_cmd(pkg, cfg):
         parts += ["--stealth2"]
     if cfg.get("relaxed"):
         parts += ["--relaxed"]
+    if cfg.get("relaxed_so"):
+        parts += ["--relaxed-so"]
     if cfg.get("anon"):
         parts += ["--anon"]
     nhdd_cmd = " ".join(parts)
@@ -701,6 +706,7 @@ def main():
             "stealth": True,
             "stealth2": True,
             "relaxed": True,
+            "relaxed_so": True,
             "anon": False,
             "region_delay_ms": 2,
             "su_cmd": su_cmd_override or "kp -c",

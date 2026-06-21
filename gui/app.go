@@ -89,6 +89,7 @@ type DumpParams struct {
 	Stealth       bool   `json:"stealth"`       // 是否启用 stealth
 	Stealth2      bool   `json:"stealth2"`      // 使用 process_vm_readv 替代 /proc/pid/mem（反检测）
 	Relaxed       bool   `json:"relaxed"`       // 宽松 DEX 验证（endian_tag，不依赖 magic）
+	RelaxedSO     bool   `json:"relaxedSo"`     // 宽松 SO 识别（ELF magic 抹除时用结构识别）
 	Anon          bool   `json:"anon"`          // 仅扫描匿名内存映射
 	RegionDelayMs int    `json:"regionDelayMs"` // 区域延时毫秒
 }
@@ -223,6 +224,9 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 	}
 	if params.Relaxed {
 		nhddCmdParts = append(nhddCmdParts, "--relaxed")
+	}
+	if params.RelaxedSO {
+		nhddCmdParts = append(nhddCmdParts, "--relaxed-so")
 	}
 	if params.Anon {
 		nhddCmdParts = append(nhddCmdParts, "--anon")
