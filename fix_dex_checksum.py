@@ -239,7 +239,7 @@ def validate_deep_item_level(data):
         issues.append(f"MAP_OFF_INVALID=0x{map_off:X}")
     else:
         map_size = u32(data, map_off)
-        if map_size > 10000:
+        if map_size > 50:
             issues.append(f"MAP_SIZE_CORRUPT={map_size}")
         elif map_size == 0:
             issues.append("MAP_SIZE_ZERO")
@@ -469,7 +469,7 @@ def classify_dex_full(path):
     else:
         try:
             map_size = u32(data, map_off)
-            if map_size > 10000:
+            if map_size > 50:
                 header_issues.append(f"MAP_SIZE_CORRUPT={map_size}")
                 map_repairable = True
             elif map_size == 0:
@@ -479,9 +479,6 @@ def classify_dex_full(path):
                 map_end = map_off + 4 + map_size * 12
                 if map_end > real_size:
                     header_issues.append(f"MAP_LIST_OOB")
-                    map_repairable = True
-                elif map_size > 50:
-                    header_issues.append(f"MAP_SIZE_SUSPICIOUS={map_size}")
                     map_repairable = True
         except:
             header_issues.append("MAP_READ_ERROR")
@@ -558,13 +555,14 @@ def rebuild_map_list(data):
     ]
     for sec_type, size_off, off_off in header_sections:
         sec_size = u32(data, size_off)
-        sec_off = u32(data, off_off)
-        if sec_size > 0 and sec_off > 0:
+        sec_off  = u32(data, off_off)
+        # 与 GUI RebuildMapList 一致:off 必须在文件内才纳入
+        if sec_size > 0 and sec_off > 0 and sec_off < real_size:
             entries.append((sec_type, sec_off, sec_size))
 
     data_size = u32(data, 0x68)
-    data_off = u32(data, 0x6C)
-    if data_size > 0 and data_off > 0:
+    data_off  = u32(data, 0x6C)
+    if data_size > 0 and data_off > 0 and data_off < real_size:
         entries.append((kDexTypeMapList, data_off, 0))
 
     entries.sort(key=lambda x: x[1])
@@ -579,9 +577,12 @@ def rebuild_map_list(data):
         data = data + bytearray(map_list_size)
 
     put32(data, map_off, len(entries))
+    # 每个 map entry 12 字节: type(u16) + unused(u16) + count(u32) + offset(u32)
+    # 之前用 <HHI 只写 8 字节,漏写 offset 字段 → 重建出的 map_list 偏移全错。
+    # 与 GUI dexfix.go RebuildMapList 对齐,写满 12 字节。
     for i, (sec_type, sec_off, sec_size) in enumerate(entries):
         base = map_off + 4 + i * 12
-        struct.pack_into('<HHI', data, base, sec_type, 0, sec_size)
+        struct.pack_into('<HHII', data, base, sec_type, 0, sec_size, sec_off)
     put32(data, 0x34, map_off)
     return data
 
@@ -612,7 +613,9 @@ def fix_dex(path, deep=False):
             map_bad = True
         else:
             map_size = u32(data, map_off)
-            if map_size > 10000 or map_size == 0:
+            if map_size > 50:
+                map_bad = True
+            elif map_size == 0:
                 map_bad = True
             else:
                 map_end = map_off + 4 + map_size * 12
@@ -645,6 +648,193 @@ def fix_dex(path, deep=False):
         return "fixed", ', '.join(changed)
     else:
         return "ok", "already valid"
+
+
+# ---------------------------------------------------------------------------
+# GUI 对齐实现 (镜像 gui/dexfix.go)
+#   与 TUI auto_classify_and_fix 配合,保证 CLI 行为与 GUI 一致:
+#   - validate_dex_deep_bool  <-> validateDexDeep      (map>50, 无 per-map-entry)
+#   - fix_dex_file_aligned     <-> FixDexFile           (一段式: 校验→重建→重校验→修头+校验和)
+#   - fix_directory_aligned    <-> FixDexDirectory      (Total/OK/Fixed/Bad 统计)
+# ---------------------------------------------------------------------------
+def validate_dex_deep_bool(data):
+    """镜像 GUI validateDexDeep (dexfix.go)。返回 bool:True=结构有效。
+
+    与 validate_deep_item_level 的差异(为对齐 GUI):
+      - map_size 阈值统一 >50(同 GUI);
+      - 不做 per-map-entry offset 越界检查(GUI 不做);
+      - 只返回 bool,不收集 issues。
+    """
+    real_size = len(data)
+    if real_size < DEX_HEADER_SIZE:
+        return False
+    if real_size > 64 * 1024 * 1024:
+        return False
+
+    # map_list
+    map_off = u32(data, 0x34)
+    if map_off < DEX_HEADER_SIZE or map_off >= real_size:
+        return False
+    if map_off + 4 > real_size:
+        return False
+    map_size = u32(data, map_off)
+    if map_size > 50:
+        return False
+    if map_off + 4 + map_size * 12 > real_size:
+        return False
+
+    sids_size = u32(data, 0x38); sids_off = u32(data, 0x3C)
+    tids_size = u32(data, 0x40); tids_off = u32(data, 0x44)
+    pids_size = u32(data, 0x48); pids_off = u32(data, 0x4C)
+    fids_size = u32(data, 0x50); fids_off = u32(data, 0x54)
+    mids_size = u32(data, 0x58); mids_off = u32(data, 0x5C)
+    cls_size  = u32(data, 0x60); cls_off  = u32(data, 0x64)
+
+    # section 表字节范围越界
+    if sids_size and sids_off and sids_off + sids_size * 4  > real_size: return False
+    if tids_size and tids_off and tids_off + tids_size * 4  > real_size: return False
+    if pids_size and pids_off and pids_off + pids_size * 12 > real_size: return False
+    if fids_size and fids_off and fids_off + fids_size * 8  > real_size: return False
+    if mids_size and mids_off and mids_off + mids_size * 8  > real_size: return False
+    if cls_size  and cls_off  and cls_off  + cls_size  * 32 > real_size: return False
+
+    # 1. string_ids: string_data_off 在文件内
+    if sids_size and sids_off:
+        for i in range(sids_size):
+            if u32(data, sids_off + i * 4) >= real_size: return False
+    # 2. type_ids: desc_idx < sids_size
+    if tids_size and tids_off:
+        for i in range(tids_size):
+            if u32(data, tids_off + i * 4) >= sids_size: return False
+    # 3. proto_ids: shorty/ret/params
+    if pids_size and pids_off:
+        for i in range(pids_size):
+            b = pids_off + i * 12
+            shorty = u32(data, b); ret = u32(data, b + 4); params = u32(data, b + 8)
+            if shorty >= sids_size or ret >= tids_size or (params > 0 and params >= real_size):
+                return False
+    # 4. field_ids: cls/typ < tids_size, name < sids_size
+    if fids_size and fids_off:
+        for i in range(fids_size):
+            b = fids_off + i * 8
+            cls = struct.unpack_from('<H', data, b)[0]
+            typ = struct.unpack_from('<H', data, b + 2)[0]
+            name = u32(data, b + 4)
+            if cls >= tids_size or typ >= tids_size or name >= sids_size: return False
+    # 5. method_ids: cls < tids_size, proto < pids_size, name < sids_size
+    if mids_size and mids_off:
+        for i in range(mids_size):
+            b = mids_off + i * 8
+            cls = struct.unpack_from('<H', data, b)[0]
+            proto = struct.unpack_from('<H', data, b + 2)[0]
+            name = u32(data, b + 4)
+            if cls >= tids_size or proto >= pids_size or name >= sids_size: return False
+    # 6. class_defs: class_idx < tids_size, 三偏移在文件内
+    if cls_size and cls_off:
+        for i in range(cls_size):
+            b = cls_off + i * 32
+            class_idx = u32(data, b)
+            annot_off = u32(data, b + 20)
+            cd_off    = u32(data, b + 24)
+            sv_off    = u32(data, b + 28)
+            if class_idx >= tids_size: return False
+            if annot_off and annot_off >= real_size: return False
+            if cd_off and cd_off >= real_size: return False
+            if sv_off and sv_off >= real_size: return False
+    return True
+
+
+def fix_dex_file_aligned(path):
+    """镜像 GUI FixDexFile (dexfix.go)。一段式: 校验→重建→重校验→修头+校验和。
+
+    文件处置与 GUI 完全一致:
+      - len < 0x70 或非 'dex\\n' magic  → 删除文件
+      - 深度校验失败 → 尝试 rebuild_map_list → 仍失败 → 删除
+      - rebuild 返回 None(无法重建) → 移到同级 invalid/ 子目录
+      - 否则修 header_size/endian_tag/file_size/SHA-1/Adler32,有改动才落盘
+
+    返回 (fixed, deleted, err_msg): deleted=True 表示已删除或已隔离。
+    """
+    try:
+        with open(path, 'rb') as f:
+            data = bytearray(f.read())
+    except Exception as e:
+        return False, False, f"read {path}: {e}"
+
+    if len(data) < DEX_HEADER_SIZE:
+        try: os.remove(path)
+        except OSError: pass
+        return False, True, f"too small ({len(data)} bytes), deleted"
+
+    if bytes(data[0:4]) != b'dex\n':
+        try: os.remove(path)
+        except OSError: pass
+        return False, True, "not a DEX file, deleted"
+
+    if not validate_dex_deep_bool(data):
+        new_data = rebuild_map_list(data)
+        if new_data is not None:
+            data = new_data
+            # 重建后立即重校验(同 GUI),仍无效则删除
+            if not validate_dex_deep_bool(data):
+                try: os.remove(path)
+                except OSError: pass
+                return False, True, "still invalid after map_list rebuild, deleted"
+        else:
+            # 无法重建 → 移到 invalid/(同 GUI)
+            invalid_dir = os.path.join(os.path.dirname(path), "invalid")
+            os.makedirs(invalid_dir, exist_ok=True)
+            new_path = os.path.join(invalid_dir, os.path.basename(path))
+            try:
+                os.rename(path, new_path)
+            except OSError:
+                pass
+            return False, True, "invalid DEX (map_list/section corrupted), moved to invalid/"
+
+    fixed = False
+    if u32(data, 0x24) != DEX_HEADER_SIZE:
+        put32(data, 0x24, DEX_HEADER_SIZE); fixed = True
+    if u32(data, 0x28) != DEX_ENDIAN_TAG:
+        put32(data, 0x28, DEX_ENDIAN_TAG); fixed = True
+    if u32(data, 0x20) != len(data):
+        put32(data, 0x20, len(data)); fixed = True
+
+    sig = hashlib.sha1(bytes(data[0x20:])).digest()
+    if bytes(data[0x0C:0x20]) != sig:
+        data[0x0C:0x20] = sig; fixed = True
+
+    cksum = zlib.adler32(bytes(data[0x0C:])) & 0xFFFFFFFF
+    if u32(data, 0x08) != cksum:
+        put32(data, 0x08, cksum); fixed = True
+
+    if fixed:
+        try:
+            with open(path, 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            return False, False, f"write {path}: {e}"
+    return fixed, False, None
+
+
+def fix_directory_aligned(dir_path):
+    """镜像 GUI FixDexDirectory (dexfix.go)。递归修复目录下所有 .dex。
+
+    返回 {total, ok, fixed, bad, bad_files}。
+    ok 包含所有未被删除/隔离的文件(含 fixed),与 GUI 统计口径一致。
+    """
+    dex_files = sorted(glob.glob(os.path.join(dir_path, "**", "*.dex"), recursive=True))
+    stats = {"total": len(dex_files), "ok": 0, "fixed": 0, "bad": 0, "bad_files": []}
+    for path in dex_files:
+        fixed, deleted, err = fix_dex_file_aligned(path)
+        if err is not None:
+            if deleted:
+                stats["bad"] += 1
+                stats["bad_files"].append(os.path.basename(path))
+            continue
+        if fixed:
+            stats["fixed"] += 1
+        stats["ok"] += 1
+    return stats
 
 
 # ---------------------------------------------------------------------------

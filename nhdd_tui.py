@@ -450,9 +450,12 @@ def _pump(stream, st: DashState, is_stderr):
 # 结果:pull + 统计
 # ---------------------------------------------------------------------------
 def auto_classify_and_fix(dex_dir, local_dir):
-    """自动修复DEX文件头 + 校验 + 三级分类，显示统计"""
+    """对齐 GUI FixDexDirectory:一段式 校验→重建→重校验→修头+校验和。
+
+    文件处置与 GUI 一致:过小/非DEX 删除,不可重建移 invalid/,否则修头+校验和。
+    统计口径与 GUI 一致:OK(含已修复)/修复/损坏已隔离。
+    """
     try:
-        # 动态导入 fix_dex_checksum
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "fix_dex", os.path.join(os.path.dirname(os.path.abspath(__file__)), "fix_dex_checksum.py"))
@@ -462,111 +465,42 @@ def auto_classify_and_fix(dex_dir, local_dir):
         console.print(f"[yellow]无法加载 fix_dex_checksum: {e}[/]")
         return
 
-    import glob as _glob
-    dex_files = sorted(_glob.glob(os.path.join(dex_dir, "*.dex")))
-    if not dex_files:
+    stats = fix_mod.fix_directory_aligned(dex_dir)
+    # stats: {total, ok, fixed, bad, bad_files}
+    if stats["total"] == 0:
         return
 
-    # 统计
-    stats = {"ok": 0, "bad": 0, "fixed": 0, "repairable": 0, "total": len(dex_files)}
-    bad_files = []
-    repairable_files = []
-
-    for fp in dex_files:
-        name = os.path.basename(fp)
-        try:
-            # 先分类
-            category, reason, details = fix_mod.classify_dex_full(fp)
-            if category == "jadx-ready":
-                stats["ok"] += 1
-            elif category == "repairable":
-                stats["repairable"] += 1
-                repairable_files.append((name, reason, details))
-            elif category == "bad":
-                stats["bad"] += 1
-                bad_files.append((name, reason))
-            else:
-                stats["bad"] += 1
-                bad_files.append((name, reason))
-        except Exception:
-            stats["bad"] += 1
-            bad_files.append((name, "classify_error"))
-
-    # 尝试修复 repairable 文件
-    if repairable_files:
-        for name, reason, details in repairable_files:
-            fp = os.path.join(dex_dir, name)
-            try:
-                status, msg = fix_mod.fix_dex(fp, deep=True)
-                if status == "fixed":
-                    stats["fixed"] += 1
-                    stats["repairable"] -= 1
-                    # 修复后重新分类
-                    cat2, r2, _ = fix_mod.classify_dex_full(fp)
-                    if cat2 == "jadx-ready":
-                        stats["ok"] += 1
-                    else:
-                        stats["bad"] += 1
-                        bad_files.append((name, f"fix_failed: {r2}"))
-                        # 移回 bad 目录
-                        bad_dir = os.path.join(dex_dir, "bad")
-                        os.makedirs(bad_dir, exist_ok=True)
-                        try:
-                            os.rename(fp, os.path.join(bad_dir, name))
-                        except OSError:
-                            pass
-            except Exception:
-                pass
-
-    # 移动 bad 文件到 bad/ 子目录
-    if bad_files:
-        bad_dir = os.path.join(dex_dir, "bad")
-        os.makedirs(bad_dir, exist_ok=True)
-        for name, reason in bad_files:
-            src = os.path.join(dex_dir, name)
-            dst = os.path.join(bad_dir, name)
-            try:
-                os.rename(src, dst)
-            except OSError:
-                pass
-
-    # 显示分类统计
-    from rich.table import Table as Tbl
-    from rich import box as bx
-    ct = Tbl(title="DEX 校验分类", box=bx.ROUNDED, border_style="cyan")
+    ct = Table(title="DEX 校验分类", box=box.ROUNDED, border_style="cyan")
     ct.add_column("类别", style="bold")
     ct.add_column("数量", style="cyan")
     ct.add_column("说明", style="dim")
-    ct.add_row("[green]OK[/]", str(stats["ok"]), "通过所有校验，可直接反编译")
-    if stats["bad"]:
-        fixed_note = ""
-        if stats["fixed"]:
-            fixed_note = f" (已尝试修复 {stats['fixed']} 个，map_list 已重建但内容仍损坏)"
-        ct.add_row("[red]BAD[/]", str(stats["bad"]), "结构损坏，已移至 bad/ 目录" + fixed_note)
+    ct.add_row("[green]OK[/]", str(stats["ok"]),
+               "通过所有校验,可直接反编译(含已修复)")
+    ct.add_row("[yellow]修复[/]", str(stats["fixed"]),
+               "map_list 已重建 / header+校验和已修复")
+    ct.add_row("[red]损坏已隔离[/]", str(stats["bad"]),
+               "过小/非DEX 已删除,不可重建已移至 invalid/")
     ct.add_row("[bold]总计[/]", str(stats["total"]), "")
     console.print()
     console.print(ct)
 
-    if bad_files:
-        console.print(f"\n[red]已隔离 {len(bad_files)} 个损坏文件到 bad/ 目录[/]")
-    if stats["ok"] == stats["total"]:
+    if stats["bad"]:
+        console.print(f"\n[red]损坏文件:[/] {', '.join(stats['bad_files'])}")
+    if stats["bad"] == 0:
         console.print("\n[bold green]全部 DEX 通过校验！[/]")
 
     # 写日志
     log_path = os.path.join(local_dir, "log.txt")
     try:
         with open(log_path, "w", encoding="utf-8") as lf:
-            lf.write(f"DEX Validation Report\n")
+            lf.write("DEX Validation Report\n")
             lf.write(f"{'='*40}\n")
-            lf.write(f"Total: {stats['total']}  OK: {stats['ok']}  Fixed: {stats['fixed']}  Bad: {stats['bad']}\n\n")
-            if bad_files:
+            lf.write(f"Total: {stats['total']}  OK: {stats['ok']}  "
+                     f"Fixed: {stats['fixed']}  Bad: {stats['bad']}\n\n")
+            if stats["bad_files"]:
                 lf.write("Bad files:\n")
-                for name, reason in bad_files:
-                    lf.write(f"  {name}: {reason}\n")
-            if repairable_files:
-                lf.write("\nRepairable files:\n")
-                for name, reason, _ in repairable_files:
-                    lf.write(f"  {name}: {reason}\n")
+                for name in stats["bad_files"]:
+                    lf.write(f"  {name}\n")
     except OSError:
         pass
 
