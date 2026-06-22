@@ -804,6 +804,44 @@ static const char *my_basename(const char *path) {
     return p ? p + 1 : path;
 }
 
+// ---- Filter out system noise from SO dumping ----
+// nhdd matches ANY \x7fELF + ET_DYN in memory, which pulls in a lot of system
+// artifacts that are useless for unpacking: ART AOT output (.oat/.odex/.art/.vdex),
+// the dynamic linker, the zygote entry point, [vdso], and APK files mmap'd whole.
+// Anonymous SOs (no maps path) are KEPT — these are often packer-injected/decrypted
+// native libraries, exactly what unpacking wants to catch. Returns 1 if the SO should
+// be skipped as system noise, 0 to keep.
+static int so_is_system_noise(const char *so_path) {
+    // Anonymous mapping: never noise (keep — likely packer-injected/decrypted SO).
+    if (so_path[0] == '\0') return 0;
+
+    // System directory prefixes: /system/ /apex/ /data/dalvik-cache/ /dev/__properties__
+    if (strncmp(so_path, "/system/", 8) == 0) return 1;
+    if (strncmp(so_path, "/apex/", 6) == 0) return 1;
+    if (strncmp(so_path, "/data/dalvik-cache", 17) == 0) return 1;
+    if (strncmp(so_path, "/dev/", 5) == 0) return 1;
+
+    const char *bname = my_basename(so_path);
+    // [vdso] — kernel virtual dynamic shared object
+    if (bname[0] == '[') return 1;
+
+    size_t blen = strlen(bname);
+    // ART AOT/ODEX output by extension
+    if (blen >= 5 && (strcmp(bname + blen - 4, ".oat") == 0 ||
+                      strcmp(bname + blen - 5, ".odex") == 0 ||
+                      strcmp(bname + blen - 5, ".art") == 0 ||
+                      strcmp(bname + blen - 5, ".vdex") == 0)) return 1;
+    // APK files mmap'd whole (the ELF we saw was the APK's internal zip structure)
+    if (blen >= 4 && strcmp(bname + blen - 4, ".apk") == 0) return 1;
+    // Dynamic linker / zygote entry
+    if (strcmp(bname, "linker64") == 0 || strcmp(bname, "linker") == 0 ||
+        strcmp(bname, "linker_asan") == 0 || strcmp(bname, "linker_asan64") == 0)
+        return 1;
+    if (strncmp(bname, "app_process", 11) == 0) return 1;
+
+    return 0;
+}
+
 // Counters carried across PID + snapshot iterations.
 typedef struct {
     int dex_unique;     // DEX actually written to disk
@@ -1021,6 +1059,13 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
 
                     // SO name from the maps region we are inside.
                     const char *so_path = r->path;
+                    // Skip system noise: ART AOT output (.oat/.odex/.art/.vdex), linker,
+                    // app_process, [vdso], APK files, and /system /apex /dalvik-cache libs.
+                    // Anonymous SOs (no path) are kept — those are often packer-injected.
+                    if (so_is_system_noise(so_path)) {
+                        i += 4096;
+                        continue;
+                    }
                     // B5: no longer skip-by-path here. We dump into a buffer, score its
                     // decryption state, and keep the best snapshot across watch rounds.
                     // (Anonymous SOs key on a content hash below.)
@@ -1140,6 +1185,11 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                         if (READ_REMOTE(elf_hdr, 64, elf_addr) == 64 &&
                             elf_so_struct_valid(elf_hdr, 64, &is_64)) {
                             const char *so_path = r->path;
+                            // Skip system noise (same filter as standard scan).
+                            if (so_is_system_noise(so_path)) {
+                                i += 4096;
+                                continue;
+                            }
                             // B5: don't skip-by-path; score & keep best snapshot instead.
                             {
                                 // SO extent = contiguous same-path regions.
