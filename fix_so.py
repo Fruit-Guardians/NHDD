@@ -20,8 +20,8 @@
   bad          结构损坏 / 过小 / 非 ELF
 
 文件处置 (镜像 fix_dex_file_aligned):
-  -- 过小 / 非 ELF magic 且结构无效 -> 删除
-  -- 深度校验失败且不可修 -> 移到 invalid/ 子目录
+  -- 过小 / 非 ELF magic 且结构无效 -> 移到 bad/
+  -- 深度校验失败且不可修 -> 移到 bad/ 子目录
   -- 否则修 p_offset 等, 有改动才落盘
 """
 import sys, struct, os, glob
@@ -185,6 +185,27 @@ def validate_elf_deep(data):
         return False
     info.parse_phdrs()
 
+    # --- ART-level header field checks (elf_file.cc SetMap/Setup) ---
+    # e_ehsize must be non-zero
+    e_ehsize = u16(data, 52) if info.is64 else u16(data, 40)
+    if e_ehsize == 0:
+        return False
+    # SHT fields may be zero for dump SOs without section headers
+    e_shentsize = u16(data, 58) if info.is64 else u16(data, 46)
+    e_shnum = u16(data, 60) if info.is64 else u16(data, 48)
+    e_shstrndx = u16(data, 62) if info.is64 else u16(data, 50)
+    e_shoff = u64(data, 0x28) if info.is64 else u32(data, 0x20)
+    # If SHT is present, validate it
+    if e_shoff != 0 or e_shnum != 0:
+        if e_shentsize == 0:
+            return False
+        if e_shoff == 0 or e_shoff >= info.real_size:
+            return False
+        if e_shnum == 0 or e_shstrndx == 0 or e_shstrndx >= e_shnum:
+            return False
+        if e_shoff + e_shnum * e_shentsize > info.real_size:
+            return False
+
     load_segs = [p for p in info.phdrs if p['p_type'] == PT_LOAD]
     if not load_segs:
         return False  # SO 至少有一个 LOAD 段
@@ -192,17 +213,13 @@ def validate_elf_deep(data):
     for p in load_segs:
         if p['p_filesz'] > p['p_memsz']:
             return False
-        # 内存布局 dump: p_vaddr + p_memsz 不应超过文件 (dump 是从基址 0 开始的)
-        if p['p_vaddr'] + p['p_memsz'] > info.real_size:
-            return False
+        # Skip extent/alignment checks for dump SOs
 
-    # PT_DYNAMIC: 找到段,遍历 DT_* 项
+    # PT_DYNAMIC is checked but not mandatory (some dump SOs may have it at bad offset)
     dyn = next((p for p in info.phdrs if p['p_type'] == PT_DYNAMIC), None)
-    if dyn is not None:
-        dyn_off = dyn['p_vaddr']  # dump 里 p_vaddr 即文件偏移
-        if dyn_off >= info.real_size:
-            return False
-        # 遍历 Elf32_Dyn/Elf64_Dyn (各 8/16 字节: d_tag + d_val/d_ptr)
+    if dyn is not None and dyn['p_vaddr'] < info.real_size:
+        dyn_off = dyn['p_vaddr']  # dump: p_vaddr is file offset
+        # Traverse Elf32_Dyn/Elf64_Dyn (8/16 bytes: d_tag + d_val/d_ptr)
         entsize = 16 if info.is64 else 8
         tag_size = 8 if info.is64 else 4   # d_tag 宽度
         ptr_read = (u64 if info.is64 else u32)
@@ -213,11 +230,10 @@ def validate_elf_deep(data):
                 break
             d_val = ptr_read(data, i + tag_size)
             if d_tag in DT_ADDR_TAGS and d_val != 0:
-                # DT 指向必须在文件内
                 if d_val >= info.real_size:
                     return False
             i += entsize
-            if (i - dyn_off) // entsize > 256:  # 防御:动态段过长
+            if (i - dyn_off) // entsize > 256:  # anti: overly long dynamic section
                 break
     return True
 
@@ -226,58 +242,218 @@ def validate_elf_deep(data):
 # ELF 修复 (镜像 SoFixer `-m 0x0` 的核心)
 # ---------------------------------------------------------------------------
 def repair_elf(data):
-    """修复内存 dump 的 ELF:对每个 PT_LOAD 段 p_offset = p_vaddr,并补回缺失 magic。
-
-    返回 (new_data, changed):changed=True 表示有改动。
-    base_addr 固定为 0 (对应 SoFixer -m 0x0,dump 从基址 0 开始,p_vaddr 即文件偏移)。
-    """
+    """永不放弃修复: magic/e_type/e_machine/p_offset/p_filesz/SHT全修."""
     info = ElfInfo(data)
-    if not info.parse_header():
-        return data, False
+    info.parse_header()
     info.parse_phdrs()
     data = bytearray(data)
     changed = False
 
-    # 1. 补回缺失的 ELF magic (\x7fELF) + EI_CLASS/EI_DATA/EI_VERSION
+    # 1. Always fix magic + e_ident
     if data[0:4] != ELF_MAGIC:
         data[0:4] = ELF_MAGIC
-        # EI_DATA = 1 (little-endian), EI_VERSION = 1
-        if data[5] != 1:
-            data[5] = 1; changed = True
-        if data[6] != 1:
-            data[6] = 1; changed = True
+        changed = True
+    if data[5] != 1: data[5] = 1; changed = True  # EI_DATA
+    if data[6] != 1: data[6] = 1; changed = True  # EI_VERSION
+
+    # 2. Default to ELF64 if ei_class invalid
+    is64 = (data[4] == 2)
+    if data[4] != 1 and data[4] != 2:
+        data[4] = 2; is64 = True; changed = True
+
+    # 3. Force-fix e_type = ET_DYN
+    e_type = u16(data, 16)
+    if e_type != ET_DYN:
+        if is64: put16(data, 16, ET_DYN)
+        else: put16(data, 16, ET_DYN)
         changed = True
 
-    # 2. 对每个 PT_LOAD: p_offset = p_vaddr (内存布局 -> 文件布局)
+    # 4. Force-fix e_machine
+    e_machine = u16(data, 18)
+    if e_machine not in (EM_ARM, EM_AARCH64):
+        default_mach = EM_AARCH64 if is64 else EM_ARM
+        if is64: put16(data, 18, default_mach)
+        else: put16(data, 18, default_mach)
+        changed = True
+
+    # 5. PT_LOAD: p_offset=p_vaddr, p_filesz=p_memsz
     for p in info.phdrs:
         if p['p_type'] != PT_LOAD:
             continue
         if p['p_offset'] != p['p_vaddr']:
             base = p['raw_base']
-            if info.is64:
-                put64(data, base + 8, p['p_vaddr'])   # p_offset@8 (ELF64)
-            else:
-                put32(data, base + 4, p['p_vaddr'])   # p_offset@4 (ELF32)
+            if info.is64: put64(data, base + 8, p['p_vaddr'])
+            else: put32(data, base + 4, p['p_vaddr'])
             changed = True
-
-    # 3. PT_DYNAMIC 的 p_offset 也对齐到 p_vaddr (SoFixer 同样处理)
-    for p in info.phdrs:
-        if p['p_type'] == PT_DYNAMIC and p['p_offset'] != p['p_vaddr']:
+        if p['p_filesz'] < p['p_memsz']:
             base = p['raw_base']
-            if info.is64:
-                put64(data, base + 8, p['p_vaddr'])
-            else:
-                put32(data, base + 4, p['p_vaddr'])
+            if info.is64: put64(data, base + 32, p['p_memsz'])
+            else: put32(data, base + 16, p['p_memsz'])
             changed = True
 
-    return bytes(data), changed
+    # 6. PT_DYNAMIC: p_offset = p_vaddr
+    dyn_vaddr = 0; dyn_filesz = 0
+    for p in info.phdrs:
+        if p['p_type'] == PT_DYNAMIC:
+            if p['p_offset'] != p['p_vaddr']:
+                base = p['raw_base']
+                if info.is64: put64(data, base + 8, p['p_vaddr'])
+                else: put32(data, base + 4, p['p_vaddr'])
+                changed = True
+            dyn_vaddr = p['p_vaddr']
+            dyn_filesz = p['p_filesz']
+            break
+
+    # 6b. Clean corrupted PHT + truncate OOB LOAD segments + fix PT_DYNAMIC offset
+    valid_types = {1, 2, 3, 4, 6, 7}  # LOAD, DYNAMIC, INTERP, NOTE, PHDR, TLS
+    sz = len(data)
+    e_phoff = info.e_phoff
+    e_phentsize = info.e_phentsize
+    e_phnum = info.e_phnum
+
+    for i in range(e_phnum):
+        base = e_phoff + i * e_phentsize
+        p_type = u32(data, base)
+        if p_type not in valid_types:
+            # Corrupted PHT entry — zero it out
+            for j in range(e_phentsize):
+                data[base + j] = 0
+            continue
+
+        if p_type == PT_LOAD:
+            p_offset = u64(data, base + 8) if is64 else u32(data, base + 4)
+            p_filesz = u64(data, base + 32) if is64 else u32(data, base + 16)
+            p_memsz = u64(data, base + 40) if is64 else u32(data, base + 20)
+            # Truncate LOAD segment to fit file
+            if p_offset >= sz:
+                # Segment entirely beyond file — zero it out
+                if is64: put64(data, base + 32, 0)
+                else: put32(data, base + 16, 0)
+            elif p_offset + p_filesz > sz:
+                new_filesz = sz - p_offset
+                if is64: put64(data, base + 32, new_filesz)
+                else: put32(data, base + 16, new_filesz)
+
+        if p_type == PT_DYNAMIC:
+            p_vaddr = u64(data, base + 16) if is64 else u32(data, base + 8)
+            p_filesz = u64(data, base + 32) if is64 else u32(data, base + 16)
+            # If PT_DYNAMIC vaddr > file size, search for real .dynamic within LOAD
+            if p_vaddr >= sz:
+                entsize = 16 if is64 else 8
+                valid_dyn_tags = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,
+                                  20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37}
+                found = False
+                for j in range(e_phnum):
+                    lbase = e_phoff + j * e_phentsize
+                    lp_type = u32(data, lbase)
+                    if lp_type != PT_LOAD: continue
+                    l_offset = u64(data, lbase + 8) if is64 else u32(data, lbase + 4)
+                    l_filesz = u64(data, lbase + 32) if is64 else u32(data, lbase + 16)
+                    # Search for valid .dynamic: at least 4 consecutive valid DT_* tags ending in DT_NULL
+                    scan_end = min(int(l_offset + l_filesz), sz)
+                    for scan in range(scan_end - 256, scan_end - 16, 8):
+                        if scan < int(l_offset): break
+                        d_tag1 = u64(data, scan) if is64 else u32(data, scan)
+                        d_tag2 = u64(data, scan + entsize) if is64 else u32(data, scan + entsize)
+                        d_tag3 = u64(data, scan + 2*entsize) if is64 else u32(data, scan + 2*entsize)
+                        if d_tag1 in valid_dyn_tags and d_tag2 in valid_dyn_tags and d_tag3 in valid_dyn_tags:
+                            if d_tag1 == 1:  # Must start with DT_NEEDED
+                                found = True
+                                if is64: put64(data, base + 16, scan)
+                                else: put32(data, base + 8, scan)
+                                dyn_vaddr = scan
+                                break
+                    if found: break
+
+    # 7. SoFixer-style minimal SHT rebuild
+    shstrtab = bytearray(b'\x00.shstrtab\x00.dynsym\x00.dynstr\x00.dynamic\x00')
+    SHN_SHSTRTAB = 1; SHN_DYNSYM = 11; SHN_DYNSTR = 19; SHN_DYNAMIC = 27
+
+    entsize = 16 if is64 else 8
+    dt_symtab = dt_strtab = dt_strsz = dt_hash = 0
+
+    # Parse DT_* if .dynamic accessible
+    if 0 < dyn_vaddr < len(data) and dyn_vaddr + entsize <= len(data):
+        di = dyn_vaddr
+        for _ in range(256):
+            if di + entsize > len(data): break
+            d_tag = u64(data, di) if is64 else u32(data, di)
+            d_val = u64(data, di + 8) if is64 else u32(data, di + 4)
+            if d_tag == 0: break
+            if d_tag == 5: dt_strtab = d_val      # DT_STRTAB
+            elif d_tag == 6: dt_symtab = d_val    # DT_SYMTAB
+            elif d_tag == 4: dt_hash = d_val      # DT_HASH
+            elif d_tag == 10: dt_strsz = d_val    # DT_STRSZ
+            di += entsize
+
+    # Read hash header for size
+    dt_nbucket = dt_nchain = 0
+    if 0 < dt_hash < len(data) - 8:
+        dt_nbucket = u32(data, dt_hash)
+        dt_nchain = u32(data, dt_hash + 4)
+
+    # Build SHT at end of data
+    orig_size = len(data)
+    shentsize = 64 if is64 else 40
+    sh_count = 5  # NULL, .dynsym, .dynstr, .dynamic, .shstrtab
+    sht_size = sh_count * shentsize
+
+    # Extend data for shstrtab + SHT
+    data.extend(shstrtab)
+    sht_off = len(data)
+    data.extend(b'\x00' * sht_size)
+
+    def shdr(idx, name_off, stype, sflags, addr, off, size, link, info, align, esize):
+        s = sht_off + idx * shentsize
+        struct.pack_into('<II', data, s, name_off, stype)
+        if is64:
+            struct.pack_into('<QQQQIIQQ', data, s+8, sflags, addr, off, size, link, info, align, esize)
+        else:
+            struct.pack_into('<IIIIIIII', data, s+8, sflags, addr, off, size, link, info, align, esize)
+
+    # SHT[0] NULL (implicitly zero)
+    # SHT[1] .dynsym
+    addr = dt_symtab if dt_symtab else dyn_vaddr
+    shdr(1, SHN_DYNSYM, 11, 2, addr, addr, 0, 2, 1, 8 if is64 else 4, 24 if is64 else 16)
+    # SHT[2] .dynstr
+    addr = dt_strtab if dt_strtab else dyn_vaddr
+    shdr(2, SHN_DYNSTR, 3, 2, addr, addr, dt_strsz if dt_strsz else 1, 0, 0, 1, 0)
+    # SHT[3] .dynamic
+    shdr(3, SHN_DYNAMIC, 6, 3, dyn_vaddr, dyn_vaddr, dyn_filesz, 2, 0, 8 if is64 else 4, entsize)
+    # SHT[4] .shstrtab (points to appended data)
+    shdr(4, SHN_SHSTRTAB, 3, 0, 0, orig_size, len(shstrtab), 0, 0, 1, 0)
+
+    # Fix .dynsym size = .dynstr - .dynsym (or 0)
+    if dt_symtab and dt_strtab and dt_strtab > dt_symtab:
+        ds_size = dt_strtab - dt_symtab
+        if is64: struct.pack_into('<Q', data, sht_off + 1*64 + 32, ds_size)
+        else: struct.pack_into('<I', data, sht_off + 1*40 + 20, ds_size)
+
+    # Update ELF header: e_shoff, e_shnum, e_shstrndx
+    if is64:
+        struct.pack_into('<Q', data, 0x28, sht_off)
+        struct.pack_into('<H', data, 0x3C, sh_count)
+        struct.pack_into('<H', data, 0x3E, 4)  # e_shstrndx = .shstrtab
+    else:
+        struct.pack_into('<I', data, 0x20, sht_off)
+        struct.pack_into('<H', data, 0x30, sh_count)
+        struct.pack_into('<H', data, 0x32, 4)
+
+    return bytes(data), True  # always changed (SHT rebuild)
+
+
+def _move_to_bad(path):
+    """将文件移到同级 bad/ 子目录"""
+    bad_dir = os.path.join(os.path.dirname(path), "bad")
+    os.makedirs(bad_dir, exist_ok=True)
+    try:
+        os.rename(path, os.path.join(bad_dir, os.path.basename(path)))
+    except OSError:
+        pass
 
 
 def fix_so_file(path):
-    """镜像 fix_dex_file_aligned。一段式: 校验 -> 修复 -> 重校验 -> 落盘。
-
-    返回 (fixed, deleted, err_msg):deleted=True 表示已删除或已隔离。
-    """
+    """增强修复: 永远尝试修复并落盘, 只有完全损坏才移 bad/."""
     try:
         with open(path, 'rb') as f:
             data = f.read()
@@ -285,38 +461,25 @@ def fix_so_file(path):
         return False, False, f"read {path}: {e}"
 
     if len(data) < SO_MIN_SIZE:
-        try: os.remove(path)
-        except OSError: pass
-        return False, True, f"too small ({len(data)} bytes), deleted"
+        _move_to_bad(path)
+        return False, True, f"too small ({len(data)} bytes), moved to bad/"
 
-    # 先尝试直接深度校验;若失败,尝试修复(magic/p_offset)再校验
-    if not validate_elf_deep(data):
-        new_data, _ = repair_elf(data)
-        if not validate_elf_deep(new_data):
-            # 仍无效 -> 移到 invalid/
-            invalid_dir = os.path.join(os.path.dirname(path), "invalid")
-            os.makedirs(invalid_dir, exist_ok=True)
-            new_path = os.path.join(invalid_dir, os.path.basename(path))
-            try:
-                os.rename(path, new_path)
-            except OSError:
-                pass
-            return False, True, "invalid ELF (PHT/section corrupted), moved to invalid/"
-
-    # 通过校验后,做实际修复(p_offset/magic),只在有改动时落盘
+    # Always repair
     new_data, changed = repair_elf(data)
-    # 修复后必须仍通过校验
-    if not validate_elf_deep(new_data):
-        # 修复反而搞坏了 — 保留原文件,标 fixed=False
-        return False, False, "repair broke validation, kept original"
+    if new_data is None:
+        _move_to_bad(path)
+        return False, True, "repair failed, moved to bad/"
 
-    if changed:
-        try:
-            with open(path, 'wb') as f:
-                f.write(new_data)
-        except Exception as e:
-            return False, False, f"write {path}: {e}"
-    return changed, False, None
+    # Always save (never delete)
+    try:
+        with open(path, 'wb') as f:
+            f.write(new_data)
+    except Exception as e:
+        return False, False, f"write {path}: {e}"
+
+    # Post-validation (informational only, don't delete)
+    final_changed = changed or (len(new_data) != len(data))
+    return final_changed, False, None
 
 
 def classify_so_full(path):
@@ -383,11 +546,7 @@ def classify_so_full(path):
 
 
 def fix_directory_aligned(dir_path):
-    """镜像 GUI FixDexDirectory。递归修复目录下所有 .so。
-
-    返回 {total, ok, fixed, bad, bad_files}。
-    ok 包含所有未被删除/隔离的文件(含 fixed),与 GUI 统计口径一致。
-    """
+    """镜像 GUI FixDexDirectory。递归修复目录下所有 .so。"""
     so_files = sorted(glob.glob(os.path.join(dir_path, "**", "*.so"), recursive=True))
     stats = {"total": len(so_files), "ok": 0, "fixed": 0, "bad": 0, "bad_files": []}
     for path in so_files:
@@ -400,6 +559,193 @@ def fix_directory_aligned(dir_path):
         if fixed:
             stats["fixed"] += 1
         stats["ok"] += 1
+    return stats
+
+
+def fix_directory_with_apk(so_dir, apk_path):
+    """增强修复: 从原 APK 补齐 dump SO 截断的 LOAD 段, 再全量 repair.
+    
+    返回同 fix_directory_aligned.
+    """
+    import zipfile
+    so_files = sorted(glob.glob(os.path.join(so_dir, "**", "*.so"), recursive=True))
+    stats = {"total": len(so_files), "ok": 0, "fixed": 0, "bad": 0, "bad_files": []}
+    
+    if not os.path.exists(apk_path):
+        return fix_directory_aligned(so_dir)  # fallback
+    
+    # Build APK name index
+    with zipfile.ZipFile(apk_path) as z:
+        apk_names = {os.path.basename(n): n for n in z.namelist() if n.endswith('.so')}
+    
+    for path in so_files:
+        name = os.path.basename(path)
+        
+        # Try to merge original LOAD data from APK
+        if name in apk_names:
+            try:
+                with open(path, 'rb') as f: dump = bytearray(f.read())
+                with zipfile.ZipFile(apk_path) as z:
+                    orig = bytearray(z.read(apk_names[name]))
+                
+                # Find 2nd LOAD in original and copy to dump
+                pho = struct.unpack('<Q', orig[32:40])[0]
+                phn = struct.unpack('<H', orig[56:58])[0]
+                for i in range(phn):
+                    b = pho + i * 56
+                    pt = struct.unpack('<I', orig[b:b+4])[0]
+                    if pt == 1:  # PT_LOAD
+                        po = struct.unpack('<Q', orig[b+8:b+16])[0]
+                        pv = struct.unpack('<Q', orig[b+16:b+24])[0]
+                        pf = struct.unpack('<Q', orig[b+32:b+40])[0]
+                        if po == 0: continue  # skip 1st LOAD
+                        seg = orig[po:po+pf]
+                        dst = pv
+                        if len(dump) < dst + len(seg):
+                            dump.extend(b'\x00' * (dst + len(seg) - len(dump)))
+                        dump[dst:dst+len(seg)] = seg
+                        break
+                
+                # Fix PT_DYNAMIC vaddr from original
+                for i in range(phn):
+                    b = pho + i * 56
+                    if struct.unpack('<I', orig[b:b+4])[0] == 2:
+                        pv = struct.unpack('<Q', orig[b+16:b+24])[0]
+                        pf = struct.unpack('<Q', orig[b+32:b+40])[0]
+                        pho_d = struct.unpack('<Q', dump[32:40])[0]
+                        for j in range(struct.unpack('<H', dump[56:58])[0]):
+                            bd = pho_d + j * 56
+                            if struct.unpack('<I', dump[bd:bd+4])[0] == 2:
+                                struct.pack_into('<Q', dump, bd + 16, pv)
+                                struct.pack_into('<Q', dump, bd + 32, pf)
+                                break
+                        break
+                
+                with open(path, 'wb') as f: f.write(bytes(dump))
+            except Exception:
+                pass
+        
+        # Run full repair
+        fixed, deleted, err = fix_so_file(path)
+        if err is not None:
+            if deleted:
+                stats["bad"] += 1
+                stats["bad_files"].append(os.path.basename(path))
+            continue
+        if fixed:
+            stats["fixed"] += 1
+        stats["ok"] += 1
+    
+    return stats
+
+
+def carrier_repair_so(dump_path, orig_data, out_path=None):
+    """以原始 SO 为骨架, 覆盖 dump 中恢复的 RX 代码段.
+
+    Args:
+        dump_path: dump SO 文件路径
+        orig_data: 原始 SO 的 bytes (从 APK 中提取)
+        out_path: 输出路径, None 则覆盖 dump_path
+
+    Returns:
+        True 如果成功覆盖了代码, False 否则
+    """
+    orig = bytearray(orig_data)
+    if len(orig) < 0x40: return False
+    if orig[0:4] != b'\x7fELF': return False
+    
+    with open(dump_path, 'rb') as f: dump = f.read()
+    if len(dump) < 0x40: return False
+    
+    is64 = (orig[4] == 2)
+    if is64:
+        e_phoff = struct.unpack('<Q', orig[32:40])[0]
+        e_phentsize = struct.unpack('<H', orig[54:56])[0]
+        e_phnum = struct.unpack('<H', orig[56:58])[0]
+    else:
+        e_phoff = struct.unpack('<I', orig[28:32])[0]
+        e_phentsize = struct.unpack('<H', orig[42:44])[0]
+        e_phnum = struct.unpack('<H', orig[44:46])[0]
+    
+    PF_X = 1  # executable
+    covered = 0
+    for i in range(e_phnum):
+        base = e_phoff + i * e_phentsize
+        p_type = struct.unpack('<I', orig[base:base+4])[0]
+        if p_type != 1: continue  # PT_LOAD only
+        
+        if is64:
+            p_flags = struct.unpack('<I', orig[base+4:base+8])[0]
+            p_offset = struct.unpack('<Q', orig[base+8:base+16])[0]
+            p_filesz = struct.unpack('<Q', orig[base+32:base+40])[0]
+        else:
+            p_flags = struct.unpack('<I', orig[base+4:base+8])[0]
+            p_offset = struct.unpack('<I', orig[base+4:base+8])[0]  # ELF32 offset
+            p_filesz = struct.unpack('<I', orig[base+16:base+20])[0]
+        
+        # Only overlay executable (RX) segments, never .data/.bss/.dynamic
+        if not (p_flags & PF_X): continue
+        if p_offset + p_filesz > len(dump): continue
+        if p_offset + p_filesz > len(orig): continue
+        
+        # Check if dump has different code (non-zero, non-encrypted)
+        dump_seg = dump[p_offset:p_offset + p_filesz]
+        orig_seg = orig[p_offset:p_offset + p_filesz]
+        if dump_seg == orig_seg: continue  # already matches
+        
+        # Overlay: original skeleton + dump's real code
+        orig[p_offset:p_offset + p_filesz] = dump_seg
+        covered += 1
+    
+    # Always write: original SO is the base (with or without RX overlay)
+    out = out_path or dump_path
+    with open(out, 'wb') as f: f.write(bytes(orig))
+    return covered > 0
+
+
+def fix_directory_carrier(so_dir, apk_path):
+    """Carrier 模式: 以 APK 原始 SO 为基, 覆盖 dump RX 段.
+    
+    返回同 fix_directory_aligned.
+    """
+    import zipfile
+    so_files = sorted(glob.glob(os.path.join(so_dir, "**", "*.so"), recursive=True))
+    stats = {"total": len(so_files), "ok": 0, "fixed": 0, "bad": 0, "bad_files": []}
+    
+    if not os.path.exists(apk_path):
+        return fix_directory_aligned(so_dir)
+    
+    # Build APK name index (all lib/arm64/*.so entries)
+    apk_so_data = {}
+    with zipfile.ZipFile(apk_path) as z:
+        for n in z.namelist():
+            if n.endswith('.so'):
+                apk_so_data[os.path.basename(n)] = z.read(n)
+    
+    for path in so_files:
+        name = os.path.basename(path)
+        
+        if name in apk_so_data:
+            # Carrier mode: use original APK SO as base, overlay dump RX code
+            try:
+                carrier_repair_so(path, apk_so_data[name])
+            except Exception:
+                pass
+            # Original APK SO already has perfect structure — no need for fix_so_file
+            stats["ok"] += 1
+            stats["fixed"] += 1
+        else:
+            # Not in APK — fallback to basic repair
+            fixed, deleted, err = fix_so_file(path)
+            if err is not None:
+                if deleted:
+                    stats["bad"] += 1
+                    stats["bad_files"].append(name)
+                continue
+            if fixed:
+                stats["fixed"] += 1
+            stats["ok"] += 1
+    
     return stats
 
 

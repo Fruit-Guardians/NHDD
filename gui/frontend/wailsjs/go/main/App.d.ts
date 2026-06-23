@@ -10,6 +10,8 @@ export function GetNhddPath():Promise<string>;
 
 export function IsDumping():Promise<boolean>;
 
+export function RepackAPK(arg1:main.RepackParams):Promise<main.RepackResult>;
+
 export function SelectDirectory():Promise<string>;
 
 export function StartDump(arg1:main.DumpParams):Promise<main.DumpResult>;

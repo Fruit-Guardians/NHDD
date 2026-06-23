@@ -88,6 +88,50 @@ export namespace main {
 	        this.error = source["error"];
 	    }
 	}
+	export class RepackParams {
+	    package: string;
+	    dumpDir: string;
+	    outputDir: string;
+	    adbPath: string;
+	    hostPort: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new RepackParams(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.package = source["package"];
+	        this.dumpDir = source["dumpDir"];
+	        this.outputDir = source["outputDir"];
+	        this.adbPath = source["adbPath"];
+	        this.hostPort = source["hostPort"];
+	    }
+	}
+	export class RepackResult {
+	    success: boolean;
+	    message: string;
+	    outputApk: string;
+	    replacedDex: number;
+	    skippedDex: number;
+	    replacedSo: number;
+	    skippedSo: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new RepackResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.success = source["success"];
+	        this.message = source["message"];
+	        this.outputApk = source["outputApk"];
+	        this.replacedDex = source["replacedDex"];
+	        this.skippedDex = source["skippedDex"];
+	        this.replacedSo = source["replacedSo"];
+	        this.skippedSo = source["skippedSo"];
+	    }
+	}
 
 }
 

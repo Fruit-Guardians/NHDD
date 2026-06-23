@@ -19,9 +19,10 @@ import (
 
 // App 主应用结构体
 type App struct {
-	ctx     context.Context
-	mu      sync.Mutex
-	dumping bool
+	ctx       context.Context
+	mu        sync.Mutex
+	dumping   bool
+	repacking bool
 }
 
 // NewApp 创建新的 App 实例
@@ -80,7 +81,7 @@ type DumpParams struct {
 	OutputDir     string `json:"outputDir"`
 	AdbPath       string `json:"adbPath"`
 	HostPort      string `json:"hostPort"`
-	Mode          string `json:"mode"`          // dex, so, all
+	Mode          string `json:"mode"`          // apk, dex, so
 	Restart       bool   `json:"restart"`       // 是否重启 app
 	Watch         bool   `json:"watch"`         // 是否启用 watch
 	DryLimit      int    `json:"dryLimit"`      // watch 连续几轮无新 DEX 停止
@@ -149,7 +150,7 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 
 	// 默认值
 	if params.Mode == "" {
-		params.Mode = "dex"
+		params.Mode = "apk"
 	}
 	if params.OutputDir == "" {
 		params.OutputDir = "./nhdd_output"
@@ -202,8 +203,8 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 	switch strings.ToLower(strings.TrimSpace(params.Mode)) {
 	case "so":
 		modeArg = "--so"
-	case "all":
-		modeArg = "--all"
+	case "apk", "all":
+		modeArg = "--apk"
 	}
 
 	nhddCmdParts := []string{"/data/local/tmp/nhdd", pkg, deviceDumpDir, modeArg}
@@ -315,7 +316,7 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 	if err != nil {
 		a.log(fmt.Sprintf("修复 DEX 出错: %v", err))
 	} else {
-		a.log(fmt.Sprintf("[6/6] 修复完成: %d OK, %d 修复, %d 损坏已隔离", stats.OK, stats.Fixed, stats.Bad))
+		a.log(fmt.Sprintf("[6/6] DEX 修复: %d OK, %d 修复, %d 损坏", stats.OK, stats.Fixed, stats.Bad))
 		if stats.Bad > 0 {
 			a.log(fmt.Sprintf("  [警告] 损坏文件: %v", stats.BadFiles))
 		}
@@ -336,7 +337,7 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 		if soErr != nil {
 			a.log(fmt.Sprintf("修复 SO 出错: %v", soErr))
 		} else {
-			a.log(fmt.Sprintf("[6b] SO 修复完成: %d OK, %d 修复, %d 损坏已隔离", soStats.OK, soStats.Fixed, soStats.Bad))
+			a.log(fmt.Sprintf("[6b] SO 增强修复: %d OK, %d 修复, %d 损坏", soStats.OK, soStats.Fixed, soStats.Bad))
 			if soStats.Bad > 0 {
 				a.log(fmt.Sprintf("  [警告] 损坏 SO: %v", soStats.BadFiles))
 			}
@@ -360,6 +361,24 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 
 	a.log(fmt.Sprintf("脱壳完成! %d DEX, %d SO, %.2f KB, 输出: %s",
 		dexCount, soCount, float64(totalSize)/1024.0, targetDir))
+
+	// APK 模式: 自动生成 jadx 分析 APK
+	if strings.ToLower(strings.TrimSpace(params.Mode)) == "apk" {
+		a.log("APK 模式: 自动生成 jadx 分析 APK...")
+		repackParams := RepackParams{
+			Package:   pkg,
+			DumpDir:   targetDir,
+			OutputDir: outputDir,
+			AdbPath:   params.AdbPath,
+			HostPort:  params.HostPort,
+		}
+		repackResult, repackErr := DoRepackAPK(repackParams, a.log)
+		if repackErr != nil {
+			a.log(fmt.Sprintf("自动 repack 失败: %v", repackErr))
+		} else if repackResult.Success {
+			a.log(fmt.Sprintf("分析 APK: %s", repackResult.OutputAPK))
+		}
+	}
 
 	return &DumpResult{
 		Success:    true,
@@ -425,6 +444,29 @@ func (a *App) IsDumping() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.dumping
+}
+
+// RepackAPK 重打包 APK（将修复后的 DEX/SO 替换回原始 APK，供 jadx 分析，不签名）
+func (a *App) RepackAPK(params RepackParams) *RepackResult {
+	a.mu.Lock()
+	if a.repacking {
+		a.mu.Unlock()
+		return &RepackResult{Success: false, Message: "正在重打包中，请等待..."}
+	}
+	a.repacking = true
+	a.mu.Unlock()
+
+	defer func() {
+		a.mu.Lock()
+		a.repacking = false
+		a.mu.Unlock()
+	}()
+
+	result, err := DoRepackAPK(params, a.log)
+	if err != nil {
+		return result
+	}
+	return result
 }
 
 // log 发送日志事件到前端

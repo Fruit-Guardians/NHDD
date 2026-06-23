@@ -63,9 +63,9 @@
         <div class="form-group">
           <label>Dump模式:</label>
           <div class="radio-group">
+            <label><input type="radio" v-model="mode" value="apk" /> APK (全自动)</label>
             <label><input type="radio" v-model="mode" value="dex" /> DEX</label>
             <label><input type="radio" v-model="mode" value="so" /> SO</label>
-            <label><input type="radio" v-model="mode" value="all" /> ALL</label>
           </div>
         </div>
         <div class="form-group">
@@ -173,6 +173,14 @@
       >
         {{ dumping ? '脱壳中...' : 'DUMP!' }}
       </button>
+      <button
+        v-if="dumpDone"
+        class="btn btn-repack"
+        :disabled="repacking"
+        @click="startRepack"
+      >
+        {{ repacking ? '生成中...' : '生成 jadx 分析 APK' }}
+      </button>
       <div class="log-panel" ref="logPanel">
         <div v-for="(line, i) in logLines" :key="i" class="log-line">{{ line }}</div>
         <div v-if="logLines.length === 0" class="log-empty">等待操作...</div>
@@ -182,7 +190,7 @@
 </template>
 
 <script>
-import { ConnectADB, GetAppList, StartDump, SelectDirectory, GetNhddPath } from '../wailsjs/go/main/App.js'
+import { ConnectADB, GetAppList, StartDump, RepackAPK, SelectDirectory, GetNhddPath } from '../wailsjs/go/main/App.js'
 import { EventsOn } from '../wailsjs/runtime/runtime.js'
 
 export default {
@@ -204,20 +212,22 @@ export default {
       // Config
       suCmd: 'su -c',
       outputDir: './nhdd_output',
-      mode: 'dex',
-      restart: false,
+      mode: 'apk',
+      restart: true,
       watch: true,
       dryLimit: 3,
       maxSeconds: 120,
       maxRounds: 60,
-      stealth: false,
-      stealth2: false,
-      relaxed: false,
+      stealth: true,
+      stealth2: true,
+      relaxed: true,
       anon: false,
       regionDelayMs: 2,
 
       // State
       dumping: false,
+      repacking: false,
+      dumpDone: false,
       logLines: [],
       showProgress: false,
       progress: {
@@ -313,6 +323,7 @@ export default {
     async startDump() {
       if (!this.selectedPkg) return
       this.dumping = true
+      this.dumpDone = false
       this.showProgress = true
       this.progress = {
         round: 0, newThis: 0, total: 0, dedup: 0, dry: 0, dryLimit: this.dryLimit,
@@ -341,6 +352,7 @@ export default {
 
         if (result.success) {
           this.addLog('脱壳完成! DEX: ' + result.dexCount + ', SO: ' + result.soCount + ', 输出: ' + result.outputDir)
+          this.dumpDone = true
         } else {
           this.addLog('脱壳失败: ' + result.message)
         }
@@ -349,6 +361,34 @@ export default {
       }
 
       this.dumping = false
+    },
+
+    async startRepack() {
+      if (!this.selectedPkg) return
+      this.repacking = true
+      this.addLog('生成 jadx 分析 APK...')
+
+      try {
+        const result = await RepackAPK({
+          package: this.selectedPkg,
+          dumpDir: this.outputDir + '/' + this.selectedPkg,
+          outputDir: this.outputDir,
+          adbPath: this.adbPath,
+          hostPort: this.hostPort,
+        })
+
+        if (result.success) {
+          this.addLog('分析 APK 已生成! 替换 DEX: ' + result.replacedDex)
+          this.addLog('输出: ' + result.outputApk)
+          this.addLog('可直接拖入 jadx 分析')
+        } else {
+          this.addLog('生成失败: ' + result.message)
+        }
+      } catch (e) {
+        this.addLog('生成异常: ' + e)
+      }
+
+      this.repacking = false
     },
 
     addLog(msg) {

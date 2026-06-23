@@ -20,49 +20,37 @@ const (
 )
 
 // FixSoFile 修复单个 SO (内存 dump):p_offset=p_vaddr 对齐 + 补回 magic。
-// 返回 (已修复, 已删除, 错误)。
+// 返回 (已修复, 已隔离, 错误)。无效文件移到 bad/ 子目录，不删除。
 func FixSoFile(path string) (bool, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false, false, err
 	}
 	if len(data) < soMinSize {
-		os.Remove(path)
+		moveToBadDir(path)
 		return false, true, nil
 	}
 
-	if !validateSoDeep(data) {
-		// 尝试修复后再校验
-		if newData := repairSo(data); newData != nil {
-			if validateSoDeep(newData) {
-				data = newData
-			} else {
-				// 仍无效 -> 移到 invalid/
-				invalidDir := filepath.Join(filepath.Dir(path), "invalid")
-				os.MkdirAll(invalidDir, 0755)
-				newPath := filepath.Join(invalidDir, filepath.Base(path))
-				os.Rename(path, newPath)
-				return false, true, nil
-			}
-		} else {
-			invalidDir := filepath.Join(filepath.Dir(path), "invalid")
-			os.MkdirAll(invalidDir, 0755)
-			newPath := filepath.Join(invalidDir, filepath.Base(path))
-			os.Rename(path, newPath)
-			return false, true, nil
-		}
+	// 尝试修复 (repairSo 返回 nil 表示无法修复)
+	repaired := repairSo(data)
+	if repaired == nil {
+		moveToBadDir(path)
+		return false, true, nil
 	}
 
-	newData, changed := repairSo(data)
-	if !validateSoDeep(newData) {
-		return false, false, nil // 保留原文件
+	if !validateSoDeep(repaired) {
+		moveToBadDir(path)
+		return false, true, nil
 	}
-	if changed {
-		if err := os.WriteFile(path, newData, 0644); err != nil {
+
+	// 判断是否实际有修改 (切片地址不同)
+	if &repaired[0] != &data[0] {
+		if err := os.WriteFile(path, repaired, 0644); err != nil {
 			return false, false, err
 		}
+		return true, false, nil
 	}
-	return changed, false, nil
+	return false, false, nil
 }
 
 // FixSoDirectory 递归修复目录中所有 .so 文件,返回统计 (复用 DexStats 结构)。
@@ -119,11 +107,18 @@ func repairSo(data []byte) []byte {
 	copy(out, data)
 	changed := false
 
-	// 补回 magic
+	// 补回 magic + e_ident
 	if string(out[0:4]) != soMagic {
 		copy(out[0:4], soMagic)
-		out[5] = 1 // EI_DATA little-endian
-		out[6] = 1 // EI_VERSION
+		changed = true
+	}
+	// ART-required: always fix EI_DATA=1, EI_VERSION=1
+	if out[5] != 1 {
+		out[5] = 1 // ELFDATA2LSB
+		changed = true
+	}
+	if out[6] != 1 {
+		out[6] = 1 // EV_CURRENT
 		changed = true
 	}
 
@@ -151,6 +146,30 @@ func repairSo(data []byte) []byte {
 					binary.LittleEndian.PutUint32(out[pRaw:pRaw+4], uint32(pVaddr))
 				}
 				changed = true
+			}
+			// SoFixer parity: set p_filesz = p_memsz for PT_LOAD to eliminate gaps
+			if pType == elfPtLoad {
+				var fRaw, mRaw uint64
+				var pFilesz, pMemsz uint64
+				if is64 {
+					fRaw = base + 32
+					mRaw = base + 40
+					pFilesz = binary.LittleEndian.Uint64(out[fRaw : fRaw+8])
+					pMemsz = binary.LittleEndian.Uint64(out[mRaw : mRaw+8])
+				} else {
+					fRaw = base + 16
+					mRaw = base + 20
+					pFilesz = uint64(binary.LittleEndian.Uint32(out[fRaw : fRaw+4]))
+					pMemsz = uint64(binary.LittleEndian.Uint32(out[mRaw : mRaw+4]))
+				}
+				if pFilesz < pMemsz {
+					if is64 {
+						binary.LittleEndian.PutUint64(out[fRaw:fRaw+8], pMemsz)
+					} else {
+						binary.LittleEndian.PutUint32(out[fRaw:fRaw+4], uint32(pMemsz))
+					}
+					changed = true
+				}
 			}
 		}
 	}
@@ -199,20 +218,86 @@ func validateSoDeep(data []byte) bool {
 		return false
 	}
 
+	// --- ART-level header field checks (elf_file.cc SetMap/Setup) ---
+
+	// e_ehsize must be non-zero
+	var eEhsize uint16
+	if is64 {
+		eEhsize = binary.LittleEndian.Uint16(data[52:54])
+	} else {
+		eEhsize = binary.LittleEndian.Uint16(data[40:42])
+	}
+	if eEhsize == 0 {
+		return false
+	}
+
+	// e_shentsize / e_shnum / e_shstrndx — may be zero for dump SOs without SHT
+	var eShentsize uint16
+	if is64 {
+		eShentsize = binary.LittleEndian.Uint16(data[58:60])
+	} else {
+		eShentsize = binary.LittleEndian.Uint16(data[46:48])
+	}
+
+	// e_shnum must be non-zero if SHT present
+	var eShnum uint16
+	if is64 {
+		eShnum = binary.LittleEndian.Uint16(data[60:62])
+	} else {
+		eShnum = binary.LittleEndian.Uint16(data[48:50])
+	}
+
+	// e_shstrndx
+	var eShstrndx uint16
+	if is64 {
+		eShstrndx = binary.LittleEndian.Uint16(data[62:64])
+	} else {
+		eShstrndx = binary.LittleEndian.Uint16(data[50:52])
+	}
+
+	// e_shoff — if zero, dump SO has no section headers (tolerable)
+	var eShoff uint64
+	if is64 {
+		eShoff = binary.LittleEndian.Uint64(data[0x28:0x30])
+	} else {
+		eShoff = uint64(binary.LittleEndian.Uint32(data[0x20:0x24]))
+	}
+	// If SHT is present, validate it
+	if eShoff != 0 || eShnum != 0 {
+		if eShoff == 0 || eShoff >= uint64(realSize) {
+			return false
+		}
+		if eShnum == 0 || eShstrndx == 0 || eShstrndx >= eShnum {
+			return false
+		}
+		shEnd := eShoff + uint64(eShnum)*uint64(eShentsize)
+		if shEnd > uint64(realSize) {
+			return false
+		}
+
+	// shstrtab section header must be accessible
+	shstrtabOff := eShoff + uint64(eShstrndx)*uint64(eShentsize)
+	if shstrtabOff+uint64(eShentsize) > uint64(realSize) {
+		return false
+	}
+	} // end if SHT present
+
 	hasLoad := false
 	var dynVaddr uint64
 	var dynFound bool
 	for i := uint16(0); i < ePhnum; i++ {
 		base := uint64(ePhoff) + uint64(i)*uint64(ePhentsize)
 		var pType uint32
-		var pVaddr, pFilesz, pMemsz uint64
+		var pOffset, pVaddr, pFilesz, pMemsz uint64
 		if is64 {
 			pType = binary.LittleEndian.Uint32(data[base : base+4])
+			pOffset = binary.LittleEndian.Uint64(data[base+8 : base+16])
 			pVaddr = binary.LittleEndian.Uint64(data[base+16 : base+24])
 			pFilesz = binary.LittleEndian.Uint64(data[base+32 : base+40])
 			pMemsz = binary.LittleEndian.Uint64(data[base+40 : base+48])
 		} else {
 			pType = binary.LittleEndian.Uint32(data[base : base+4])
+			pOffset = uint64(binary.LittleEndian.Uint32(data[base+4 : base+8]))
 			pVaddr = uint64(binary.LittleEndian.Uint32(data[base+8 : base+12]))
 			pFilesz = uint64(binary.LittleEndian.Uint32(data[base+16 : base+20]))
 			pMemsz = uint64(binary.LittleEndian.Uint32(data[base+20 : base+24]))
@@ -222,9 +307,8 @@ func validateSoDeep(data []byte) bool {
 			if pFilesz > pMemsz {
 				return false
 			}
-			if pVaddr+pMemsz > uint64(realSize) {
-				return false
-			}
+			// Skip pVaddr+pMemsz extent: truncated dumps are normal
+			// Skip pFilesz alignment: .bss segments legitimately unaligned
 		} else if pType == elfPtDynamic {
 			dynVaddr = pVaddr
 			dynFound = true
@@ -233,13 +317,12 @@ func validateSoDeep(data []byte) bool {
 	if !hasLoad {
 		return false
 	}
+	// PT_DYNAMIC is checked but not mandatory (some dump SOs may have it at bad offset)
 	// 遍历 .dynamic DT_* 项,校验关键 DT 指向在文件内
 	if dynFound && dynVaddr < uint64(realSize) {
 		entsize := uint64(16)
-		tagSize := uint64(8)
 		if !is64 {
 			entsize = 8
-			tagSize = 4
 		}
 		i := dynVaddr
 		count := uint64(0)

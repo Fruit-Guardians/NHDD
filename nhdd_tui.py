@@ -125,15 +125,13 @@ def check_nhdd_binary():
 
 
 def push_nhdd_if_missing(local_nhdd=None):
-    """若设备上没有 nhdd,尝试从本地推一个(若提供)。"""
-    if check_nhdd_binary():
-        return True
-    if local_nhdd and os.path.exists(local_nhdd):
-        console.print(f"[yellow]设备上无 nhdd,从本地推送 {local_nhdd}[/]")
-        adb("push", local_nhdd, NHDD_BIN)
-        adb_shell(f"chmod 755 {NHDD_BIN}")
+    """若设备上没有 nhdd,尝试从本地推。始终确保可执行。"""
+    if not local_nhdd or not os.path.exists(local_nhdd):
         return check_nhdd_binary()
-    return False
+    # Always push to ensure latest binary and correct permissions
+    adb("push", local_nhdd, NHDD_BIN)
+    adb_shell(f"chmod 755 {NHDD_BIN}")
+    return check_nhdd_binary()
 
 
 def get_third_party_apps():
@@ -211,11 +209,13 @@ def select_app(default_pkg=None):
 # ---------------------------------------------------------------------------
 def gather_config():
     console.print(Rule("脱壳配置", style="cyan"))
-    mode = Prompt.ask("Dump 模式", choices=["dex", "so", "all"], default="dex")
+    mode = Prompt.ask("Dump 模式", choices=["apk", "dex", "so"], default="apk")
+    if not mode or mode not in ("apk", "dex", "so"):
+        mode = "apk"
 
     # 强对抗壳冷启动时反内存读取检测更活跃,会秒杀刚重启的进程 → 冷启动扫常 0 DEX。
     # 扫「已稳定运行的进程」命中率最高。默认不重启。
-    restart = Confirm.ask("重启 app 再扫?(强对抗壳建议[否],直接扫当前进程)", default=False)
+    restart = Confirm.ask("重启 app 再扫?", default=True)
     use_watch = Confirm.ask("启用 watch 监听(推荐,捕获懒加载 DEX)", default=True)
     cfg = {
         "mode": mode,
@@ -235,13 +235,13 @@ def gather_config():
     if use_watch:
         cfg["dry_limit"] = IntPrompt.ask("  连续几轮无新 DEX 自动停 (dry K)", default=3)
         cfg["max_seconds"] = IntPrompt.ask("  最大运行秒数", default=120)
-    stealth = Confirm.ask("启用 stealth(区域间延时,降低被检测概率)", default=False)
+    stealth = Confirm.ask("启用 stealth(区域间延时,降低被检测概率)", default=True)
     cfg["stealth"] = stealth
     if stealth:
         cfg["region_delay_ms"] = IntPrompt.ask("  区域延时 (ms)", default=2)
-    stealth2 = Confirm.ask("启用 stealth2(process_vm_readv 反检测,二代壳推荐)", default=False)
+    stealth2 = Confirm.ask("启用 stealth2(process_vm_readv 反检测,二代壳推荐)", default=True)
     cfg["stealth2"] = stealth2
-    relaxed = Confirm.ask("启用 relaxed(宽松 DEX 验证,不依赖 magic,二代壳推荐)", default=False)
+    relaxed = Confirm.ask("启用 relaxed(宽松 DEX 验证,不依赖 magic,二代壳推荐)", default=True)
     cfg["relaxed"] = relaxed
     anon = Confirm.ask("启用 anon(仅扫描匿名内存映射)", default=False)
     cfg["anon"] = anon
@@ -259,7 +259,7 @@ def gather_config():
 # 执行:watch 实时进度面板
 # ---------------------------------------------------------------------------
 def build_nhdd_cmd(pkg, cfg):
-    mode_arg = {"dex": "--dex", "so": "--so", "all": "--all"}[cfg["mode"]]
+    mode_arg = {"dex": "--dex", "so": "--so", "apk": "--apk"}[cfg["mode"]]
     parts = [NHDD_BIN, pkg, DEVICE_DUMP_DIR, mode_arg]
     if cfg["watch"]:
         parts += ["--watch", str(cfg["dry_limit"]),
@@ -452,7 +452,7 @@ def _pump(stream, st: DashState, is_stderr):
 def auto_classify_and_fix(dex_dir, local_dir):
     """对齐 GUI FixDexDirectory:一段式 校验→重建→重校验→修头+校验和。
 
-    文件处置与 GUI 一致:过小/非DEX 删除,不可重建移 invalid/,否则修头+校验和。
+    文件处置与 GUI 一致:过小/非DEX 移 bad/,不可重建移 bad/,否则修头+校验和。
     统计口径与 GUI 一致:OK(含已修复)/修复/损坏已隔离。
     """
     try:
@@ -479,7 +479,7 @@ def auto_classify_and_fix(dex_dir, local_dir):
     ct.add_row("[yellow]修复[/]", str(stats["fixed"]),
                "map_list 已重建 / header+校验和已修复")
     ct.add_row("[red]损坏已隔离[/]", str(stats["bad"]),
-               "过小/非DEX 已删除,不可重建已移至 invalid/")
+               "过小/非DEX 已移至 bad/,不可重建已移至 bad/")
     ct.add_row("[bold]总计[/]", str(stats["total"]), "")
     console.print()
     console.print(ct)
@@ -505,12 +505,9 @@ def auto_classify_and_fix(dex_dir, local_dir):
         pass
 
 
-def auto_classify_and_fix_so(so_dir, local_dir):
-    """对齐 fix_so.py:校验→修复(p_offset=p_vaddr,补magic)→重校验→落盘。
+def auto_classify_and_fix_so(so_dir, local_dir, apk_path=None):
+    """Carrier 模式: 以原 APK SO 为骨架, 覆盖 dump RX 代码段."""
 
-    文件处置:过小/非ELF 且结构无效删除,不可修移 invalid/,否则修 p_offset。
-    统计口径与 DEX 一致:OK(含已修复)/修复/损坏已隔离。
-    """
     try:
         import importlib.util
         spec = importlib.util.spec_from_file_location(
@@ -521,28 +518,31 @@ def auto_classify_and_fix_so(so_dir, local_dir):
         console.print(f"[yellow]无法加载 fix_so: {e}[/]")
         return
 
-    stats = fix_mod.fix_directory_aligned(so_dir)
+    if apk_path and os.path.exists(apk_path):
+        stats = fix_mod.fix_directory_carrier(so_dir, apk_path)
+    else:
+        stats = fix_mod.fix_directory_aligned(so_dir)
     if stats["total"] == 0:
         return
 
-    ct = Table(title="SO 校验分类", box=box.ROUNDED, border_style="magenta")
+    ct = Table(title="SO Carrier 修复", box=box.ROUNDED, border_style="magenta")
     ct.add_column("类别", style="bold")
     ct.add_column("数量", style="cyan")
     ct.add_column("说明", style="dim")
-    ct.add_row("[green]OK[/]", str(stats["ok"]),
-               "PHT/LOAD/.dynamic 有效,可加载 IDA(含已修复)")
-    ct.add_row("[yellow]修复[/]", str(stats["fixed"]),
-               "p_offset=p_vaddr 对齐 / magic 已补回")
-    ct.add_row("[red]损坏已隔离[/]", str(stats["bad"]),
-               "过小/非ELF 已删除,不可修已移至 invalid/")
+    ct.add_row("[green]已修复[/]", str(stats["ok"]),
+               "原 APK SO 为骨架 + dump 代码覆盖, 可直接 IDA")
+    ct.add_row("[yellow]代码已合入[/]", str(stats["fixed"]),
+               "dump RX 段已覆盖到原始 SO")
+    ct.add_row("[red]损坏[/]", str(stats["bad"]),
+               "过小/无ELF结构, 已移至 bad/")
     ct.add_row("[bold]总计[/]", str(stats["total"]), "")
     console.print()
     console.print(ct)
 
     if stats["bad"]:
-        console.print(f"\n[red]损坏文件:[/] {', '.join(stats['bad_files'])}")
+        console.print(f"\n[red]无法修复:[/] {', '.join(stats['bad_files'])}")
     if stats["bad"] == 0:
-        console.print("\n[bold green]全部 SO 通过校验！[/]")
+        console.print("\n[bold green]全部 SO Carrier 修复完成！[/]")
 
     # 追加到同一日志
     log_path = os.path.join(local_dir, "log.txt")
@@ -560,7 +560,7 @@ def auto_classify_and_fix_so(so_dir, local_dir):
         pass
 
 
-def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd=""):
+def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd="", mode="dex"):
     local = os.path.join(output_dir, pkg)
     os.makedirs(local, exist_ok=True)
     # 防御:拉取前清空本地 dex/so 子目录的旧文件,避免上次同 app 结果残留合并进来。
@@ -611,7 +611,7 @@ def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd=""):
     if os.path.isdir(dex_dir) and dex_count > 0:
         auto_classify_and_fix(dex_dir, local)
     so_dir = os.path.join(local, "so")
-    if os.path.isdir(so_dir) and so_count > 0:
+    if os.path.isdir(so_dir) and so_count > 0 and mode != "apk":
         auto_classify_and_fix_so(so_dir, local)
     if not pulled_ok:
         console.print(f"[yellow]注意: adb pull 返回非零,文件可能仍在设备 {DEVICE_DUMP_DIR}[/]")
@@ -633,6 +633,7 @@ def main():
     # 解析 -o/--output:指定本地输出目录(绝对路径最佳,避免随运行目录漂移)
     output_override = None
     cli_mode = False
+    repack_flag = False
     su_cmd_override = None
     filtered = []
     i = 0
@@ -656,6 +657,10 @@ def main():
             continue
         if a.startswith("--su-cmd="):
             su_cmd_override = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a == "--repack":
+            repack_flag = True
             i += 1
             continue
         filtered.append(a)
@@ -692,7 +697,7 @@ def main():
     if cli_mode:
         # CLI 非交互模式:使用默认最佳配置(stealth2+relaxed,适合二代壳)
         cfg = {
-            "mode": "dex",
+            "mode": "apk",
             "restart": False,
             "watch": True,
             "dry_limit": 3,
@@ -722,7 +727,31 @@ def main():
         console.print("[yellow]未扫描到任何进程(目标未运行或被杀),跳过拉取。[/]")
         console.print("[yellow]建议:先手动打开 app 再扫,或在配置里开启「重启 app 再扫」。[/]")
         return
-    pull_and_summarize(pkg, st, cfg["output_dir"], cfg.get("su_cmd", ""))
+    pull_and_summarize(pkg, st, cfg["output_dir"], cfg.get("su_cmd", ""), cfg["mode"])
+
+    # APK 模式: 拉 APK → carrier → repack (全程自动)
+    is_apk = (cfg["mode"] == "apk")
+    if is_apk or repack_flag:
+        from scripts.repack_apk import pull_apk as _pull_apk
+        repack_dir = os.path.join(cfg["output_dir"], pkg, "repack")
+        os.makedirs(repack_dir, exist_ok=True)
+
+        console.print("[bold dim]拉取原 APK...[/]")
+        apk_path = _pull_apk(ADB, "", pkg, repack_dir)
+
+        if apk_path and os.path.exists(apk_path):
+            so_dir = os.path.join(cfg["output_dir"], pkg, "so")
+            if os.path.isdir(so_dir):
+                auto_classify_and_fix_so(so_dir, cfg["output_dir"], apk_path)
+
+        console.print("[bold]生成 jadx 分析 APK...[/]")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "repack_apk.py")
+        dump_dir = os.path.join(cfg["output_dir"], pkg)
+        cmd = [sys.executable, script, "--from-local", apk_path, dump_dir,
+               "-o", os.path.join(repack_dir, f"{pkg}_repacked.apk")]
+        subprocess.run(cmd)
+        console.print()
+
     console.print("\n[bold green]全部完成。[/]")
 
 
