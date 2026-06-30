@@ -109,6 +109,20 @@
         <div class="form-group">
           <label><input type="checkbox" v-model="anon" /> anon(仅扫描匿名映射)</label>
         </div>
+        <div class="form-group">
+          <label><input type="checkbox" v-model="jniMap" /> JNIMAP(Native方法扫描)</label>
+          <span class="hint">无hook枚举JNINativeMethod, 独立于DEX/SO模式</span>
+        </div>
+        <div v-if="jniMap" class="sub-config">
+          <div class="form-group">
+            <label>过滤库名(可选):</label>
+            <input v-model="jniLib" placeholder="留空=全部扫描, 如 libnative-lib.so" />
+          </div>
+          <div class="form-group">
+            <label>最小连续条目数:</label>
+            <input type="number" v-model.number="jniMin" min="1" max="20" />
+          </div>
+        </div>
 
         <div class="info-section">
           <span class="info-label">nhdd: {{ nhddPath }}</span>
@@ -223,6 +237,9 @@ export default {
       relaxed: true,
       anon: false,
       regionDelayMs: 2,
+      jniMap: false,
+      jniLib: '',
+      jniMin: 2,
 
       // State
       dumping: false,
@@ -348,6 +365,9 @@ export default {
           relaxed: this.relaxed,
           anon: this.anon,
           regionDelayMs: this.regionDelayMs,
+          jniMap: this.jniMap,
+          jniLib: this.jniLib,
+          jniMin: this.jniMin,
         })
 
         if (result.success) {

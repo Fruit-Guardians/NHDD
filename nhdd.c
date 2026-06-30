@@ -347,6 +347,45 @@ static int dex_hit_valid(const uint8_t *buf, size_t n, size_t magic_off, uint32_
     return 1;
 }
 
+// Strong DEX header validation: check endian_tag + all section table ranges
+static int dex_header_strong_valid(const uint8_t *hdr, uint32_t file_size) {
+    // endian_tag must be 0x12345678
+    uint32_t endian_tag = 0;
+    memcpy(&endian_tag, hdr + 0x28, 4);
+    if (endian_tag != 0x12345678) return 0;
+
+    // Read all section table offsets and sizes
+    uint32_t string_ids_off=0, string_ids_size=0;
+    uint32_t type_ids_off=0, type_ids_size=0;
+    uint32_t proto_ids_off=0, proto_ids_size=0;
+    uint32_t field_ids_off=0, field_ids_size=0;
+    uint32_t method_ids_off=0, method_ids_size=0;
+    uint32_t class_defs_off=0, class_defs_size=0;
+
+    memcpy(&string_ids_off, hdr + 0x3C, 4);
+    memcpy(&string_ids_size, hdr + 0x40, 4);
+    memcpy(&type_ids_off, hdr + 0x44, 4);
+    memcpy(&type_ids_size, hdr + 0x48, 4);
+    memcpy(&proto_ids_off, hdr + 0x4C, 4);
+    memcpy(&proto_ids_size, hdr + 0x50, 4);
+    memcpy(&field_ids_off, hdr + 0x54, 4);
+    memcpy(&field_ids_size, hdr + 0x58, 4);
+    memcpy(&method_ids_off, hdr + 0x5C, 4);
+    memcpy(&method_ids_size, hdr + 0x60, 4);
+    memcpy(&class_defs_off, hdr + 0x64, 4);
+    memcpy(&class_defs_size, hdr + 0x68, 4);
+
+    // Each section must be fully within file_size
+    if (string_ids_off + string_ids_size * 4 > file_size) return 0;
+    if (type_ids_off + type_ids_size * 4 > file_size) return 0;
+    if (proto_ids_off + proto_ids_size * 12 > file_size) return 0;
+    if (field_ids_off + field_ids_size * 8 > file_size) return 0;
+    if (method_ids_off + method_ids_size * 8 > file_size) return 0;
+    if (class_defs_off + class_defs_size * 32 > file_size) return 0;
+
+    return 1;
+}
+
 // Validate a DEX header by structural features alone (no magic required).
 // Used for second-gen extraction shells that erase the "dex\n" magic.
 // Checks: endian_tag == 0x12345678, header_size == 0x70, file_size sane,
@@ -679,6 +718,27 @@ static int group_maps_by_path_inode(const maps_list *ml, MappedObject *objs, int
     int count = 0;
     for (size_t i = 0; i < ml->count && count < max_objs; i++) {
         const maps_region *r = &ml->regs[i];
+
+        // Anonymous mappings (path=="" or inode==0) each get their own object
+        if (r->path[0] == '\0' || r->inode == 0) {
+            MappedObject *o = &objs[count];
+            memset(o, 0, sizeof(*o));
+            snprintf(o->path, sizeof(o->path), "anon_%lx", (unsigned long)r->start);
+            snprintf(o->name, sizeof(o->name), "anon_%lx", (unsigned long)r->start);
+            o->inode = 0;
+            o->base_addr = r->start - r->offset;
+            o->min_start = r->start;
+            o->max_end = r->end;
+            o->min_offset = r->offset;
+            o->file_size = r->offset + (r->end - r->start);
+            o->region_count = 1;
+            if (r->readable) o->has_r = 1;
+            if (r->writable) o->has_w = 1;
+            if (r->executable) o->has_x = 1;
+            count++;
+            continue;
+        }
+
         // Group key = path + inode
         int found = 0;
         for (int j = 0; j < count; j++) {
@@ -1043,10 +1103,11 @@ static int elf_repair_basic(const char *path) {
         #define SH_PUT32(v) do { uint32_t _v = (uint32_t)(v); SH_PUT(&_v, 4); } while(0)
         #define SH_PUT64(v) do { uint64_t _v = (uint64_t)(v); SH_PUT(&_v, 8); } while(0)
 
-        // shstrtab: section name strings
+        // shstrtab: section name strings (use sizeof, not strlen — first byte is \0)
         uint32_t shstrtab_off = out_off;
-        const char *shstrtab = "\0.shstrtab\0.dynsym\0.dynstr\0.hash\0.dynamic\0";
-        uint32_t shstrtab_len = (uint32_t)strlen(shstrtab) + 1;
+        static const char shstrtab[] =
+            "\0.shstrtab\0.dynsym\0.dynstr\0.hash\0.dynamic\0";
+        uint32_t shstrtab_len = sizeof(shstrtab);
         SH_PUT(shstrtab, shstrtab_len);
         // Name offsets in shstrtab:
         #define SHN_SHSTRTAB  1
@@ -1241,7 +1302,7 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
     fprintf(stderr, "[*] Scanning PID %s (%s): %zu regions%s\n", pid, pkg, ml->count,
             g_use_vm_readv ? " (stealth2: vm_readv)" : "");
 
-    uint8_t buf[4096];
+    uint8_t buf[4096 + 0x70];  // +0x70 overlap for cross-page magic/header coverage
     int pid_dex_unique = 0, pid_dex_seen = 0;
 
     for (size_t ri = 0; ri < ml->count; ri++) {
@@ -1258,8 +1319,12 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
         // Stealth: brief pause between regions to look less like bulk extraction.
         if (g_region_delay_us > 0) usleep((useconds_t)g_region_delay_us);
 
+        #define PAGE_READ_SIZE (4096 + 0x70)
         for (uintptr_t addr = r->start; addr < r->end; addr += 4096) {
-            ssize_t n = READ_REMOTE(buf, sizeof(buf), addr);
+            size_t to_read = PAGE_READ_SIZE;
+            if (addr + to_read > r->end)
+                to_read = (size_t)(r->end - addr);
+            ssize_t n = READ_REMOTE(buf, to_read, addr);
             if (n < 64) continue;
 
             for (int i = 0; i <= n - 4; i++) {
@@ -1311,6 +1376,16 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                         dex_size = recovered;
                     }
                     if (dex_size < 0x70 || dex_size > 0x10000000) continue;
+
+                    // Strong validation: check endian_tag + all section table ranges
+                    {
+                        uint8_t hdr_check[0x70];
+                        if (READ_REMOTE(hdr_check, 0x70, dex_addr) == 0x70) {
+                            if (!dex_header_strong_valid(hdr_check, dex_size)) {
+                                continue;  // structural checks failed — likely false positive
+                            }
+                        }
+                    }
 
                     c->dex_total++;
                     pid_dex_seen++;
@@ -1520,16 +1595,19 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
         int obj_count = group_maps_by_path_inode(ml, objs, 1024);
         int so_dumped = 0, so_skipped_sys = 0, so_skipped_other = 0;
 
-        // Read ELF header from first readable region for kind classification
+        // Read ELF header: prefer offset==0 readable region, fallback to any readable
         for (int i = 0; i < obj_count; i++) {
             MappedObject *o = &objs[i];
 
             // Read header bytes from memory for kind detection
             uint8_t head[64] = {0};
             int have_head = 0;
+
+            // First pass: look for offset==0 && readable
             for (size_t j = 0; j < ml->count; j++) {
                 const maps_region *rg = &ml->regs[j];
                 if (rg->inode != o->inode || strcmp(rg->path, o->path) != 0) continue;
+                if (rg->offset != 0) continue;
                 if (!rg->readable) continue;
                 if (g_use_vm_readv) {
                     ssize_t n = vm_readv_retry(target_pid, head, sizeof(head), rg->start);
@@ -1537,6 +1615,22 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                 } else if (mem_fd >= 0) {
                     ssize_t n = pread_retry(mem_fd, head, sizeof(head), (off_t)rg->start);
                     if (n > 0) { have_head = 1; break; }
+                }
+            }
+
+            // Second pass (fallback): any readable region
+            if (!have_head) {
+                for (size_t j = 0; j < ml->count; j++) {
+                    const maps_region *rg = &ml->regs[j];
+                    if (rg->inode != o->inode || strcmp(rg->path, o->path) != 0) continue;
+                    if (!rg->readable) continue;
+                    if (g_use_vm_readv) {
+                        ssize_t n = vm_readv_retry(target_pid, head, sizeof(head), rg->start);
+                        if (n > 0) { have_head = 1; break; }
+                    } else if (mem_fd >= 0) {
+                        ssize_t n = pread_retry(mem_fd, head, sizeof(head), (off_t)rg->start);
+                        if (n > 0) { have_head = 1; break; }
+                    }
                 }
             }
 
@@ -1595,10 +1689,7 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                        outfile, (unsigned long long)o->file_size, o->region_count,
                        o->origin, o->kind, pid);
 
-                // Basic repair if policy says so
-                if (o->policy == POLICY_DUMP_AND_FIX) {
-                    elf_repair_basic(outfile);
-                }
+                // Repair deferred to main()'s unified batch pass (avoids double-repair)
                 snprintf(o->reason, sizeof(o->reason), "dumped: %llu bytes, %d regions",
                          (unsigned long long)o->file_size, o->region_count);
             } else {
@@ -1840,7 +1931,7 @@ int main(int argc, char **argv) {
             }
         }
         rounds_run++;
-        int unique_before = c.dex_unique;
+        int unique_before = c.dex_unique + c.so_count;
 
         if (rounds_limit > 1) fprintf(stderr, "\n[*] === Round %d ===\n", round + 1);
 
@@ -1862,10 +1953,10 @@ int main(int argc, char **argv) {
         }
 
         if (watch) {
-            int new_this = c.dex_unique - unique_before;
+            int new_this = (c.dex_unique + c.so_count) - unique_before;
             if (new_this > 0) dry_rounds = 0; else dry_rounds++;
-            fprintf(stderr, "[*] round %d: +%d new unique DEX (total=%d, dry=%d/%d)\n",
-                    round + 1, new_this, c.dex_unique, dry_rounds, watch_dry_limit);
+            fprintf(stderr, "[*] round %d: +%d new unique (DEX=%d, SO=%d, dry=%d/%d)\n",
+                    round + 1, new_this, c.dex_unique, c.so_count, dry_rounds, watch_dry_limit);
             if (dry_rounds >= watch_dry_limit) {
                 fprintf(stderr, "[*] stable set reached (%d dry rounds), stopping.\n", watch_dry_limit);
                 break;

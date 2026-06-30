@@ -7,6 +7,9 @@ export namespace main {
 	    adbPath: string;
 	    hostPort: string;
 	    mode: string;
+	    jniMap: boolean;
+	    jniLib: string;
+	    jniMin: number;
 	    restart: boolean;
 	    watch: boolean;
 	    dryLimit: number;
@@ -30,6 +33,9 @@ export namespace main {
 	        this.adbPath = source["adbPath"];
 	        this.hostPort = source["hostPort"];
 	        this.mode = source["mode"];
+	        this.jniMap = source["jniMap"];
+	        this.jniLib = source["jniLib"];
+	        this.jniMin = source["jniMin"];
 	        this.restart = source["restart"];
 	        this.watch = source["watch"];
 	        this.dryLimit = source["dryLimit"];

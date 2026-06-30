@@ -289,6 +289,7 @@ func validateSoDeep(data []byte) bool {
 		base := uint64(ePhoff) + uint64(i)*uint64(ePhentsize)
 		var pType uint32
 		var pOffset, pVaddr, pFilesz, pMemsz uint64
+		_ = pOffset // read from ELF for structural validation only
 		if is64 {
 			pType = binary.LittleEndian.Uint32(data[base : base+4])
 			pOffset = binary.LittleEndian.Uint64(data[base+8 : base+16])
