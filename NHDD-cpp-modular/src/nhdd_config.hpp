@@ -20,6 +20,14 @@ struct NhddConfig {
     int  jnimap_max_region_mb = 64;  // max generic table region size; target lib data is always scanned
     bool jnimap_full_scan = false;   // scan broad readable regions, slower
 
+    // Continuous monitoring mode
+    bool continuous = false;         // --continuous: persistent maps monitoring
+    int  monitor_interval = 2;      // --monitor-interval: seconds between maps checks (default 2s)
+    int  monitor_duration = 0;      // --monitor-duration: total monitoring time in seconds (0=unlimited)
+    bool monitor_verbose = false;    // --monitor-verbose: print every maps diff event
+    bool dump_on_load = true;        // dump SO immediately when detected in maps
+    bool timeline = true;            // record SO/DEX load timeline to timeline.jsonl
+
     // Dedup table sizing
     int dedup_dex_max = 1024;
     int dedup_so_max  = 512;

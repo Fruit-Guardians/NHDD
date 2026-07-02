@@ -17,6 +17,7 @@
 #include "process_manager.hpp"
 #include "so_dumper.hpp"
 #include "nhdd_scanner.hpp"
+#include "maps_monitor.hpp"
 
 class NhddApp {
 public:
@@ -180,6 +181,23 @@ public:
                 disguise = argv[++i];
                 continue;
             }
+            if (std::strcmp(argv[i], "--continuous") == 0) {
+                cfg.continuous = true;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--monitor-interval") == 0 && i + 1 < argc) {
+                cfg.monitor_interval = std::atoi(argv[++i]);
+                if (cfg.monitor_interval < 1) cfg.monitor_interval = 1;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--monitor-duration") == 0 && i + 1 < argc) {
+                cfg.monitor_duration = std::atoi(argv[++i]);
+                continue;
+            }
+            if (std::strcmp(argv[i], "--monitor-verbose") == 0) {
+                cfg.monitor_verbose = true;
+                continue;
+            }
             if (!target) { target = argv[i]; continue; }
             if (!out_dir) { out_dir = argv[i]; continue; }
         }
@@ -264,7 +282,17 @@ public:
                          cfg.jnimap_module[0] ? " in " : "",
                          cfg.jnimap_module[0] ? cfg.jnimap_module : "");
         std::fprintf(stderr, "[*] Output directory: %s\n", out_dir);
-        if (watch) {
+        
+        if (cfg.continuous) {
+            std::fprintf(stderr,
+                "[*] CONTINUOUS mode: monitoring maps every %ds%s\n",
+                cfg.monitor_interval,
+                cfg.monitor_duration > 0 ? 
+                    (std::string(" for ") + std::to_string(cfg.monitor_duration) + "s").c_str() : 
+                    " (unlimited)");
+            std::fprintf(stderr,
+                "[*] >>> Dynamic SO loads will be detected and dumped automatically <<<\n");
+        } else if (watch) {
             std::fprintf(stderr,
                 "[*] WATCH mode: scan until %d dry rounds (max %d rounds / %ds)\n",
                 watch_dry_limit, max_rounds, max_seconds);
@@ -284,6 +312,108 @@ public:
 
         int rounds_run = 0;
         int dry_rounds = 0;
+
+        // ---- Continuous monitoring mode ----
+        if (cfg.continuous) {
+            char timeline_path[768];
+            std::snprintf(timeline_path, sizeof(timeline_path), "%s/timeline.jsonl", out_dir);
+            
+            // Create monitors for each PID
+            std::vector<MapsMonitor> monitors(pid_count);
+            
+            std::fprintf(stderr, "[*] Taking baseline snapshots for %d process(es)...\n", pid_count);
+            for (int p = 0; p < pid_count; p++) {
+                if (!monitors[p].take_baseline(pids[p])) {
+                    std::fprintf(stderr, "[-] Failed to take baseline for PID %s\n", pids[p]);
+                }
+            }
+            
+            // Initial full scan
+            std::fprintf(stderr, "[*] Running initial full scan...\n");
+            for (int p = 0; p < pid_count; p++) {
+                scanner.scan_pid(pids[p], dex_dir, so_dir, jni_dir, mode, counters);
+            }
+            
+            time_t start_time = std::time(nullptr);
+            int check_count = 0;
+            
+            std::fprintf(stderr, "[*] Starting continuous monitoring (interval=%ds)...\n", 
+                         cfg.monitor_interval);
+            
+            while (true) {
+                // Check duration limit
+                if (cfg.monitor_duration > 0) {
+                    time_t elapsed = std::time(nullptr) - start_time;
+                    if (elapsed >= cfg.monitor_duration) {
+                        std::fprintf(stderr, "\n[*] Monitor duration limit (%ds) reached\n",
+                                     cfg.monitor_duration);
+                        break;
+                    }
+                }
+                
+                sleep(cfg.monitor_interval);
+                check_count++;
+                
+                // Re-resolve PIDs if package name was provided
+                if (!is_numeric) {
+                    pid_count = ProcessManager::find_pids_for_package(
+                        target, pids, sizeof(pids[0]), kMaxPids);
+                    if (pid_count <= 0) {
+                        std::fprintf(stderr, "[*] No matching process, waiting...\n");
+                        continue;
+                    }
+                    // Ensure we have enough monitors
+                    while (monitors.size() < static_cast<size_t>(pid_count)) {
+                        monitors.emplace_back();
+                    }
+                }
+                
+                // Check each process for new SO loads
+                bool found_new = false;
+                for (int p = 0; p < pid_count; p++) {
+                    auto events = monitors[p].check_new_loads(pids[p]);
+                    
+                    for (const auto& evt : events) {
+                        found_new = true;
+                        
+                        std::fprintf(stderr, "[+] NEW SO DETECTED: %s (base=0x%lx, size=%llu) pid=%s\n",
+                                     evt.name.c_str(), 
+                                     static_cast<unsigned long>(evt.base_addr),
+                                     static_cast<unsigned long long>(evt.size),
+                                     pids[p]);
+                        
+                        // Write to timeline
+                        if (cfg.timeline) {
+                            MapsMonitor::write_timeline_event(timeline_path, pids[p], evt, "load");
+                        }
+                        
+                        // Immediate dump of the new SO
+                        if (cfg.dump_on_load && (mode & ScanMode::SO)) {
+                            std::fprintf(stderr, "[*] Dumping newly loaded SO...\n");
+                            ScanCounters temp_counters;
+                            scanner.scan_pid(pids[p], dex_dir, so_dir, jni_dir, 
+                                           ScanMode::SO, temp_counters);
+                            counters.so_count += temp_counters.so_count;
+                        }
+                    }
+                }
+                
+                if (cfg.monitor_verbose || found_new) {
+                    std::fprintf(stderr, "[*] Check #%d: %s (elapsed=%llds, total SO=%d, DEX=%d)\n",
+                                 check_count, 
+                                 found_new ? "NEW SO LOADED" : "no changes",
+                                 static_cast<long long>(std::time(nullptr) - start_time),
+                                 counters.so_count, counters.dex_unique);
+                }
+            }
+            
+            std::fprintf(stderr, "[*] Continuous monitoring stopped after %d checks\n", check_count);
+            rounds_run = check_count;  // Set rounds_run for summary
+            
+            // Final summary handled below
+        } else {
+        // ---- Standard snapshot/watch mode ----
+
         time_t t_start = std::time(nullptr);
         int rounds_limit = watch ? max_rounds : snapshot_rounds;
 
@@ -343,6 +473,8 @@ public:
             if (round + 1 < rounds_limit && snapshot_interval > 0)
                 sleep(snapshot_interval);
         }
+        
+        } // end continuous/standard mode branch
 
         // ---- Summary ----
         std::fprintf(stderr,
@@ -422,6 +554,7 @@ private:
             "NHDD — No-Hook DEX/SO Dumper v9.0-cpp-class\n"
             "Usage: %s <pid|package> [output_dir] [--so|--dex|--all|--jnimap [LIB]]\n"
             "                       [--watch [K]] [--snapshot ROUNDS] [--interval SECS]\n"
+            "                       [--continuous] [--monitor-interval SECS] [--monitor-duration SECS]\n"
             "                       [--stealth] [--stealth2] [--relaxed] [--anon] [--no-deep-so]\n"
             "                       [--region-delay MS] [--name NAME]\n"
             "                       [--max-rounds N] [--max-seconds S] [--keep]\n"
@@ -444,6 +577,10 @@ private:
             "    --watch [K]   Keep scanning until K dry rounds\n"
             "    --snapshot N  Fixed N rounds (default 1)\n"
             "    --interval T  Seconds between rounds (default 1)\n"
+            "    --continuous  Continuous maps monitoring mode (detects dynamic SO loads)\n"
+            "    --monitor-interval T  Seconds between maps checks in continuous mode (default 2)\n"
+            "    --monitor-duration S  Total monitoring time in seconds (0=unlimited, default 0)\n"
+            "    --monitor-verbose     Print every maps check event\n"
             "\n"
             "  JNIMAP:\n"
             "    --jni-lib LIB Filter fnPtr module\n"
