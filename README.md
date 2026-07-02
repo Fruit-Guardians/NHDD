@@ -1,5 +1,6 @@
 # NHDD — No-Hook DEX/SO Dumper
 简体中文 | [English](./README.EN.md)
+
 NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存 DEX/SO Dump 工具**。它的核心程序 `nhdd` 以独立 root 进程运行，通过读取目标进程的 `/proc/<pid>/maps` 和 `/proc/<pid>/mem`（或使用 `process_vm_readv` 的 stealth2 模式），在内存中扫描 DEX/ELF magic，并将已加载到内存中的 DEX 或 SO 导出到文件。
 
 和 Frida/Xposed/FART/fdex2 这类"进程内 Hook/注入"路线不同，NHDD 的核心思路是：**不向目标 App 注入代码，不修改目标进程方法入口，不依赖 ART Hook**。这可以显著降低由进程内 Hook、注入库、异常线程名、方法入口跳转等特征带来的暴露面。
