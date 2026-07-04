@@ -72,10 +72,26 @@ NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存
 要求：Android NDK r25+，目标设备为 ARM64。
 
 ```bash
+<<<<<<< HEAD
 # 推荐：使用仓库脚本
 NDK=/path/to/android-ndk-r27 API=34 ./scripts/build_nhdd_android.sh
 
 # 或手动编译
+=======
+# Recommended cross-platform builder (Windows/macOS/Linux)
+python3 scripts/build_nhdd_android.py
+
+# Explicit NDK / API / output path
+python3 scripts/build_nhdd_android.py --ndk /path/to/android-ndk-r27 --api 34 --out nhdd
+
+# macOS / Linux shell wrapper
+NDK=/path/to/android-ndk-r27 API=34 ./scripts/build_nhdd_android.sh
+
+# Windows PowerShell wrapper
+powershell -ExecutionPolicy Bypass -File scripts/build_nhdd_android.ps1 -Ndk C:\Android\android-ndk-r27
+
+# Manual command
+>>>>>>> 144a47d2591c27f1bf7b2c92b15574c0e6078509
 /path/to/android-ndk-r27/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang \
   -O2 -static -Wall -Wextra -o nhdd nhdd.c
 ```
@@ -94,7 +110,37 @@ adb push ./sofixer /data/local/tmp/sofixer
 adb shell chmod 755 /data/local/tmp/sofixer
 ```
 
+<<<<<<< HEAD
 ## 命令行使用
+=======
+## Environment doctor
+
+Before the first run, or after moving to a new machine, run:
+
+```bash
+make doctor
+```
+
+The doctor checks:
+
+- Local dependencies: `adb`, `sdkmanager`, Android NDK, Node/npm, Wails, Python rich, frontend dependencies, and the SoFixer submodule.
+- Device state: whether an authorized Android device is connected.
+- Root command: it auto-probes `su -c`, `kp -c`, and `ksud -c`, or you can provide one explicitly.
+- Device binary: verifies `/data/local/tmp/nhdd` exists, pulls it back, and checks that it is an ELF64 AArch64 binary.
+
+Common overrides:
+
+```bash
+make doctor NDK_PATH="$ANDROID_HOME/ndk/27.2.12479018"
+make doctor SU_CMD="kp -c"
+make doctor ADB=/path/to/adb HOST_PORT=192.168.238.1:5037 SU_CMD="ksud -c"
+python3 scripts/doctor.py --ndk /path/to/android-ndk-r27 --su-cmd "su -c"
+```
+
+When a check fails, the `fix:` line gives the next command to run, such as installing the NDK, initializing submodules, connecting a device, or running `make android push` again.
+
+## Command-line usage
+>>>>>>> 144a47d2591c27f1bf7b2c92b15574c0e6078509
 
 ### 1. 推荐：扫已运行 App + watch
 
@@ -230,7 +276,22 @@ TUI 会提示：
 - dump 模式选择 DEX、SO 或 ALL。
 - 本地输出目录。
 
+<<<<<<< HEAD
 ## 桌面 GUI 使用方式
+=======
+Each TUI run gets an isolated run id. Results are saved under:
+
+```text
+nhdd_output/<package>/<YYYYMMDD-HHMMSS>/
+├── dex/
+├── so/
+└── log.txt
+```
+
+This keeps repeated tests for the same app from mixing old files into the current run statistics.
+
+## Desktop GUI workflow
+>>>>>>> 144a47d2591c27f1bf7b2c92b15574c0e6078509
 
 桌面 GUI 基于 Go + Wails v2，提供原生窗口 + Web 前端，不需要 CGO 或 GCC。
 

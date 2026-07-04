@@ -10,13 +10,13 @@ import (
 // 与 dexfix.go 的 DEX 修复保持同样的处置口径:过小/非ELF 删除,不可修移 invalid/。
 
 const (
-	soMagic       = "\x7fELF"
-	soMinSize     = 0x40
-	elfEtDyn      = 3
-	elfEmArm      = 40
-	elfEmAarch64  = 183
-	elfPtLoad     = 1
-	elfPtDynamic  = 2
+	soMagic      = "\x7fELF"
+	soMinSize    = 0x40
+	elfEtDyn     = 3
+	elfEmArm     = 40
+	elfEmAarch64 = 183
+	elfPtLoad    = 1
+	elfPtDynamic = 2
 )
 
 // FixSoFile 修复单个 SO (内存 dump):p_offset=p_vaddr 对齐 + 补回 magic。
@@ -31,11 +31,34 @@ func FixSoFile(path string) (bool, bool, error) {
 		return false, true, nil
 	}
 
+<<<<<<< HEAD
 	// 尝试修复 (repairSo 返回 nil 表示无法修复)
 	repaired := repairSo(data)
 	if repaired == nil {
 		moveToBadDir(path)
 		return false, true, nil
+=======
+	if !validateSoDeep(data) {
+		// 尝试修复后再校验
+		if newData, _ := repairSo(data); newData != nil {
+			if validateSoDeep(newData) {
+				data = newData
+			} else {
+				// 仍无效 -> 移到 invalid/
+				invalidDir := filepath.Join(filepath.Dir(path), "invalid")
+				os.MkdirAll(invalidDir, 0755)
+				newPath := filepath.Join(invalidDir, filepath.Base(path))
+				os.Rename(path, newPath)
+				return false, true, nil
+			}
+		} else {
+			invalidDir := filepath.Join(filepath.Dir(path), "invalid")
+			os.MkdirAll(invalidDir, 0755)
+			newPath := filepath.Join(invalidDir, filepath.Base(path))
+			os.Rename(path, newPath)
+			return false, true, nil
+		}
+>>>>>>> 144a47d2591c27f1bf7b2c92b15574c0e6078509
 	}
 
 	if !validateSoDeep(repaired) {
@@ -77,13 +100,13 @@ func FixSoDirectory(dir string) (*DexStats, error) {
 	return stats, nil
 }
 
-func repairSo(data []byte) []byte {
+func repairSo(data []byte) ([]byte, bool) {
 	if len(data) < soMinSize {
-		return nil
+		return nil, false
 	}
 	is64 := data[4] == 2
 	if data[4] != 1 && data[4] != 2 {
-		return nil
+		return nil, false
 	}
 	var ePhoff uint64
 	var ePhentsize, ePhnum uint16
@@ -97,10 +120,10 @@ func repairSo(data []byte) []byte {
 		ePhnum = binary.LittleEndian.Uint16(data[44:46])
 	}
 	if ePhnum == 0 || ePhentsize == 0 {
-		return nil
+		return nil, false
 	}
 	if uint64(ePhoff)+uint64(ePhnum)*uint64(ePhentsize) > uint64(len(data)) {
-		return nil
+		return nil, false
 	}
 
 	out := make([]byte, len(data))
@@ -174,9 +197,9 @@ func repairSo(data []byte) []byte {
 		}
 	}
 	if !changed {
-		return data
+		return data, false
 	}
-	return out
+	return out, true
 }
 
 // validateSoDeep 镜像 fix_so.py validate_elf_deep:ET_DYN + PHT 自洽 + LOAD 自洽 + .dynamic DT 指向。

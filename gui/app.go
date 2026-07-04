@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -288,7 +287,7 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 	cmdArgs = append(cmdArgs, "shell", fullShellCmd)
 
 	cmd := exec.Command(adbPath, cmdArgs...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.SysProcAttr = hiddenWindowSysProcAttr()
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	cmd.Start()

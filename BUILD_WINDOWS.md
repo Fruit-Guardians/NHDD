@@ -6,28 +6,45 @@ Both the desktop GUI and the command-line TUI are only controllers. The Android-
 
 ## 1. Build Android-side `nhdd`
 
-### Linux
+### Cross-platform
 
 ```bash
-export NDK=/path/to/android-ndk-r27
-./scripts/build_nhdd_android.sh
+python scripts/build_nhdd_android.py
+python scripts/build_nhdd_android.py --ndk C:\Android\android-ndk-r27 --api 34 --out nhdd
 ```
 
-Equivalent manual command:
+The Python builder auto-detects NDK installs under the normal Android SDK
+locations on Windows, macOS, and Linux. You can still use the shell wrappers:
 
 ```bash
-$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang \
-  -O2 -static -Wall -Wextra -o nhdd nhdd.c
+# macOS / Linux
+NDK=/path/to/android-ndk-r27 ./scripts/build_nhdd_android.sh
 ```
-
-### Windows
-
-Use the Windows NDK prebuilt clang path:
 
 ```powershell
-$NDK="C:\Android\android-ndk-r27"
-& "$NDK\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android34-clang.cmd" `
+# Windows PowerShell
+powershell -ExecutionPolicy Bypass -File scripts\build_nhdd_android.ps1 -Ndk C:\Android\android-ndk-r27
+```
+
+Equivalent manual Windows command:
+
+```powershell
+& "C:\Android\android-ndk-r27\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android34-clang.cmd" `
   -O2 -static -Wall -Wextra -o nhdd nhdd.c
+```
+
+Equivalent manual Linux command:
+
+```bash
+/path/to/android-ndk-r27/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang \
+  -O2 -static -Wall -Wextra -o nhdd nhdd.c
+```
+
+## 1.5. Diagnose environment
+
+```bash
+python scripts/doctor.py
+python scripts/doctor.py --su-cmd "su -c"
 ```
 
 ## 2. Build the Wails desktop GUI

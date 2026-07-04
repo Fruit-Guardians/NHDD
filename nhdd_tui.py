@@ -1,33 +1,44 @@
-#!/usr/bin/env python3
+
 """
 NHDD 终端版 (TUI) — No-Hook DEX/SO Dumper Terminal Interface
 
-交互式终端界面:logo → 设备 → 应用列表 → 配置 → watch 实时进度 → 结果统计。
-复用设备端 nhdd 二进制 + ADB,展示层用 rich。
+交互式终端界面:logo → 设备 → 应用列表 → 配置 → watch 实时进度 → 结果统计.
+复用设备端 nhdd 二进制 + ADB,展示层用 rich.
 
 Usage:
     python nhdd_tui.py                 # 交互式选 app
     python nhdd_tui.py com.example.app # 直接指定包名
+    python nhdd_tui.py --cli           # CLI 非交互模式
     python nhdd_tui.py --logo          # 只打印 logo
+    python nhdd_tui.py -v, --version   # 打印版本信息
     python nhdd_tui.py com.example.app -o D:\\dumps   # 指定输出目录(绝对路径最佳)
     python nhdd_tui.py com.example.app --cli --repack-dex-only --repack-quick
 
 Options:
-    -o, --output DIR       本地输出目录(默认 ./nhdd_output)。填绝对路径可避免随运行目录漂移。
-    --repack               非 APK 模式下也强制生成 jadx 分析 APK。
-    --no-repack            APK 模式下跳过自动重打包。
-    --repack-dex-only      只打包 classes*.dex，最快，适合 jadx 分析。
-    --repack-full          保留原 APK 结构后替换 DEX。
-    --repack-quick         重打包阶段只做 DEX header 快检，速度最快。
-    --repack-deep          重打包阶段做深度 DEX 校验，较慢。
-    --repack-report        生成 dex_manifest / duplicate_classes 报告，较慢。
-    --replace-so           full repack 时把修复后的 SO 替换回 APK。
+
+    -o, --output DIR       本地输出目录(默认 ./nhdd_output).填绝对路径可避免随运行目录漂移.
+    --repack               非 APK 模式下也强制生成 jadx 分析 APK.
+    --no-repack            APK 模式下跳过自动重打包.
+    --repack-dex-only      只打包 classes*.dex,最快,适合 jadx 分析.
+    --repack-full          保留原 APK 结构后替换 DEX.
+    --repack-quick         重打包阶段只做 DEX header 快检,速度最快.
+    --repack-deep          重打包阶段做深度 DEX 校验,较慢.
+    --repack-report        生成 dex_manifest / duplicate_classes 报告,较慢.
+    --replace-so           full repack 时把修复后的 SO 替换回 APK.
+
+    -o, --output DIR   本地输出目录(默认 ./nhdd_output).填绝对路径可避免随运行目录漂移.
+    --su-cmd, --su CMD 指定 SU 命令(如 kp -c / ksud -c / su -c).支持 {cmd} 模板.
+    --cli              CLI 非交互模式,使用默认最佳配置(stealth2+relaxed,适合二代壳)
+    --logo             只打印 NHDD logo 并退出
+    -v, --version      打印版本信息并退出
+    -h, --help         打印此帮助信息并退出
+
 """
 
 import os
 import re
-import sys
 import shlex
+import sys
 import time
 import subprocess
 import threading
@@ -52,7 +63,7 @@ try:
     from rich.rule import Rule
 except ImportError:
     sys.stderr.write(
-        "[!] 缺少依赖 rich。请先安装:  pip install rich\n"
+        "[!] 缺少依赖 rich.请先安装:  pip install rich\n"
         "[!] 或:  python -m pip install rich\n"
     )
     sys.exit(1)
@@ -80,7 +91,7 @@ LOGO = r"""
 TAGLINE = "No-Hook DEX/SO/JNI Dumper   ·   C++类重构 · 无注入 · 反检测"
 AUTHORS = "漫宿骄盛、weixiao"
 REPO_URL = "https://github.com/mansujiaosheng/NHDD"
-DISCLAIMER = "免责声明：本工具仅用于合法授权的安全研究、逆向分析与自有应用调试。请勿用于未授权访问、绕过商业授权、窃取代码或数据、侵犯第三方权益等行为。"
+DISCLAIMER = "免责声明：本工具仅用于合法授权的安全研究、逆向分析与自有应用调试.请勿用于未授权访问、绕过商业授权、窃取代码或数据、侵犯第三方权益等行为."
 
 
 # ---------------------------------------------------------------------------
@@ -105,30 +116,84 @@ def show_logo():
 # ---------------------------------------------------------------------------
 # ADB helpers (复用 nhdd_ctrl.py 逻辑)
 # ---------------------------------------------------------------------------
-def adb(*args, timeout=60):
-    """执行 adb 命令,返回 (rc, stdout+stderr)。list 调用,支持多设备。"""
-    cmd = shlex.split(ADB)
+
+def adb_base_args():
+    """解析 NHDD_ADB.支持 adb、绝对路径、或兼容旧用法的 'adb -H host -P port'."""
+    try:
+        parts = shlex.split(ADB, posix=(os.name != "nt"))
+    except ValueError:
+        parts = [ADB]
+    return parts or ["adb"]
+
+
+def adb(*args, timeout=120):
+    """执行 adb 命令,返回 (rc, stdout+stderr).list 调用,支持多设备."""
+    cmd = adb_base_args()
     if _device_serial:
         cmd += ["-s", _device_serial]
     cmd += list(args)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                       encoding="utf-8", errors="replace")
-    return r.returncode, (r.stdout + r.stderr).strip()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           encoding="utf-8", errors="replace")
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return -1, f"[!] adb command timed out after {timeout}s"
+    except FileNotFoundError:
+        return -1, f"[!] adb 命令未找到: {cmd[0]}"
 
 
-def adb_shell(cmd, timeout=60):
-    """在设备 shell 中执行命令。list 调用,不嵌套引号。"""
-    adb_cmd = shlex.split(ADB)
-    if _device_serial:
-        adb_cmd += ["-s", _device_serial]
-    adb_cmd += ["shell", cmd]
-    r = subprocess.run(adb_cmd, capture_output=True, text=True, timeout=timeout,
-                       encoding="utf-8", errors="replace")
-    return r.returncode, (r.stdout + r.stderr).strip()
+def adb_shell(cmd, timeout=120):
+    return adb("shell", cmd, timeout=timeout)
+
+
+def quote_shell_cmd(s):
+    """为 Android /system/bin/sh 引用单个参数."""
+    if s is None:
+        return "''"
+    s = str(s)
+    if s == "":
+        return "''"
+    safe = all(c.isalnum() or c in "_-.:/+@%=" for c in s)
+    if safe:
+        return s
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def join_shell_args(parts):
+    return " ".join(quote_shell_cmd(p) for p in parts)
+
+
+def wrap_root_cmd(cmd, su_cmd=""):
+    """用 root wrapper 包装 Android shell 命令.支持 'su -c' 与包含 {cmd} 的模板."""
+    su = (su_cmd or "").strip()
+    if not su:
+        return cmd
+    quoted = quote_shell_cmd(cmd)
+    if "{cmd}" in su:
+        return su.replace("{cmd}", quoted)
+    return f"{su} {quoted}"
+
+
+def command_hint(context, output=""):
+    text = (output or "").lower()
+    if "not found" in text and "adb" in text:
+        return "请确认 adb 已安装并在 PATH 中,或设置 NHDD_ADB 为 adb 绝对路径."
+    if "no devices" in text or "device not found" in text or "offline" in text:
+        return "请检查 USB 调试授权、adb devices 状态,必要时重新插拔设备."
+    if "permission denied" in text:
+        return "请检查 root 命令是否正确,例如 su -c / kp -c / ksud -c."
+    if "closed" in text or "killed" in text:
+        return "目标可能被壳或系统杀掉,建议先手动打开 App,并尝试 stealth2/relaxed."
+    return context
+
+
+def make_run_id():
+    return time.strftime("%Y%m%d-%H%M%S")
+
 
 
 def check_device():
-    """返回已连接设备列表。"""
+    """返回已连接设备列表."""
     rc, out = adb("devices")
     devices = []
     for line in out.splitlines():
@@ -142,7 +207,7 @@ def check_device():
 
 
 def select_device(devices):
-    """选择设备并设置全局 _device_serial。单设备自动选,多设备交互选。"""
+    """选择设备并设置全局 _device_serial.单设备自动选,多设备交互选."""
     global _device_serial
     if len(devices) == 1:
         _device_serial = devices[0]
@@ -171,7 +236,7 @@ def check_nhdd_binary():
 
 
 def push_nhdd_if_missing(local_nhdd=None):
-    """若设备上没有 nhdd,尝试从本地推。始终确保可执行。"""
+    """若设备上没有 nhdd,尝试从本地推.始终确保可执行."""
     if not local_nhdd or not os.path.exists(local_nhdd):
         return check_nhdd_binary()
     # Always push to ensure latest binary and correct permissions
@@ -191,7 +256,7 @@ def get_third_party_apps():
 
 
 def get_running_pids(pkg):
-    rc, out = adb_shell(f"pidof {pkg}")
+    rc, out = adb_shell(f"pidof {quote_shell_cmd(pkg)}")
     return [p for p in out.split() if p.isdigit()]
 
 
@@ -199,13 +264,13 @@ def get_running_pids(pkg):
 # 交互:选 app
 # ---------------------------------------------------------------------------
 def select_app(default_pkg=None):
-    """分页 + 搜索选择第三方 app。"""
+    """分页 + 搜索选择第三方 app."""
     if default_pkg:
         return default_pkg
     console.print(Rule("加载应用列表", style="cyan"))
     apps = get_third_party_apps()
     if not apps:
-        console.print("[red]未取到第三方应用列表,请检查设备连接。[/]")
+        console.print("[red]未取到第三方应用列表,请检查设备连接.[/]")
         return None
 
     page_size = 25
@@ -280,7 +345,7 @@ def gather_config():
         "jnimap": False,       # 叠加模式下的 checkbox
         "jni_lib": "",
         "jni_min": 2,
-        # repack_apk_fast.py 对接参数。默认走 dex-only + quick，避免 APK 模式尾部卡很久。
+        # repack_apk_fast.py 对接参数.默认走 dex-only + quick,避免 APK 模式尾部卡很久.
         "repack_enabled": mode == "apk",
         "repack_dex_only": True,
         "repack_quick": True,
@@ -304,6 +369,7 @@ def gather_config():
     anon = Confirm.ask("启用 anon(仅扫描匿名内存映射)", default=False)
     cfg["anon"] = anon
 
+
     # JNIMAP: 独立模式 or 叠加到 DEX/SO 模式
     if mode == "jnimap":
         cfg["jnimap"] = True
@@ -324,7 +390,8 @@ def gather_config():
             if not jni_lib.strip():
                 cfg["jni_min"] = IntPrompt.ask("  最小连续 JNI 条目数", default=2)
 
-    su = Prompt.ask("SU 命令(读其他进程内存需要 root:留空=普通shell 或 su -c / ksud -c / kp -c)",
+    su = Prompt.ask("SU 命令(读其他进程内存需要 root:留空=普通shell 或 su -c / kp -c / ksud -c)\n"
+                    "      支持 {cmd} 模板(如 kp --exec-file {cmd})",
                     default="su -c")
     cfg["su_cmd"] = su.strip()
     if mode == "apk":
@@ -384,14 +451,8 @@ def build_nhdd_cmd(pkg, cfg):
         parts += ["--relaxed"]
     if cfg.get("anon"):
         parts += ["--anon"]
-    nhdd_cmd = " ".join(parts)
-    # 包装到 root shell
-    if cfg["su_cmd"]:
-        su = cfg["su_cmd"].strip()
-        if "{cmd}" in su:
-            return f"{su.replace('{cmd}', repr(nhdd_cmd))}"
-        return f"{su} {repr(nhdd_cmd)}"
-    return nhdd_cmd
+    nhdd_cmd = join_shell_args(parts)
+    return wrap_root_cmd(nhdd_cmd, cfg.get("su_cmd", ""))
 
 
 # 进度面板状态
@@ -409,6 +470,10 @@ class DashState:
         self.done = False
         self.dex_files = 0
         self.so_files = 0
+        self.returncode = 0
+        self.run_id = ""
+        self.device_dir = DEVICE_DUMP_DIR
+        self.local_dir = ""
         self.last_lines = deque(maxlen=12)
         self.all_lines = []  # 完整日志用于写入 log.txt
         self.finished_summary = ""
@@ -436,7 +501,7 @@ RE_SOFILE = re.compile(r"^\[\+\]\s+SO")  # match [+] SO: and [+] SO(memelf):
 
 
 def render_dashboard(st: DashState, pkg: str):
-    """构造实时面板:返回一个纵向叠加的 Group(main + 日志)。"""
+    """构造实时面板:返回一个纵向叠加的 Group(main + 日志)."""
     # 统计行
     stat = Table.grid(padding=(0, 2))
     stat.add_column(style="bold")
@@ -479,26 +544,32 @@ def render_dashboard(st: DashState, pkg: str):
 
 
 def adb_shell_root(cmd, su_cmd=""):
-    """以 root 执行 shell 命令(nhdd 用 su 写的文件需 root 才能删)。"""
-    su = (su_cmd or "").strip()
-    if not su:
-        return adb_shell(cmd)
-    if "{cmd}" in su:
-        return adb_shell(su.replace("{cmd}", repr(cmd)))
-    return adb_shell(f"{su} {cmd!r}")
+    """以 root 执行 shell 命令(nhdd 用 su 写的文件需 root 才能删)."""
+    return adb_shell(wrap_root_cmd(cmd, su_cmd))
 
 
 def run_dump(pkg, cfg):
-    """执行 dump,带 Live 进度面板。cfg['restart'] 控制是否重启 app。"""
+    """执行 dump,带 Live 进度面板.cfg['restart'] 控制是否重启 app."""
     # 清理:nhdd 用 su 写的文件是 root 属主,普通 shell 的 rm 会 Permission denied
-    # → 残留跨次累积,污染下一次输出。故带 su 清理。
+    # → 残留跨次累积,污染下一次输出.故带 su 清理.
+    run_id = cfg.get("run_id") or make_run_id()
+    cfg["run_id"] = run_id
     console.print(Rule("准备", style="cyan"))
-    adb_shell_root(f"rm -rf {DEVICE_DUMP_DIR}; mkdir -p {DEVICE_DUMP_DIR}", cfg.get("su_cmd"))
+    clean_cmd = f"rm -rf {quote_shell_cmd(DEVICE_DUMP_DIR)}; mkdir -p {quote_shell_cmd(DEVICE_DUMP_DIR)}"
+    rc, out = adb_shell_root(clean_cmd, cfg.get("su_cmd"))
+    if rc != 0:
+        console.print(f"[red]设备端输出目录准备失败:[/] {out or '(无输出)'}")
+        console.print(f"[yellow]建议:[/] {command_hint('请检查 root 命令和 /data/local/tmp 写入权限.', out)}")
+        st = DashState()
+        st.returncode = rc
+        st.run_id = run_id
+        return st
+    console.print(f"[dim]本次 run_id: {run_id}[/]")
 
     if cfg.get("restart"):
-        adb_shell(f"am force-stop {pkg}")
+        adb_shell(f"am force-stop {quote_shell_cmd(pkg)}")
         console.print(f"[1] 已停止 {pkg}")
-        adb_shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
+        adb_shell(f"monkey -p {quote_shell_cmd(pkg)} -c android.intent.category.LAUNCHER 1")
         console.print(f"[2] 已启动 {pkg}")
         time.sleep(3)  # 给壳时间解密加载
     else:
@@ -507,23 +578,30 @@ def run_dump(pkg, cfg):
     pids = get_running_pids(pkg)
     console.print(f"[3] 当前进程: {pids if pids else '(无)'}")
     if not pids:
-        console.print("[yellow]目标未运行。建议:先手动打开 app,或配置里开启重启。[/]")
-        return DashState()
+        console.print("[yellow]目标未运行.建议:先手动打开 app,或配置里开启重启.[/]")
+        st = DashState()
+        st.run_id = run_id
+        return st
 
     cmd = build_nhdd_cmd(pkg, cfg)
-    adb_cmd = shlex.split(ADB)
-    if _device_serial:
-        adb_cmd += ["-s", _device_serial]
-    adb_cmd += ["shell", cmd]
-    full = f'{ADB}{" -s "+_device_serial if _device_serial else ""} shell "{cmd}"'
-    console.print(f"[4] 运行: [dim]{full}[/]\n")
+
+    adb_args = adb_base_args() + ["shell", cmd]
+    console.print(f"[4] 运行: [dim]{' '.join(shlex.quote(a) for a in adb_args)}[/]\n")
 
     st = DashState()
     st.dry_limit = cfg["dry_limit"] if cfg["watch"] else 1
+    st.run_id = run_id
 
-    proc = subprocess.Popen(adb_cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, bufsize=1,
-                            encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.Popen(adb_args, shell=False, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, bufsize=1,
+                                encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        console.print(f"[red]ADB 命令未找到:[/] {adb_base_args()[0]}")
+        console.print("[yellow]建议:[/] 请安装 Android platform-tools,或设置 NHDD_ADB 为 adb 绝对路径.")
+        st.returncode = 127
+        return st
+
     # nhdd 进度在 stderr,结果文件行在 stdout
     out_th = threading.Thread(target=_pump, args=(proc.stdout, st, False), daemon=True)
     out_th.start()
@@ -533,12 +611,16 @@ def run_dump(pkg, cfg):
         for line in iter(proc.stderr.readline, ""):
             _parse_line(line.rstrip(), st)
             live.update(render_dashboard(st, pkg), refresh=True)
-        proc.wait()
+        st.returncode = proc.wait()
         out_th.join(timeout=2)
         st.done = True
         live.update(render_dashboard(st, pkg), refresh=True)
 
     console.print()
+    if st.returncode != 0:
+        last = "\n".join(st.last_lines)
+        console.print(f"[red]nhdd 执行失败,退出码 {st.returncode}[/]")
+        console.print(f"[yellow]建议:[/] {command_hint('请检查 root 命令、目标进程状态和 stealth2/relaxed 参数.', last)}")
     if st.finished_summary:
         console.print(Panel(st.finished_summary, title="[bold green]结果[/]",
                             border_style="green", box=box.ROUNDED))
@@ -609,10 +691,10 @@ def _pump(stream, st: DashState, is_stderr):
 # 结果:pull + 统计
 # ---------------------------------------------------------------------------
 def auto_classify_and_fix(dex_dir, local_dir):
-    """对齐 GUI FixDexDirectory:一段式 校验→重建→重校验→修头+校验和。
+    """对齐 GUI FixDexDirectory:一段式 校验→重建→重校验→修头+校验和.
 
-    文件处置与 GUI 一致:过小/非DEX 移 bad/,不可重建移 bad/,否则修头+校验和。
-    统计口径与 GUI 一致:OK(含已修复)/修复/损坏已隔离。
+    文件处置与 GUI 一致:过小/非DEX 移 bad/,不可重建移 bad/,否则修头+校验和.
+    统计口径与 GUI 一致:OK(含已修复)/修复/损坏已隔离.
     """
     try:
         import importlib.util
@@ -651,8 +733,8 @@ def auto_classify_and_fix(dex_dir, local_dir):
     # 写日志
     log_path = os.path.join(local_dir, "log.txt")
     try:
-        with open(log_path, "w", encoding="utf-8") as lf:
-            lf.write("DEX Validation Report\n")
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write("\nDEX Validation Report\n")
             lf.write(f"{'='*40}\n")
             lf.write(f"Total: {stats['total']}  OK: {stats['ok']}  "
                      f"Fixed: {stats['fixed']}  Bad: {stats['bad']}\n\n")
@@ -664,9 +746,34 @@ def auto_classify_and_fix(dex_dir, local_dir):
         pass
 
 
-def auto_classify_and_fix_so(so_dir, local_dir, apk_path=None):
-    """Carrier 模式: 以原 APK SO 为骨架, 覆盖 dump RX 代码段."""
 
+def write_run_log(local_dir, pkg, run_id, st, dex_count, so_count, total_size, pulled_ok):
+    log_path = os.path.join(local_dir, "log.txt")
+    try:
+        with open(log_path, "w", encoding="utf-8") as lf:
+            lf.write("NHDD TUI Run Summary\n")
+            lf.write(f"{'='*40}\n")
+            lf.write(f"Package: {pkg}\n")
+            lf.write(f"Run ID: {run_id}\n")
+            lf.write(f"Device dir: {DEVICE_DUMP_DIR}\n")
+            lf.write(f"Return code: {st.returncode}\n")
+            lf.write(f"Pulled OK: {pulled_ok}\n")
+            lf.write(f"Rounds: {st.round}\n")
+            lf.write(f"Processes: {st.processes}\n")
+            lf.write(f"DEX files: {dex_count}\n")
+            lf.write(f"SO files: {so_count}\n")
+            lf.write(f"Total size: {total_size}\n")
+            if st.last_lines:
+                lf.write("\nLast nhdd lines:\n")
+                for line in st.last_lines:
+                    lf.write(f"  {line}\n")
+            lf.write("\n")
+    except OSError as e:
+        console.print(f"[yellow]写入运行日志失败:[/] {e}")
+
+
+def auto_classify_and_fix_so(so_dir, local_dir, apk_path=None):
+    """对齐 fix_so.py:校验→修复(p_offset=p_vaddr,补magic)→重校验→落盘."""
     try:
         import importlib.util
         spec = importlib.util.spec_from_file_location(
@@ -697,7 +804,7 @@ def auto_classify_and_fix_so(so_dir, local_dir, apk_path=None):
                    "至少有 RX 页被覆盖到原始 SO")
     else:
         ct.add_row("[green]OK[/]", str(stats["ok"]),
-                   "PHT/DYNAMIC/SHT 已校验或修复，可用于 IDA/Ghidra")
+                   "PHT/DYNAMIC/SHT 已校验或修复,可用于 IDA/Ghidra")
         ct.add_row("[yellow]修复[/]", str(stats["fixed"]),
                    "p_offset / dynamic / section header 已调整")
     ct.add_row("[red]损坏[/]", str(stats["bad"]),
@@ -730,25 +837,81 @@ def auto_classify_and_fix_so(so_dir, local_dir, apk_path=None):
         pass
 
 
+
 def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd="", mode="dex"):
-    local = os.path.join(output_dir, pkg)
-    os.makedirs(local, exist_ok=True)
-    # 防御:拉取前清空本地 dex/so/jnimap 子目录的旧文件,避免上次同 app 结果残留合并进来。
-    for sub, exts in (("dex", (".dex",)), ("so", (".so", ".bin")), ("jnimap", (".jsonl",)), ("maps", (".txt",))):
-        sub_local = os.path.join(local, sub)
-        if os.path.isdir(sub_local):
-            for fn in os.listdir(sub_local):
-                if any(fn.endswith(e) for e in exts):
-                    try: os.remove(os.path.join(sub_local, fn))
-                    except OSError: pass
+    run_id = st.run_id or make_run_id()
+    local = os.path.join(output_dir, pkg, run_id)
+    try:
+        os.makedirs(local, exist_ok=True)
+    except OSError as e:
+        console.print(f"[red]创建本地输出目录失败:[/] {local}")
+        console.print(f"[yellow]建议:[/] 请检查 -o/--output 路径是否存在权限问题.错误: {e}")
+        return local
+    st.local_dir = local
+
+    rc, out = adb_shell(f"test -d {quote_shell_cmd(DEVICE_DUMP_DIR)} && echo OK || echo MISSING")
+    if rc != 0 or "OK" not in out:
+        console.print(f"[red]设备端输出目录不存在:[/] {DEVICE_DUMP_DIR}")
+        console.print("[yellow]建议:[/] 请确认 nhdd 已成功运行,或检查 root 命令是否允许写入 /data/local/tmp.")
+        return local
+
+    rc, out = adb_shell(f"find {quote_shell_cmd(DEVICE_DUMP_DIR)} -type f 2>&1 | head -5")
+    if rc != 0 or "Permission denied" in out:
+        console.print(f"[yellow]设备端文件权限不足,尝试修复...[/]")
+    elif not out.strip():
+        console.print(f"[yellow]设备端没有生成 dump 文件:[/] {DEVICE_DUMP_DIR}")
+        console.print("[yellow]建议:[/] 请确认目标进程已运行,必要时启用 watch / stealth2 / relaxed.")
+
+    # nhdd 以 root 运行,dump 文件属主为 root,adb pull 默认以 shell 用户运行无法读取。
+    # 优先用 adb root 让 adbd 以 root 重启,pull 直接以 root 身份读取,无需 chmod/chcon。
+    # 若 adb root 不可用(正式版固件),回退到 chmod -R 0777 + chcon -R shell_data_file。
+    console.print("[dim]切换 adb root 模式...[/]")
+    root_rc, root_out = adb("root", timeout=30)
+    if root_rc == 0 and "cannot" not in root_out.lower():
+        # adb root 会重启 adbd,等待设备重新上线
+        time.sleep(2)
+        adb("wait-for-device", timeout=30)
+        console.print("[dim]adb root 已启用,pull 将以 root 身份执行[/]")
+    else:
+        console.print(f"[dim]adb root 不可用,回退到 chmod + chcon...[/]")
+        fix_rc, fix_out = adb_shell_root(
+            f"chmod -R 0777 {quote_shell_cmd(DEVICE_DUMP_DIR)} && "
+            f"chcon -R u:object_r:shell_data_file:s0 {quote_shell_cmd(DEVICE_DUMP_DIR)}",
+            su_cmd)
+        if fix_rc != 0:
+            console.print(f"[yellow]权限修复失败:[/] {fix_out or '(无输出)'}")
+            console.print("[yellow]建议:[/] 请检查 root 命令是否正确,或手动执行 chmod + chcon.")
+
     rc, out = adb("pull", f"{DEVICE_DUMP_DIR}/.", local + os.sep)
     pulled_ok = rc == 0
+    if not pulled_ok:
+        console.print(f"[red]adb pull 失败:[/] {out or '(无输出)'}")
+        console.print(f"[yellow]建议:[/] {command_hint('请检查 ADB 连接、输出目录权限,设备端文件可能仍保留.', out)}")
 
-    # 拉取成功后清理设备端 dump 文件
+    # 验证本地实际拉取的文件数,避免 adb pull 返回 0 但实际没拉到文件时误删设备端
+    pulled_dex = pulled_so = 0
+    if pulled_ok:
+        for _, _, files in os.walk(local):
+            for f in files:
+                if f.endswith(".dex"):
+                    pulled_dex += 1
+                elif f.endswith(".so"):
+                    pulled_so += 1
+        if pulled_dex == 0 and pulled_so == 0:
+            console.print(f"[yellow]adb pull 返回成功但本地无 DEX/SO 文件,跳过清理以防误删设备端文件.[/]")
+            console.print(f"[yellow]设备端文件仍在:[/] {DEVICE_DUMP_DIR}")
+            console.print("[yellow]建议:[/] 请手动 adb pull 或检查 root 权限.")
+            pulled_ok = False
+
+    # 拉取验证通过后才清理设备端 dump 文件
     if pulled_ok:
         console.print("[dim]清理设备端 dump 文件...[/]")
-        adb_shell_root(f"rm -rf {DEVICE_DUMP_DIR}", su_cmd)
-        console.print("[dim]设备端 dump 文件已清理[/]")
+        cleanup_rc, cleanup_out = adb_shell_root(f"rm -rf {quote_shell_cmd(DEVICE_DUMP_DIR)}", su_cmd)
+        if cleanup_rc == 0:
+            console.print("[dim]设备端 dump 文件已清理[/]")
+        else:
+            console.print(f"[yellow]设备端清理失败:[/] {cleanup_out or '(无输出)'}")
+            console.print("[yellow]建议:[/] 下次运行前会再次尝试清理;如持续失败,请手动 adb shell su -c rm.")
 
     # 统计本地文件
     dex_count = so_count = jni_count = 0
@@ -769,16 +932,20 @@ def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd="", mode="dex"):
     tbl.add_column("项目", style="bold")
     tbl.add_column("值", style="cyan")
     tbl.add_row("应用", pkg)
+    tbl.add_row("Run ID", run_id)
     tbl.add_row("扫描轮次", str(st.round))
     tbl.add_row("解析进程数", str(st.processes))
     tbl.add_row("DEX 文件", f"{dex_count} (去重后唯一)")
+
     tbl.add_row("SO 文件", f"{so_count} 本地 / {st.so_files} 日志")
     if jni_count:
         tbl.add_row("JNI map", f"{jni_count} jsonl / {st.jni_total} 条目")
+
     tbl.add_row("总大小", f"{size_mb:.1f} MB")
     tbl.add_row("本地路径", local)
     console.print()
     console.print(tbl)
+    write_run_log(local, pkg, run_id, st, dex_count, so_count, total_size, pulled_ok)
 
     # 写 nhdd 实时日志到 log.txt（在校验结果之前）
     log_path = os.path.join(local, "log.txt")
@@ -814,7 +981,7 @@ def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd="", mode="dex"):
 # Repack: 对接 scripts/repack_apk_fast.py
 # ---------------------------------------------------------------------------
 def _parse_pm_path_output(out):
-    """从 pm path 输出里取 APK 路径，优先 base.apk。"""
+    """从 pm path 输出里取 APK 路径,优先 base.apk."""
     paths = []
     for line in out.splitlines():
         line = line.strip()
@@ -827,7 +994,7 @@ def _parse_pm_path_output(out):
 
 
 def pull_original_apk_for_repack(pkg, output_dir):
-    """按 TUI 当前选择的设备拉取原 APK，避免旧实现忽略 -s 设备序列号。"""
+    """按 TUI 当前选择的设备拉取原 APK,避免旧实现忽略 -s 设备序列号."""
     os.makedirs(output_dir, exist_ok=True)
     rc, out = adb_shell(f"pm path {pkg}")
     if rc != 0:
@@ -847,7 +1014,7 @@ def pull_original_apk_for_repack(pkg, output_dir):
 
 
 def resolve_repack_script():
-    """优先使用快版脚本；兼容 scripts/ 下或 TUI 同目录下放置。"""
+    """优先使用快版脚本;兼容 scripts/ 下或 TUI 同目录下放置."""
     base = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(base, "scripts", "repack_apk_fast.py"),
@@ -861,11 +1028,11 @@ def resolve_repack_script():
 
 
 def run_repack_flow(pkg, cfg, force=False):
-    """生成 jadx 分析 APK。默认使用 repack_apk_fast.py 的 dex-only + quick 路径。"""
+    """生成 jadx 分析 APK.默认使用 repack_apk_fast.py 的 dex-only+quick路径."""
     if not (force or cfg.get("mode") == "apk" or cfg.get("repack_enabled")):
         return
     if cfg.get("mode") == "apk" and not cfg.get("repack_enabled", True):
-        console.print("[yellow]已跳过自动重打包。[/]")
+        console.print("[yellow]已跳过自动重打包.[/]")
         return
 
     pkg_local = os.path.join(cfg["output_dir"], pkg)
@@ -874,7 +1041,7 @@ def run_repack_flow(pkg, cfg, force=False):
     script = resolve_repack_script()
     if not os.path.exists(script):
         console.print(f"[red]未找到重打包脚本:[/] {script}")
-        console.print("[yellow]请把 repack_apk_fast.py 放到 scripts/ 目录，或放到 nhdd_tui.py 同目录。[/]")
+        console.print("[yellow]请把 repack_apk_fast.py 放到 scripts/ 目录,或放到 nhdd_tui.py 同目录.[/]")
         return
 
     use_fast = os.path.basename(script) == "repack_apk_fast.py"
@@ -890,15 +1057,15 @@ def run_repack_flow(pkg, cfg, force=False):
     apk_path = None
 
     if cfg.get("repack_dex_only", True) and use_fast:
-        # 最快路径：不拉原 APK，不解压原 APK，只生成 classes*.dex 容器。
+        # 最快路径：不拉原 APK,不解压原 APK,只生成 classes*.dex 容器.
         cmd += [pkg, dump_dir, "--dex-only"]
     else:
         console.print("[bold dim]拉取原 APK...[/]")
         apk_path = pull_original_apk_for_repack(pkg, repack_dir)
         if not apk_path or not os.path.exists(apk_path):
-            console.print("[red]拉取原 APK 失败，跳过 repack。[/]")
+            console.print("[red]拉取原 APK 失败,跳过 repack.[/]")
             return
-        # SO carrier 仍然在 full repack 前做，保持原 TUI 语义。
+        # SO carrier 仍然在 full repack 前做,保持原 TUI 语义.
         so_dir = os.path.join(pkg_local, "so")
         if os.path.isdir(so_dir):
             auto_classify_and_fix_so(so_dir, pkg_local, apk_path)
@@ -935,6 +1102,11 @@ def main():
     args = sys.argv[1:]
     if "--logo" in args:
         show_logo()
+        return
+    if "-v" in args or "--version" in args:
+        print(f"NHDD v{VERSION}")
+        print(f"Authors: {AUTHORS}")
+        print(f"Repository: {REPO_URL}")
         return
     if "-h" in args or "--help" in args:
         print(__doc__)
@@ -1031,11 +1203,11 @@ def main():
     console.print(Rule("设备", style="cyan"))
     devices = check_device()
     if not devices:
-        console.print("[red]未发现已连接设备。请检查 adb / USB 调试 / NHDD_ADB。[/]")
+        console.print("[red]未发现已连接设备.请检查 adb / USB 调试 / NHDD_ADB.[/]")
         sys.exit(1)
     console.print(f"[green]已连接设备:[/] {', '.join(devices)}")
     if not select_device(devices):
-        console.print("[red]设备选择失败。[/]")
+        console.print("[red]设备选择失败.[/]")
         sys.exit(1)
     console.print()
 
@@ -1053,14 +1225,14 @@ def main():
     if local_nhdd:
         push_nhdd_if_missing(local_nhdd)
     elif not check_nhdd_binary():
-        console.print(f"[red]设备上无 {NHDD_BIN} 且本地未找到 nhdd 二进制。请先编译: make -C NHDD-cpp-modular android[/]")
+        console.print(f"[red]设备上无 {NHDD_BIN} 且本地未找到 nhdd 二进制.请先编译: make -C NHDD-cpp-modular android[/]")
         sys.exit(1)
     console.print(f"[green]nhdd 就绪:[/] {NHDD_BIN}")
 
     pkg_arg = next((a for a in args if not a.startswith("-")), None)
     pkg = select_app(pkg_arg)
     if not pkg:
-        console.print("[yellow]未选择应用,退出。[/]")
+        console.print("[yellow]未选择应用,退出.[/]")
         return
     console.print(f"\n[bold]已选择:[/] [cyan]{pkg}[/]\n")
 
@@ -1081,7 +1253,7 @@ def main():
             "jni_lib": "",
             "jni_min": 2,
             "region_delay_ms": 2,
-            "su_cmd": su_cmd_override or "kp -c",
+            "su_cmd": su_cmd_override or "su -c",
             "output_dir": "./nhdd_output",
             "repack_enabled": True,
             "repack_dex_only": True,
@@ -1092,7 +1264,7 @@ def main():
             "repack_replace_so": False,
             "repack_drop_unmatched_so": False,
         }
-        console.print("[bold]CLI 模式:[/] stealth2 + relaxed + stealth (二代壳推荐)")
+        console.print("[bold]CLI 模式:[/] stealth2 + relaxed + stealth (二代壳推荐),默认 su -c(可用 --su 指定 kp -c / ksud -c)")
     else:
         cfg = gather_config()
 
@@ -1124,20 +1296,25 @@ def main():
 
     st = run_dump(pkg, cfg)
     if st.processes == 0:
-        console.print("[yellow]未扫描到任何进程(目标未运行或被杀),跳过拉取。[/]")
-        console.print("[yellow]建议:先手动打开 app 再扫,或在配置里开启「重启 app 再扫」。[/]")
+        if st.returncode != 0:
+            console.print("[yellow]前置步骤或 nhdd 执行失败,跳过拉取.[/]")
+            console.print("[yellow]建议:先运行 make doctor 检查 adb/root/设备端 nhdd,再重试.[/]")
+        else:
+            console.print("[yellow]未扫描到任何进程(目标未运行或被杀),跳过拉取.[/]")
+            console.print("[yellow]建议:先手动打开 app 再扫,或在配置里开启「重启 app 再扫」.[/]")
         return
+
     pull_and_summarize(pkg, st, cfg["output_dir"], cfg.get("su_cmd", ""), cfg["mode"])
 
-    # APK 模式 / --repack: 对接 repack_apk_fast.py。
+    # APK 模式 / --repack: 对接 repack_apk_fast.py.
     run_repack_flow(pkg, cfg, force=repack_flag)
 
-    console.print("\n[bold green]全部完成。[/]")
+    console.print("\n[bold green]全部完成.[/]")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        console.print("\n[yellow]已中断。[/]")
+        console.print("\n[yellow]已中断.[/]")
         sys.exit(130)
