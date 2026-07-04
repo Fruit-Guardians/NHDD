@@ -72,8 +72,17 @@ NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存
 要求：Android NDK r25+，目标设备为 ARM64。
 
 ```bash
-# 推荐：使用仓库脚本
+# 推荐：跨平台 Python 构建入口（Windows/macOS/Linux）
+python3 scripts/build_nhdd_android.py
+
+# 指定 NDK / API / 输出路径
+python3 scripts/build_nhdd_android.py --ndk /path/to/android-ndk-r27 --api 34 --out nhdd
+
+# macOS / Linux shell 包装
 NDK=/path/to/android-ndk-r27 API=34 ./scripts/build_nhdd_android.sh
+
+# Windows PowerShell 包装
+powershell -ExecutionPolicy Bypass -File scripts/build_nhdd_android.ps1 -Ndk C:\Android\android-ndk-r27
 
 # 或手动编译
 /path/to/android-ndk-r27/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang \
@@ -93,6 +102,32 @@ adb shell chmod 755 /data/local/tmp/nhdd
 adb push ./sofixer /data/local/tmp/sofixer
 adb shell chmod 755 /data/local/tmp/sofixer
 ```
+
+## 环境诊断（doctor）
+
+首次使用或换机器后，建议先跑：
+
+```bash
+make doctor
+```
+
+doctor 会检查：
+
+- 本地依赖：`adb`、`sdkmanager`、Android NDK、Node/npm、Wails、Python rich、前端依赖、SoFixer submodule。
+- 设备状态：是否有已授权 Android 设备连接。
+- root 命令：自动尝试 `su -c`、`kp -c`、`ksud -c`，也可以手动指定。
+- 设备端二进制：检查 `/data/local/tmp/nhdd` 是否存在，并拉回本地验证是否为 ELF64 AArch64。
+
+常用覆盖参数：
+
+```bash
+make doctor NDK_PATH="$ANDROID_HOME/ndk/27.2.12479018"
+make doctor SU_CMD="kp -c"
+make doctor ADB=/path/to/adb HOST_PORT=192.168.238.1:5037 SU_CMD="ksud -c"
+python3 scripts/doctor.py --ndk /path/to/android-ndk-r27 --su-cmd "su -c"
+```
+
+如果某项失败，doctor 会在 `fix:` 行给出对应修复命令，例如安装 NDK、初始化 submodule、连接设备、重新 `make android push`。
 
 ## 命令行使用
 
@@ -229,6 +264,19 @@ TUI 会提示：
 - root 命令使用 `su -c`、`kp -c`、`ksud -c` 还是留空。
 - dump 模式选择 DEX、SO 或 ALL。
 - 本地输出目录。
+
+TUI 每次运行都会生成独立 run id，结果保存到：
+
+```text
+nhdd_output/<package>/<YYYYMMDD-HHMMSS>/
+├── dex/
+├── so/
+├── jnimap/
+├── maps/
+└── log.txt
+```
+
+这样重复测试同一个 App 时不会把旧结果混入本次统计。
 
 ## 桌面 GUI 使用方式
 
