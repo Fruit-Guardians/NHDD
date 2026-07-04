@@ -8,18 +8,9 @@ set -euo pipefail
 #   API=34 OUT=nhdd ./scripts/build_nhdd_android.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NDK="${NDK:-/lina_android/android-ndk-r27}"
-API="${API:-34}"
-OUT="${OUT:-${ROOT_DIR}/nhdd}"
-HOST_TAG="linux-x86_64"
-CC="${NDK}/toolchains/llvm/prebuilt/${HOST_TAG}/bin/aarch64-linux-android${API}-clang"
-
-if [[ ! -x "${CC}" ]]; then
-  echo "ERROR: clang not found: ${CC}" >&2
-  echo "Set NDK=/path/to/android-ndk-r27" >&2
-  exit 1
+ARGS=()
+if [[ -n "${NDK:-${NDK_PATH:-}}" ]]; then
+  ARGS+=(--ndk "${NDK:-${NDK_PATH:-}}")
 fi
-
-"${CC}" -O2 -static -Wall -Wextra -o "${OUT}" "${ROOT_DIR}/nhdd.c"
-ls -lh "${OUT}"
-file "${OUT}" || true
+ARGS+=(--api "${API:-34}" --out "${OUT:-${ROOT_DIR}/nhdd}")
+python3 "${ROOT_DIR}/scripts/build_nhdd_android.py" "${ARGS[@]}"
