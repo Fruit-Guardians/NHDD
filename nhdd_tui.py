@@ -24,6 +24,7 @@ Options:
 
 import os
 import re
+import shlex
 import sys
 import time
 import subprocess
@@ -101,9 +102,18 @@ def show_logo():
 # ---------------------------------------------------------------------------
 # ADB helpers (复用 nhdd_ctrl.py 逻辑)
 # ---------------------------------------------------------------------------
+def adb_base_args():
+    """解析 NHDD_ADB。支持 adb、绝对路径、或兼容旧用法的 'adb -H host -P port'。"""
+    try:
+        parts = shlex.split(ADB, posix=(os.name != "nt"))
+    except ValueError:
+        parts = [ADB]
+    return parts or ["adb"]
+
+
 def adb(*args, timeout=120):
     """执行 adb 命令,返回 (rc, stdout+stderr)。用列表参数避免 shell 注入。"""
-    cmd = [ADB] + list(args)
+    cmd = adb_base_args() + list(args)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, (r.stdout + r.stderr).strip()
@@ -115,6 +125,51 @@ def adb(*args, timeout=120):
 
 def adb_shell(cmd, timeout=120):
     return adb("shell", cmd, timeout=timeout)
+
+
+def quote_shell_cmd(s):
+    """为 Android /system/bin/sh 引用单个参数。"""
+    if s is None:
+        return "''"
+    s = str(s)
+    if s == "":
+        return "''"
+    safe = all(c.isalnum() or c in "_-.:/+@%=" for c in s)
+    if safe:
+        return s
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def join_shell_args(parts):
+    return " ".join(quote_shell_cmd(p) for p in parts)
+
+
+def wrap_root_cmd(cmd, su_cmd=""):
+    """用 root wrapper 包装 Android shell 命令。支持 'su -c' 与包含 {cmd} 的模板。"""
+    su = (su_cmd or "").strip()
+    if not su:
+        return cmd
+    quoted = quote_shell_cmd(cmd)
+    if "{cmd}" in su:
+        return su.replace("{cmd}", quoted)
+    return f"{su} {quoted}"
+
+
+def command_hint(context, output=""):
+    text = (output or "").lower()
+    if "not found" in text and "adb" in text:
+        return "请确认 adb 已安装并在 PATH 中,或设置 NHDD_ADB 为 adb 绝对路径。"
+    if "no devices" in text or "device not found" in text or "offline" in text:
+        return "请检查 USB 调试授权、adb devices 状态,必要时重新插拔设备。"
+    if "permission denied" in text:
+        return "请检查 root 命令是否正确,例如 su -c / kp -c / ksud -c。"
+    if "closed" in text or "killed" in text:
+        return "目标可能被壳或系统杀掉,建议先手动打开 App,并尝试 stealth2/relaxed。"
+    return context
+
+
+def make_run_id():
+    return time.strftime("%Y%m%d-%H%M%S")
 
 
 def check_device():
@@ -159,7 +214,7 @@ def get_third_party_apps():
 
 
 def get_running_pids(pkg):
-    rc, out = adb_shell(f"pidof {pkg}")
+    rc, out = adb_shell(f"pidof {quote_shell_cmd(pkg)}")
     return [p for p in out.split() if p.isdigit()]
 
 
@@ -288,14 +343,8 @@ def build_nhdd_cmd(pkg, cfg):
         parts += ["--relaxed"]
     if cfg.get("anon"):
         parts += ["--anon"]
-    nhdd_cmd = " ".join(parts)
-    # 包装到 root shell
-    if cfg["su_cmd"]:
-        su = cfg["su_cmd"].strip()
-        if "{cmd}" in su:
-            return f"{su.replace('{cmd}', repr(nhdd_cmd))}"
-        return f"{su} {repr(nhdd_cmd)}"
-    return nhdd_cmd
+    nhdd_cmd = join_shell_args(parts)
+    return wrap_root_cmd(nhdd_cmd, cfg.get("su_cmd", ""))
 
 
 # 进度面板状态
@@ -311,6 +360,10 @@ class DashState:
         self.done = False
         self.dex_files = 0
         self.so_files = 0
+        self.returncode = 0
+        self.run_id = ""
+        self.device_dir = DEVICE_DUMP_DIR
+        self.local_dir = ""
         self.last_lines = deque(maxlen=12)
         self.finished_summary = ""
 
@@ -364,25 +417,31 @@ def render_dashboard(st: DashState, pkg: str):
 
 def adb_shell_root(cmd, su_cmd=""):
     """以 root 执行 shell 命令(nhdd 用 su 写的文件需 root 才能删)。"""
-    su = (su_cmd or "").strip()
-    if not su:
-        return adb_shell(cmd)
-    if "{cmd}" in su:
-        return adb_shell(su.replace("{cmd}", repr(cmd)))
-    return adb_shell(f"{su} {cmd!r}")
+    return adb_shell(wrap_root_cmd(cmd, su_cmd))
 
 
 def run_dump(pkg, cfg):
     """执行 dump,带 Live 进度面板。cfg['restart'] 控制是否重启 app。"""
     # 清理:nhdd 用 su 写的文件是 root 属主,普通 shell 的 rm 会 Permission denied
     # → 残留跨次累积,污染下一次输出。故带 su 清理。
+    run_id = cfg.get("run_id") or make_run_id()
+    cfg["run_id"] = run_id
     console.print(Rule("准备", style="cyan"))
-    adb_shell_root(f"rm -rf {DEVICE_DUMP_DIR}; mkdir -p {DEVICE_DUMP_DIR}", cfg.get("su_cmd"))
+    clean_cmd = f"rm -rf {quote_shell_cmd(DEVICE_DUMP_DIR)}; mkdir -p {quote_shell_cmd(DEVICE_DUMP_DIR)}"
+    rc, out = adb_shell_root(clean_cmd, cfg.get("su_cmd"))
+    if rc != 0:
+        console.print(f"[red]设备端输出目录准备失败:[/] {out or '(无输出)'}")
+        console.print(f"[yellow]建议:[/] {command_hint('请检查 root 命令和 /data/local/tmp 写入权限。', out)}")
+        st = DashState()
+        st.returncode = rc
+        st.run_id = run_id
+        return st
+    console.print(f"[dim]本次 run_id: {run_id}[/]")
 
     if cfg.get("restart"):
-        adb_shell(f"am force-stop {pkg}")
+        adb_shell(f"am force-stop {quote_shell_cmd(pkg)}")
         console.print(f"[1] 已停止 {pkg}")
-        adb_shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
+        adb_shell(f"monkey -p {quote_shell_cmd(pkg)} -c android.intent.category.LAUNCHER 1")
         console.print(f"[2] 已启动 {pkg}")
         time.sleep(3)  # 给壳时间解密加载
     else:
@@ -392,17 +451,26 @@ def run_dump(pkg, cfg):
     console.print(f"[3] 当前进程: {pids if pids else '(无)'}")
     if not pids:
         console.print("[yellow]目标未运行。建议:先手动打开 app,或配置里开启重启。[/]")
-        return DashState()
+        st = DashState()
+        st.run_id = run_id
+        return st
 
     cmd = build_nhdd_cmd(pkg, cfg)
-    full = f'{ADB} shell "{cmd}"'
-    console.print(f"[4] 运行: [dim]{full}[/]\n")
+    adb_args = adb_base_args() + ["shell", cmd]
+    console.print(f"[4] 运行: [dim]{' '.join(shlex.quote(a) for a in adb_args)}[/]\n")
 
     st = DashState()
     st.dry_limit = cfg["dry_limit"] if cfg["watch"] else 1
+    st.run_id = run_id
 
-    proc = subprocess.Popen(full, shell=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, bufsize=1)
+    try:
+        proc = subprocess.Popen(adb_args, shell=False, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, bufsize=1)
+    except FileNotFoundError:
+        console.print(f"[red]ADB 命令未找到:[/] {adb_base_args()[0]}")
+        console.print("[yellow]建议:[/] 请安装 Android platform-tools,或设置 NHDD_ADB 为 adb 绝对路径。")
+        st.returncode = 127
+        return st
     # nhdd 进度在 stderr,结果文件行在 stdout
     out_th = threading.Thread(target=_pump, args=(proc.stdout, st, False), daemon=True)
     out_th.start()
@@ -412,12 +480,16 @@ def run_dump(pkg, cfg):
         for line in iter(proc.stderr.readline, ""):
             _parse_line(line.rstrip(), st)
             live.update(render_dashboard(st, pkg), refresh=True)
-        proc.wait()
+        st.returncode = proc.wait()
         out_th.join(timeout=2)
         st.done = True
         live.update(render_dashboard(st, pkg), refresh=True)
 
     console.print()
+    if st.returncode != 0:
+        last = "\n".join(st.last_lines)
+        console.print(f"[red]nhdd 执行失败,退出码 {st.returncode}[/]")
+        console.print(f"[yellow]建议:[/] {command_hint('请检查 root 命令、目标进程状态和 stealth2/relaxed 参数。', last)}")
     if st.finished_summary:
         console.print(Panel(st.finished_summary, title="[bold green]结果[/]",
                             border_style="green", box=box.ROUNDED))
@@ -505,8 +577,8 @@ def auto_classify_and_fix(dex_dir, local_dir):
     # 写日志
     log_path = os.path.join(local_dir, "log.txt")
     try:
-        with open(log_path, "w", encoding="utf-8") as lf:
-            lf.write("DEX Validation Report\n")
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write("\nDEX Validation Report\n")
             lf.write(f"{'='*40}\n")
             lf.write(f"Total: {stats['total']}  OK: {stats['ok']}  "
                      f"Fixed: {stats['fixed']}  Bad: {stats['bad']}\n\n")
@@ -516,6 +588,31 @@ def auto_classify_and_fix(dex_dir, local_dir):
                     lf.write(f"  {name}\n")
     except OSError:
         pass
+
+
+def write_run_log(local_dir, pkg, run_id, st, dex_count, so_count, total_size, pulled_ok):
+    log_path = os.path.join(local_dir, "log.txt")
+    try:
+        with open(log_path, "w", encoding="utf-8") as lf:
+            lf.write("NHDD TUI Run Summary\n")
+            lf.write(f"{'='*40}\n")
+            lf.write(f"Package: {pkg}\n")
+            lf.write(f"Run ID: {run_id}\n")
+            lf.write(f"Device dir: {DEVICE_DUMP_DIR}\n")
+            lf.write(f"Return code: {st.returncode}\n")
+            lf.write(f"Pulled OK: {pulled_ok}\n")
+            lf.write(f"Rounds: {st.round}\n")
+            lf.write(f"Processes: {st.processes}\n")
+            lf.write(f"DEX files: {dex_count}\n")
+            lf.write(f"SO files: {so_count}\n")
+            lf.write(f"Total size: {total_size}\n")
+            if st.last_lines:
+                lf.write("\nLast nhdd lines:\n")
+                for line in st.last_lines:
+                    lf.write(f"  {line}\n")
+            lf.write("\n")
+    except OSError as e:
+        console.print(f"[yellow]写入运行日志失败:[/] {e}")
 
 
 def auto_classify_and_fix_so(so_dir, local_dir):
@@ -574,24 +671,44 @@ def auto_classify_and_fix_so(so_dir, local_dir):
 
 
 def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd=""):
-    local = os.path.join(output_dir, pkg)
-    os.makedirs(local, exist_ok=True)
-    # 防御:拉取前清空本地 dex/so 子目录的旧文件,避免上次同 app 结果残留合并进来。
-    for sub, exts in (("dex", (".dex",)), ("so", (".so",))):
-        sub_local = os.path.join(local, sub)
-        if os.path.isdir(sub_local):
-            for fn in os.listdir(sub_local):
-                if any(fn.endswith(e) for e in exts):
-                    try: os.remove(os.path.join(sub_local, fn))
-                    except OSError: pass
+    run_id = st.run_id or make_run_id()
+    local = os.path.join(output_dir, pkg, run_id)
+    try:
+        os.makedirs(local, exist_ok=True)
+    except OSError as e:
+        console.print(f"[red]创建本地输出目录失败:[/] {local}")
+        console.print(f"[yellow]建议:[/] 请检查 -o/--output 路径是否存在权限问题。错误: {e}")
+        return local
+    st.local_dir = local
+
+    rc, out = adb_shell(f"test -d {quote_shell_cmd(DEVICE_DUMP_DIR)} && echo OK || echo MISSING")
+    if rc != 0 or "OK" not in out:
+        console.print(f"[red]设备端输出目录不存在:[/] {DEVICE_DUMP_DIR}")
+        console.print("[yellow]建议:[/] 请确认 nhdd 已成功运行,或检查 root 命令是否允许写入 /data/local/tmp。")
+        return local
+
+    rc, out = adb_shell(f"find {quote_shell_cmd(DEVICE_DUMP_DIR)} -type f | head -1")
+    if rc != 0:
+        console.print(f"[yellow]无法检查设备端输出文件:[/] {out or '(无输出)'}")
+    elif not out.strip():
+        console.print(f"[yellow]设备端没有生成 dump 文件:[/] {DEVICE_DUMP_DIR}")
+        console.print("[yellow]建议:[/] 请确认目标进程已运行,必要时启用 watch / stealth2 / relaxed。")
+
     rc, out = adb("pull", f"{DEVICE_DUMP_DIR}/.", local + os.sep)
     pulled_ok = rc == 0
+    if not pulled_ok:
+        console.print(f"[red]adb pull 失败:[/] {out or '(无输出)'}")
+        console.print(f"[yellow]建议:[/] {command_hint('请检查 ADB 连接、输出目录权限,设备端文件可能仍保留。', out)}")
 
     # 拉取成功后清理设备端 dump 文件
     if pulled_ok:
         console.print("[dim]清理设备端 dump 文件...[/]")
-        adb_shell_root(f"rm -rf {DEVICE_DUMP_DIR}", su_cmd)
-        console.print("[dim]设备端 dump 文件已清理[/]")
+        cleanup_rc, cleanup_out = adb_shell_root(f"rm -rf {quote_shell_cmd(DEVICE_DUMP_DIR)}", su_cmd)
+        if cleanup_rc == 0:
+            console.print("[dim]设备端 dump 文件已清理[/]")
+        else:
+            console.print(f"[yellow]设备端清理失败:[/] {cleanup_out or '(无输出)'}")
+            console.print("[yellow]建议:[/] 下次运行前会再次尝试清理；如持续失败,请手动 adb shell su -c rm。")
 
     # 统计本地文件
     dex_count = so_count = 0
@@ -610,14 +727,16 @@ def pull_and_summarize(pkg, st: DashState, output_dir, su_cmd=""):
     tbl.add_column("项目", style="bold")
     tbl.add_column("值", style="cyan")
     tbl.add_row("应用", pkg)
+    tbl.add_row("Run ID", run_id)
     tbl.add_row("扫描轮次", str(st.round))
     tbl.add_row("解析进程数", str(st.processes))
     tbl.add_row("DEX 文件", f"{dex_count} (去重后唯一)")
-    tbl.add_row("SO 文件", str(st.so_files))
+    tbl.add_row("SO 文件", str(so_count))
     tbl.add_row("总大小", f"{size_mb:.1f} MB")
     tbl.add_row("本地路径", local)
     console.print()
     console.print(tbl)
+    write_run_log(local, pkg, run_id, st, dex_count, so_count, total_size, pulled_ok)
 
     # 自动修复 + 分类
     dex_dir = os.path.join(local, "dex")
@@ -737,9 +856,15 @@ def main():
 
     st = run_dump(pkg, cfg)
     if st.processes == 0:
-        console.print("[yellow]未扫描到任何进程(目标未运行或被杀),跳过拉取。[/]")
-        console.print("[yellow]建议:先手动打开 app 再扫,或在配置里开启「重启 app 再扫」。[/]")
+        if st.returncode != 0:
+            console.print("[yellow]前置步骤或 nhdd 执行失败,跳过拉取。[/]")
+            console.print("[yellow]建议:先运行 make doctor 检查 adb/root/设备端 nhdd,再重试。[/]")
+        else:
+            console.print("[yellow]未扫描到任何进程(目标未运行或被杀),跳过拉取。[/]")
+            console.print("[yellow]建议:先手动打开 app 再扫,或在配置里开启「重启 app 再扫」。[/]")
         return
+    if st.returncode != 0:
+        console.print("[yellow]nhdd 返回非零退出码,仍尝试拉取可能已经写出的部分结果。[/]")
     pull_and_summarize(pkg, st, cfg["output_dir"], cfg.get("su_cmd", ""))
     console.print("\n[bold green]全部完成。[/]")
 
