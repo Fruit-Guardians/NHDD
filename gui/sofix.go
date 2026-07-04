@@ -10,13 +10,13 @@ import (
 // 与 dexfix.go 的 DEX 修复保持同样的处置口径:过小/非ELF 删除,不可修移 invalid/。
 
 const (
-	soMagic       = "\x7fELF"
-	soMinSize     = 0x40
-	elfEtDyn      = 3
-	elfEmArm      = 40
-	elfEmAarch64  = 183
-	elfPtLoad     = 1
-	elfPtDynamic  = 2
+	soMagic      = "\x7fELF"
+	soMinSize    = 0x40
+	elfEtDyn     = 3
+	elfEmArm     = 40
+	elfEmAarch64 = 183
+	elfPtLoad    = 1
+	elfPtDynamic = 2
 )
 
 // FixSoFile 修复单个 SO (内存 dump):p_offset=p_vaddr 对齐 + 补回 magic。
@@ -33,7 +33,7 @@ func FixSoFile(path string) (bool, bool, error) {
 
 	if !validateSoDeep(data) {
 		// 尝试修复后再校验
-		if newData := repairSo(data); newData != nil {
+		if newData, _ := repairSo(data); newData != nil {
 			if validateSoDeep(newData) {
 				data = newData
 			} else {
@@ -89,13 +89,13 @@ func FixSoDirectory(dir string) (*DexStats, error) {
 	return stats, nil
 }
 
-func repairSo(data []byte) []byte {
+func repairSo(data []byte) ([]byte, bool) {
 	if len(data) < soMinSize {
-		return nil
+		return nil, false
 	}
 	is64 := data[4] == 2
 	if data[4] != 1 && data[4] != 2 {
-		return nil
+		return nil, false
 	}
 	var ePhoff uint64
 	var ePhentsize, ePhnum uint16
@@ -109,10 +109,10 @@ func repairSo(data []byte) []byte {
 		ePhnum = binary.LittleEndian.Uint16(data[44:46])
 	}
 	if ePhnum == 0 || ePhentsize == 0 {
-		return nil
+		return nil, false
 	}
 	if uint64(ePhoff)+uint64(ePhnum)*uint64(ePhentsize) > uint64(len(data)) {
-		return nil
+		return nil, false
 	}
 
 	out := make([]byte, len(data))
@@ -155,9 +155,9 @@ func repairSo(data []byte) []byte {
 		}
 	}
 	if !changed {
-		return data
+		return data, false
 	}
-	return out
+	return out, true
 }
 
 // validateSoDeep 镜像 fix_so.py validate_elf_deep:ET_DYN + PHT 自洽 + LOAD 自洽 + .dynamic DT 指向。
@@ -236,10 +236,8 @@ func validateSoDeep(data []byte) bool {
 	// 遍历 .dynamic DT_* 项,校验关键 DT 指向在文件内
 	if dynFound && dynVaddr < uint64(realSize) {
 		entsize := uint64(16)
-		tagSize := uint64(8)
 		if !is64 {
 			entsize = 8
-			tagSize = 4
 		}
 		i := dynVaddr
 		count := uint64(0)
