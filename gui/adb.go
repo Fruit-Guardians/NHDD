@@ -1,13 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -24,8 +24,30 @@ func RunADB(adbPath string, hostPort string, args ...string) (string, error) {
 	}
 	cmdArgs = append(cmdArgs, args...)
 	cmd := exec.Command(adbPath, cmdArgs...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.SysProcAttr = hiddenWindowSysProcAttr()
 	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+// RunADBTimeout 执行 adb 命令，带超时控制。超时后命令会被 kill 并返回 ErrTimeout。
+func RunADBTimeout(timeout time.Duration, adbPath string, hostPort string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var cmdArgs []string
+	if hostPort != "" {
+		parts := strings.SplitN(hostPort, ":", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != "" {
+			cmdArgs = append(cmdArgs, "-H", strings.TrimSpace(parts[0]), "-P", strings.TrimSpace(parts[1]))
+		}
+	}
+	cmdArgs = append(cmdArgs, args...)
+	cmd := exec.CommandContext(ctx, adbPath, cmdArgs...)
+	cmd.SysProcAttr = hiddenWindowSysProcAttr()
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return strings.TrimSpace(string(out)), fmt.Errorf("adb command timed out after %v", timeout)
+	}
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -174,7 +196,7 @@ func PullDumpFiles(adbPath, hostPort, localDir, pkg, suCmd string) (int, int, er
 		return 0, 0, fmt.Errorf("create output dir failed: %w", err)
 	}
 
-	out, err := RunADB(adbPath, hostPort, "pull", deviceDumpDir+"/.", targetDir+string(os.PathSeparator))
+	out, err := RunADBTimeout(120*time.Second, adbPath, hostPort, "pull", deviceDumpDir+"/.", targetDir+string(os.PathSeparator))
 	if err != nil {
 		return 0, 0, fmt.Errorf("adb pull failed: %w%s", err, trimOutput(out))
 	}

@@ -7,6 +7,7 @@ import (
 	"hash/adler32"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -116,7 +117,7 @@ func FixDexDirectory(dir string) (*DexStats, error) {
 	}
 
 	stats := &DexStats{Total: len(dexFiles)}
-	badDir := filepath.Join(dir, "bad")
+	invalidDir := filepath.Join(dir, "invalid")
 
 	for _, f := range dexFiles {
 		fixed, deleted, err := FixDexFile(f)
@@ -133,8 +134,8 @@ func FixDexDirectory(dir string) (*DexStats, error) {
 		stats.OK++
 	}
 
-	// 统计 bad/ 目录
-	if entries, err := os.ReadDir(badDir); err == nil {
+	// 统计 invalid/ 目录中由 FixDexFile 隔离但未在主循环计数的 DEX
+	if entries, err := os.ReadDir(invalidDir); err == nil {
 		for _, e := range entries {
 			if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".dex") {
 				stats.BadFiles = append(stats.BadFiles, e.Name())
@@ -389,13 +390,9 @@ func RebuildMapList(data []byte) []byte {
 	}
 
 	// 按 offset 排序
-	for i := 0; i < len(entries)-1; i++ {
-		for j := i + 1; j < len(entries); j++ {
-			if entries[i].off > entries[j].off {
-				entries[i], entries[j] = entries[j], entries[i]
-			}
-		}
-	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].off < entries[j].off
+	})
 
 	mapListSize := 4 + len(entries)*12
 	oldMapOff := binary.LittleEndian.Uint32(data[0x34:0x38])

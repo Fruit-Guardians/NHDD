@@ -8,11 +8,18 @@ NHDD 终端版 (TUI) — No-Hook DEX/SO Dumper Terminal Interface
 Usage:
     python nhdd_tui.py                 # 交互式选 app
     python nhdd_tui.py com.example.app # 直接指定包名
+    python nhdd_tui.py --cli           # CLI 非交互模式
     python nhdd_tui.py --logo          # 只打印 logo
+    python nhdd_tui.py -v, --version   # 打印版本信息
     python nhdd_tui.py com.example.app -o D:\\dumps   # 指定输出目录(绝对路径最佳)
 
 Options:
     -o, --output DIR   本地输出目录(默认 ./nhdd_output)。填绝对路径可避免随运行目录漂移。
+    --su-cmd, --su CMD 指定 SU 命令(如 kp -c / ksud -c / su -c)。支持 {cmd} 模板。
+    --cli              CLI 非交互模式,使用默认最佳配置(stealth2+relaxed,适合二代壳)
+    --logo             只打印 NHDD logo 并退出
+    -v, --version      打印版本信息并退出
+    -h, --help         打印此帮助信息并退出
 """
 
 import os
@@ -94,15 +101,20 @@ def show_logo():
 # ---------------------------------------------------------------------------
 # ADB helpers (复用 nhdd_ctrl.py 逻辑)
 # ---------------------------------------------------------------------------
-def adb(*args, timeout=60):
-    """执行 adb 命令,返回 (rc, stdout+stderr)。"""
-    cmd = f"{ADB} " + " ".join(args)
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-    return r.returncode, (r.stdout + r.stderr).strip()
+def adb(*args, timeout=120):
+    """执行 adb 命令,返回 (rc, stdout+stderr)。用列表参数避免 shell 注入。"""
+    cmd = [ADB] + list(args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return -1, f"[!] adb command timed out after {timeout}s"
+    except FileNotFoundError:
+        return -1, f"[!] adb 命令未找到: {ADB}"
 
 
-def adb_shell(cmd, timeout=60):
-    return adb("shell", f'"{cmd}"', timeout=timeout)
+def adb_shell(cmd, timeout=120):
+    return adb("shell", cmd, timeout=timeout)
 
 
 def check_device():
@@ -245,7 +257,8 @@ def gather_config():
     cfg["relaxed"] = relaxed
     anon = Confirm.ask("启用 anon(仅扫描匿名内存映射)", default=False)
     cfg["anon"] = anon
-    su = Prompt.ask("SU 命令(读其他进程内存需要 root:留空=普通shell 或 su -c / ksud -c / kp -c)",
+    su = Prompt.ask("SU 命令(读其他进程内存需要 root:留空=普通shell 或 su -c / kp -c / ksud -c)\n"
+                    "      支持 {cmd} 模板(如 kp --exec-file {cmd})",
                     default="su -c")
     cfg["su_cmd"] = su.strip()
     out = Prompt.ask("本地输出目录", default="./nhdd_output")
@@ -626,6 +639,11 @@ def main():
     if "--logo" in args:
         show_logo()
         return
+    if "-v" in args or "--version" in args:
+        print(f"NHDD v{VERSION}")
+        print(f"Authors: {AUTHORS}")
+        print(f"Repository: {REPO_URL}")
+        return
     if "-h" in args or "--help" in args:
         print(__doc__)
         return
@@ -703,10 +721,10 @@ def main():
             "relaxed": True,
             "anon": False,
             "region_delay_ms": 2,
-            "su_cmd": su_cmd_override or "kp -c",
+            "su_cmd": su_cmd_override or "su -c",
             "output_dir": "./nhdd_output",
         }
-        console.print("[bold]CLI 模式:[/] stealth2 + relaxed + stealth (二代壳推荐)")
+        console.print("[bold]CLI 模式:[/] stealth2 + relaxed + stealth (二代壳推荐),默认 su -c(可用 --su 指定 kp -c / ksud -c)")
     else:
         cfg = gather_config()
 
