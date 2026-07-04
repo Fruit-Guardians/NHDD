@@ -265,6 +265,19 @@ TUI 会提示：
 - dump 模式选择 DEX、SO 或 ALL。
 - 本地输出目录。
 
+TUI 每次运行都会生成独立 run id，结果保存到：
+
+```text
+nhdd_output/<package>/<YYYYMMDD-HHMMSS>/
+├── dex/
+├── so/
+├── jnimap/
+├── maps/
+└── log.txt
+```
+
+这样重复测试同一个 App 时不会把旧结果混入本次统计。
+
 ## 桌面 GUI 使用方式
 
 桌面 GUI 基于 Go + Wails v2，提供原生窗口 + Web 前端，不需要 CGO 或 GCC。

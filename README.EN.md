@@ -264,6 +264,19 @@ The TUI lets you configure:
 - Dump mode: DEX, SO, or ALL.
 - Local output directory.
 
+Each TUI run gets an isolated run id. Results are saved under:
+
+```text
+nhdd_output/<package>/<YYYYMMDD-HHMMSS>/
+├── dex/
+├── so/
+├── jnimap/
+├── maps/
+└── log.txt
+```
+
+This keeps repeated tests for the same app from mixing old files into the current run statistics.
+
 ## Desktop GUI workflow
 
 The desktop GUI is built with Go + Wails v2, providing a native window with a Web frontend. No CGO or GCC required.
