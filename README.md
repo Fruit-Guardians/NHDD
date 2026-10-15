@@ -294,7 +294,7 @@ The TUI lets you configure:
 - Dump mode: DEX, SO, ALL, or APK-aware (default `apk`).
 - Local output directory.
 
-On-device flow: the TUI pushes the **v9 C++ binary** (`NHDD-cpp-modular` build output) to `/data/local/tmp/nhdd` and falls back to the root `nhdd` (v8) if not found, uses `/data/local/tmp/.cache/nhdd` as the per-run device output (wiped via the root command before each run), then pulls with `adb root` when available (fallback: root `chmod`/`chcon`). Note: raw `nhdd` CLI examples above write to `/data/local/tmp/nhdd_dump` by default, while the TUI and GUI manage their own output locations.
+On-device flow: the TUI pushes the **v9 C++ binary** (`NHDD-cpp-modular` build output) to `/data/local/tmp/nhdd` and falls back to the root `nhdd` (v8) if not found, uses `/data/local/tmp/nhdd_dump` as the device output directory — the same location the raw CLI and the GUI use (the TUI wipes and recreates it via the root command before each run, so the latest run wins) — then pulls with `adb root` when available (fallback: root `chmod`/`chcon`).
 
 After pulling, the TUI automatically repairs results using `fix_dex_checksum.py` / `fix_so.py` (same classification as the GUI), writes a `log.txt`, and can repack the dump into an APK with `scripts/repack_apk_fast.py` (unsigned, jadx-analysis only).
 
