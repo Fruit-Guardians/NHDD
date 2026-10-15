@@ -55,9 +55,12 @@ check:
 	@echo "=== gui Go vet ==="
 	cd gui && $(GO) vet ./... 2>&1 | grep -v "frontend/dist" | head -10; echo "  (OK if no output above)"
 
-# 占位: 运行测试 (有 test 后补)
+# 契约测试: Python / Go / v9 修复管线一致性 (tests/contract/compare.py)
 test:
-	@echo "no tests yet"
+	$(PYTHON) tests/contract/compare.py
+
+test-strict:
+	$(PYTHON) tests/contract/compare.py --strict
 
 format:
 	python3 -m black --check nhdd_tui.py fix_dex_checksum.py fix_so.py 2>/dev/null || true

@@ -1,0 +1,216 @@
+{
+  "schema": 1,
+  "fixtures": [
+    {
+      "name": "dex_valid.dex",
+      "kind": "dex",
+      "intent": "structurally valid minimal DEX",
+      "orig_sha256": "7b3e954a9dd535e0d67890fb61d8c6636bbb49a4bac7d8e747d13fd75a873713",
+      "size": 140,
+      "predict": {
+        "go": "OK",
+        "python": "OK",
+        "v9": "OK"
+      }
+    },
+    {
+      "name": "dex_bad_adler32.dex",
+      "kind": "dex",
+      "intent": "checksum field corrupted (dumped header)",
+      "orig_sha256": "af175e6cb02729179ca91d47f74f4bb5c22ebce1b94bd0fa7584a221d7b7947a",
+      "size": 140,
+      "predict": {
+        "go": "FIXED",
+        "python": "FIXED",
+        "v9": "FIXED"
+      },
+      "final_equiv": "dex_valid.dex"
+    },
+    {
+      "name": "dex_bad_sha1.dex",
+      "kind": "dex",
+      "intent": "SHA-1 signature corrupted",
+      "orig_sha256": "560142709064b83c8e63bad1edfa9f8088a8a3aabd7d22e4116945f5eeae043e",
+      "size": 140,
+      "predict": {
+        "go": "FIXED",
+        "python": "FIXED",
+        "v9": "FIXED"
+      },
+      "final_equiv": "dex_valid.dex"
+    },
+    {
+      "name": "dex_filesize_low.dex",
+      "kind": "dex",
+      "intent": "file_size smaller than actual length",
+      "orig_sha256": "ecd3491d1eeb39078fe2ac05689075ce75e827b475de7ac54e9c7ffb045666f8",
+      "size": 140,
+      "predict": {
+        "go": "FIXED",
+        "python": "FIXED",
+        "v9": "FIXED"
+      },
+      "final_equiv": "dex_valid.dex"
+    },
+    {
+      "name": "dex_header_size_bad.dex",
+      "kind": "dex",
+      "intent": "header_size != 0x70",
+      "orig_sha256": "b38c2473b6446b504d041dc06d0fcef5da0426f3405a36d80a5940d5670ea5f9",
+      "size": 140,
+      "predict": {
+        "go": "FIXED",
+        "python": "FIXED",
+        "v9": "FIXED"
+      },
+      "final_equiv": "dex_valid.dex"
+    },
+    {
+      "name": "dex_endian_bad.dex",
+      "kind": "dex",
+      "intent": "endian_tag wrong",
+      "orig_sha256": "e7e066e8e4b7c2915b3f7b7cb1a38f03b9e17aec10303d7411ad2ec6e9df9c4e",
+      "size": 140,
+      "predict": {
+        "go": "FIXED",
+        "python": "FIXED",
+        "v9": "FIXED"
+      },
+      "final_equiv": "dex_valid.dex"
+    },
+    {
+      "name": "dex_maplist_off_bad.dex",
+      "kind": "dex",
+      "intent": "map_off out of bounds -> needs rebuild",
+      "orig_sha256": "96d680a313618d46b2def95b28e73847266bff2a21ffd2acdcbe902dfc2e6640",
+      "size": 140,
+      "predict": {
+        "go": "FIXED",
+        "python": "FIXED",
+        "v9": "?"
+      }
+    },
+    {
+      "name": "dex_maplist_count_huge.dex",
+      "kind": "dex",
+      "intent": "map_size 0xFFFF -> needs rebuild",
+      "orig_sha256": "9642b463e63907bef79f248aa10baea276b73620b2fbed7625de537e4b1920ea",
+      "size": 140,
+      "predict": {
+        "go": "FIXED",
+        "python": "FIXED",
+        "v9": "?"
+      }
+    },
+    {
+      "name": "dex_too_small.dex",
+      "kind": "dex",
+      "intent": "0x60 bytes: quarantine to bad/",
+      "orig_sha256": "e9dffcc8238358820041e21c3c04e9a693f10afa242ac84b6e36524f64c0a81b",
+      "size": 96,
+      "predict": {
+        "go": "BAD",
+        "python": "BAD",
+        "v9": "N/A"
+      }
+    },
+    {
+      "name": "dex_magic_erased.dex",
+      "kind": "dex",
+      "intent": "magic erased: host-level quarantine",
+      "orig_sha256": "41f5b1fff6d53267108e77dde8508274fdf8fa77a6d171f80e5b5520945054f1",
+      "size": 140,
+      "predict": {
+        "go": "BAD",
+        "python": "BAD",
+        "v9": "N/A"
+      }
+    },
+    {
+      "name": "so_valid.so",
+      "kind": "so",
+      "intent": "valid dump-style ELF64 ET_DYN (no SHT)",
+      "orig_sha256": "549fc8869b1613b4418cd28a8ae9da1fde78fc6bba20a6eb4800fb1d3467cd14",
+      "size": 512,
+      "predict": {
+        "go": "OK",
+        "python": "FIXED",
+        "v9": "OK"
+      }
+    },
+    {
+      "name": "so_magic_erased.so",
+      "kind": "so",
+      "intent": "ELF magic erased",
+      "orig_sha256": "64935babf736892302f73c3beaf2b9907f0aeb7f04b38f33b1751a1b1202ca25",
+      "size": 512,
+      "predict": {
+        "go": "FIXED",
+        "python": "FIXED",
+        "v9": "FIXED"
+      },
+      "final_equiv": "so_valid.so"
+    },
+    {
+      "name": "so_offset_skew.so",
+      "kind": "so",
+      "intent": "p_offset != p_vaddr (raw mem dump)",
+      "orig_sha256": "2948579042eb0ad0755a90996ef36ed6db2c831c4087353948bdff2ee22b9ea7",
+      "size": 512,
+      "predict": {
+        "go": "FIXED",
+        "python": "FIXED",
+        "v9": "FIXED"
+      },
+      "final_equiv": "so_valid.so"
+    },
+    {
+      "name": "so_et_exec.so",
+      "kind": "so",
+      "intent": "ET_EXEC: Go baseline quarantines",
+      "orig_sha256": "ba4215d532aae8837b355c8c60606c07ad80d8f3d155f8594c5259d879355b53",
+      "size": 512,
+      "predict": {
+        "go": "BAD",
+        "python": "BAD",
+        "v9": "N/A"
+      }
+    },
+    {
+      "name": "so_tiny.so",
+      "kind": "so",
+      "intent": "0x30 bytes: quarantine",
+      "orig_sha256": "1f9a8a9339effe4f2b0027e148d4651c6d3bd81e5501961a26784b51e6f5a9e6",
+      "size": 48,
+      "predict": {
+        "go": "BAD",
+        "python": "BAD",
+        "v9": "N/A"
+      }
+    },
+    {
+      "name": "so_not_elf.so",
+      "kind": "so",
+      "intent": "non-ELF garbage: quarantine",
+      "orig_sha256": "c9d8e3352f9f790d8b0be13cb1c18ed7963009888be04acc065ee5efbd934076",
+      "size": 512,
+      "predict": {
+        "go": "BAD",
+        "python": "BAD",
+        "v9": "N/A"
+      }
+    },
+    {
+      "name": "so_phnum_bogus.so",
+      "kind": "so",
+      "intent": "e_phnum=0xFFFF: PHT bogus",
+      "orig_sha256": "9da6d84f7bde42c7111f07e6363443704efef97001887365d63a41141c301be8",
+      "size": 512,
+      "predict": {
+        "go": "BAD",
+        "python": "BAD",
+        "v9": "N/A"
+      }
+    }
+  ]
+}
