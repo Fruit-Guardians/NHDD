@@ -27,16 +27,17 @@ For second-generation extraction shells, use NHDD with `--stealth2 --relaxed` mo
 
 | Component | Status | Notes |
 |---|---:|---|
-| `nhdd.c` | Ready | Core Android ARM64 scanner. v8.0: supports DEX/SO, package multi-process scanning, snapshots, watch mode, de-duplication, DEX checksum repair, stealth2 (process_vm_readv), relaxed DEX validation, and anonymous mapping scan. |
-| `nhdd_tui.py` | Recommended | Terminal UI with root-command configuration, watch progress, and result pulling. Best daily entry point in this snapshot. |
-| `gui/` | Wails GUI | Go + Wails v2 desktop GUI with Web frontend. No CGO required. |
-| `fix_dex_checksum.py` | Ready | Standalone DEX header, SHA-1, and Adler32 repair tool. |
+| `NHDD-cpp-modular/` | **v9 — recommended device binary** | C++17 class-modular rewrite of `nhdd.c` (v9.0-cpp-class). Keeps all v8 semantics (stealth2/relaxed/anon/watch) and adds no-hook **JNIMAP scanning** (`--jnimap`, recover `JNINativeMethod` bindings to JSONL), `--analyze-so`, `--continuous` maps monitoring. TUI/GUI push this binary first and fall back to the root `nhdd` (v8). |
+| `nhdd.c` | Ready (v8 baseline) | Single-file static ARM64 scanner: DEX/SO, package multi-process scanning, snapshots, watch mode, de-duplication, built-in DEX checksum repair, built-in SoFixer-style ELF repair, stealth2 (process_vm_readv), relaxed DEX validation, anonymous mapping scan. |
+| `nhdd_tui.py` | Recommended | Terminal controller (v9.0-cpp-class): device/app selection, watch live progress (v8/v9 output formats), result pulling, local DEX/SO repair, APK repack. Best daily entry point. |
+| `gui/` | Wails GUI | Go + Wails v2 desktop GUI with Web frontend. No CGO required. Mirrors the TUI flow including built-in DEX/SO repair and APK repack. |
+| `fix_dex_checksum.py` / `fix_so.py` | Ready | Standalone repair libraries + CLIs. Their classification semantics (OK / fixed / moved to `bad/`) are deliberately aligned with the Go GUI ports (`gui/dexfix.go`, `gui/sofix.go`) and the on-device C/C++ repair — keep all three in sync when changing repair logic. |
 
 ## Features
 
 - **External memory reading**: reads target process memory via `/proc/<pid>/mem` or `process_vm_readv(2)` (stealth2); no target-process injection.
 - **DEX dumping**: scans for `dex\n` magic (or `endian_tag` in relaxed mode), reads DEX `file_size`, and exports data page by page.
-- **SO dumping**: scans ELF ET_DYN mappings and optionally repairs dumps with SoFixer.
+- **SO dumping**: maps-driven ELF scan (grouped by path+inode), system libraries and non-app objects are skipped by policy, app SOs are dumped and repaired in-process (p_offset alignment, ELF magic restore). An external SoFixer binary is **no longer required** — the repair is built in (GUI/Python ports keep the same semantics; the `third_party/SoFixer` submodule is a legacy/optional dependency).
 - **Package multi-process scan**: when given a package name, scans all matching processes, including `:remote` child processes.
 - **Snapshot mode**: `--snapshot N --interval T` performs repeated fixed-round scans.
 - **Watch mode**: `--watch [K]` scans until K consecutive dry rounds, useful for lazy-loaded DEX while you navigate the app.
@@ -62,7 +63,7 @@ Independent root process: nhdd
 │   OR scans for endian_tag 0x12345678  (--relaxed mode)
 ├── Computes dump ranges from DEX headers or ELF program headers
 ├── Writes files under out_dir/dex and out_dir/so
-└── Repairs DEX checksums and optionally invokes SoFixer
+└── Repairs DEX checksums and ELF layout in-process (no external repair step)
 ```
 
 `pread(/proc/<pid>/mem, ..., virtual_address)` uses the target process virtual address as the file offset. If root permissions and system policy allow it, the scanner can read bytes from the target process address space without executing code inside that process.
@@ -96,11 +97,26 @@ adb push ./nhdd /data/local/tmp/nhdd
 adb shell chmod 755 /data/local/tmp/nhdd
 ```
 
-If you want automatic SO repair, also push a SoFixer binary:
+If SO repair is built in (v8/v9 both repair ELF layout on-device), pushing an external SoFixer is **optional/legacy**. If you still want the external tool:
 
 ```bash
 adb push ./sofixer /data/local/tmp/sofixer
 adb shell chmod 755 /data/local/tmp/sofixer
+```
+
+## Build the C++ v9 scanner (recommended device binary)
+
+`NHDD-cpp-modular/` is a class-modular C++17 rewrite of `nhdd.c` with the same scan semantics plus JNIMAP/analyze-so/continuous capabilities. The TUI and GUI prefer its output when present.
+
+```bash
+# Auto-discovers NDK and builds (output defaults under NHDD-cpp-modular/)
+./scripts/build_nhdd_cpp.sh
+
+# Or with make (single translation unit: src/main.cpp includes all *.hpp)
+make android -C NHDD-cpp-modular CXX=/path/to/ndk/.../bin/aarch64-linux-android34-clang++
+
+# Push
+make push -C NHDD-cpp-modular   # adb push nhdd /data/local/tmp/nhdd
 ```
 
 ## Environment doctor
@@ -234,7 +250,20 @@ adb shell kp -c '/data/local/tmp/nhdd 12345 /data/local/tmp/nhdd_dump --stealth2
 | `--anon` | Only scan anonymous memory mappings (skip file-backed regions). |
 | `--region-delay MS` | Sleep MS milliseconds between memory map regions. |
 | `--name NAME` / `--disguise NAME` | Change the scanner’s visible `/proc/self/comm` and `/proc/self/cmdline` name. |
-| `--sofixer PATH` | Specify SoFixer path. Defaults to `/data/local/tmp/sofixer` or `/data/local/tmp/SoFixer64`. |
+
+### v9-only options (`NHDD-cpp-modular`, not available in `nhdd.c` v8)
+
+| Option | Description |
+|---|---|
+| `--jnimap` | No-hook JNI binding scan: externally recovers registered `JNINativeMethod` tables (both `JNI_OnLoad`-registered and static `RegisterNatives` form) and writes `jnimap_<pid>.jsonl` mapping `className + methodName + signature -> fnPtr / SO offset`. |
+| `--analyze-so` | One-shot SO analysis mode (dump + deep ELF analysis + JNIMAP targeting the dumped libraries). |
+| `--jni-lib NAME` / `--jni-min N` / `--jni-full` / `--jni-max-region N` | Restrict/tune JNI table scanning (target library, minimum entries, full-table mode, region cap). |
+| `--fnptrs` | Also record raw function-pointer candidates. |
+| `--continuous` | Continuous maps monitoring with timeline output (detects SOs that appear dynamically). |
+| `--monitor-duration S` / `--monitor-interval T` / `--monitor-verbose` | Tuning for `--continuous` mode. |
+| `--save-maps` | Persist each round's `/proc/<pid>/maps` snapshot for offline diffing. |
+| `--target-so PATH` / `--dump-target-so` / `--no-deep-so` | Target specific SO files; control deep ELF handling. |
+| `--apk` | APK-aware mode (used by TUI default flow: also pulls the original APK for carrier-based SO repair and repack). |
 
 ## Recommended TUI workflow
 
@@ -262,8 +291,12 @@ The TUI lets you configure:
 - Whether to restart the app.
 - Whether to use watch mode.
 - Root command: `su -c`, `kp -c`, `ksud -c`, or empty.
-- Dump mode: DEX, SO, or ALL.
+- Dump mode: DEX, SO, ALL, or APK-aware (default `apk`).
 - Local output directory.
+
+On-device flow: the TUI pushes the **v9 C++ binary** (`NHDD-cpp-modular` build output) to `/data/local/tmp/nhdd` and falls back to the root `nhdd` (v8) if not found, uses `/data/local/tmp/.cache/nhdd` as the per-run device output (wiped via the root command before each run), then pulls with `adb root` when available (fallback: root `chmod`/`chcon`). Note: raw `nhdd` CLI examples above write to `/data/local/tmp/nhdd_dump` by default, while the TUI and GUI manage their own output locations.
+
+After pulling, the TUI automatically repairs results using `fix_dex_checksum.py` / `fix_so.py` (same classification as the GUI), writes a `log.txt`, and can repack the dump into an APK with `scripts/repack_apk_fast.py` (unsigned, jadx-analysis only).
 
 Each TUI run gets an isolated run id. Results are saved under:
 
@@ -295,7 +328,9 @@ NHDD-run/
 └── nhdd
 ```
 
-The GUI supports: ADB connection, app list, root command configuration, dump mode (DEX/SO/ALL), watch mode, and result pulling.
+The GUI searches for the device binary in this order: executable directory → parent directory → `NHDD-cpp-modular/` build output → repository root. The v9 build is preferred when present.
+
+The GUI supports: ADB connection (local or remote `host:port`), app list, root command configuration, dump mode (DEX/SO/ALL), watch mode with live progress, result pulling, built-in DEX/SO repair (`gui/dexfix.go` / `gui/sofix.go`, Go ports of the Python repair semantics), and APK repack (replace `classes*.dex` / SO inside a copy of the original APK, strip old signatures; output is unsigned and intended for static analysis only).
 
 ## Standalone DEX repair
 
@@ -364,14 +399,21 @@ Not in this snapshot. The `app/` module is not included in this repository.
 
 ```text
 NHDD/
-├── nhdd.c                         # Android-side core scanner
-├── fix_dex_checksum.py            # Standalone DEX repair tool
-├── nhdd_tui.py                    # Recommended TUI controller
+├── nhdd.c                         # v8 single-file Android ARM64 scanner (baseline)
+├── NHDD-cpp-modular/              # v9 C++17 class-modular scanner (recommended device binary)
+│   ├── Makefile                   #   make android / host / push
+│   └── src/                       #   main.cpp + *.hpp header modules (scanner, JNIMAP, SO, config…)
+├── nhdd_tui.py                    # Recommended host-side controller (rich TUI)
+├── fix_dex_checksum.py            # Standalone DEX repair library + CLI
+├── fix_so.py                      # Standalone dumped-SO ELF repair library + CLI
 ├── scripts/
-│   ├── build_nhdd_android.sh      # Build Android ARM64 nhdd
-│   ├── build_fyne_windows.ps1
-│   └── build_fyne_windows_from_linux.sh
-├── gui/                           # Go/Wails v2 desktop GUI
+│   ├── build_nhdd_android.py      # Cross-platform v8 builder (auto-discovers NDK)
+│   ├── build_nhdd_android.sh/.ps1 # Shell/PowerShell wrappers
+│   ├── build_nhdd_cpp.sh          # v9 C++ builder
+│   ├── doctor.py                  # Environment health check (make doctor)
+│   └── repack_apk_fast.py         # APK repack used by the TUI
+├── gui/                           # Go/Wails v2 desktop GUI (+ Vue 3 frontend, Go repair ports)
+├── third_party/SoFixer            # Optional legacy submodule (repair is built in now)
 └── BUILD_WINDOWS.md               # Windows/Linux GUI build notes
 ```
 
@@ -380,7 +422,7 @@ NHDD/
 - **漫宿骄盛**
 - **weixiao**
 
-Repository: https://github.com/mansujiaosheng/NHDD
+Repository: https://github.com/Fruit-Guardians/NHDD
 
 ## Authorized use only
 
