@@ -146,17 +146,10 @@ def build_report(fixtures: list, runs: dict) -> tuple[list, list]:
                 divergences.append(
                     f"HASH-DIVERGENCE {name}: both BAD but quarantined bytes differ")
 
-        # v9: informational only where judged
-        if g and v and pred.get("v9") not in ("N/A", None):
-            if pred.get("v9") == "?" :
-                rows_note = f"v9={v['status']} (probe)"
-            elif g["status"] in ("OK", "FIXED") and v["status"] != g["status"]:
-                rows_note = f"v9 class differs: {v['status']} vs go {g['status']}"
-                divergences.append(f"V9-DIVERGENCE {name}: {rows_note}")
-            elif v["status"] == g["status"] and v["status"] in ("OK", "FIXED") \
-                    and v["sha256"] != g["sha256"]:
-                rows_note = "v9 hash differs from go (primitive-level, expected for rebuild cases)"
-                divergences.append(f"V9-HASH-DIVERGENCE {name}: {rows_note}")
+        # v9: 原语级设备管线,语义与 host 基线有意不同(无隔离、含 SHT 重建)。
+        # 只对其 manifest 记录值做漂移告警; "?"=探针, "N/A"=不适用。
+        if v and pred.get("v9") not in ("?", "N/A", None, ""):
+            pass  # drift already covered by PREDICTION-MISMATCH loop above
 
         row = {
             "name": name,

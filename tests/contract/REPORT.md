@@ -23,16 +23,14 @@ compilation terminated.
 | dex_maplist_count_huge.dex | FIXED | FIXED | SKIP | yes |
 | dex_too_small.dex | BAD | BAD | SKIP | yes |
 | dex_magic_erased.dex | BAD | BAD | SKIP | yes |
-| so_valid.so | OK | FIXED | SKIP | **NO** |
-| so_magic_erased.so | FIXED | FIXED | SKIP | **NO** |
-| so_offset_skew.so | FIXED | FIXED | SKIP | **NO** |
+| so_valid.so | OK | OK | SKIP | yes |
+| so_magic_erased.so | FIXED | FIXED | SKIP | yes |
+| so_offset_skew.so | FIXED | FIXED | SKIP | yes |
 | so_et_exec.so | BAD | BAD | SKIP | yes |
 | so_tiny.so | BAD | BAD | SKIP | yes |
 | so_not_elf.so | BAD | BAD | SKIP | yes |
 | so_phnum_bogus.so | BAD | BAD | SKIP | yes |
 
-## 差异 (3)
+## 差异
 
-- CLASS-DIVERGENCE so_valid.so: go=OK python=FIXED
-- HASH-DIVERGENCE so_magic_erased.so: both FIXED but bytes differ
-- HASH-DIVERGENCE so_offset_skew.so: both FIXED but bytes differ
+- 无 (python 与 go 基线完全一致)

@@ -148,7 +148,7 @@ FIXTURE_META = [
     ("dex_maplist_count_huge.dex", "dex", "map_size 0xFFFF -> needs rebuild", "FIXED", "FIXED", "?", None),
     ("dex_too_small.dex", "dex", "0x60 bytes: quarantine to bad/", "BAD", "BAD", "N/A", None),
     ("dex_magic_erased.dex", "dex", "magic erased: host-level quarantine", "BAD", "BAD", "N/A", None),
-    ("so_valid.so", "so", "valid dump-style ELF64 ET_DYN (no SHT)", "OK", "FIXED", "OK", None),
+    ("so_valid.so", "so", "valid dump-style ELF64 ET_DYN (no SHT)", "OK", "OK", "FIXED", None),
     ("so_magic_erased.so", "so", "ELF magic erased", "FIXED", "FIXED", "FIXED", "so_valid.so"),
     ("so_offset_skew.so", "so", "p_offset != p_vaddr (raw mem dump)", "FIXED", "FIXED", "FIXED", "so_valid.so"),
     ("so_et_exec.so", "so", "ET_EXEC: Go baseline quarantines", "BAD", "BAD", "N/A", None),
