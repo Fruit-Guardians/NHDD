@@ -18,9 +18,10 @@ import (
 
 // App 主应用结构体
 type App struct {
-	ctx     context.Context
-	mu      sync.Mutex
-	dumping bool
+	ctx       context.Context
+	mu        sync.Mutex
+	dumping   bool
+	repacking bool
 }
 
 // NewApp 创建新的 App 实例
@@ -35,20 +36,35 @@ func (a *App) startup(ctx context.Context) {
 
 // nhddBinaryPath 查找 nhdd 二进制文件路径
 func nhddBinaryPath() string {
+	// Check multiple locations in priority order
+	candidates := []string{}
+
 	exePath, err := os.Executable()
-	if err != nil {
-		return "nhdd"
+	if err == nil {
+		// 1) Same dir as GUI exe
+		candidates = append(candidates, filepath.Join(filepath.Dir(exePath), "nhdd"))
+		// 2) Parent dir
+		candidates = append(candidates, filepath.Join(filepath.Dir(exePath), "..", "nhdd"))
 	}
-	candidate := filepath.Join(filepath.Dir(exePath), "nhdd")
-	if _, err := os.Stat(candidate); err == nil {
-		return candidate
-	}
-	candidate = filepath.Join(filepath.Dir(exePath), "..", "nhdd")
-	if abs, err := filepath.Abs(candidate); err == nil {
-		if _, err := os.Stat(abs); err == nil {
-			return abs
+	// 3) NHDD-cpp-modular/src/ (C++ OOP dev build)
+	candidates = append(candidates,
+		filepath.Join("..", "NHDD-cpp-modular", "src", "nhdd"),
+		filepath.Join("NHDD-cpp-modular", "src", "nhdd"),
+	)
+	// 4) Same as original NHDD project root
+	candidates = append(candidates,
+		filepath.Join("..", "nhdd"),
+		filepath.Join("..", "..", "nhdd"),
+	)
+
+	for _, c := range candidates {
+		if abs, err := filepath.Abs(c); err == nil {
+			if _, err := os.Stat(abs); err == nil {
+				return abs
+			}
 		}
 	}
+	// Fallback: rely on PATH
 	return "nhdd"
 }
 
@@ -79,7 +95,10 @@ type DumpParams struct {
 	OutputDir     string `json:"outputDir"`
 	AdbPath       string `json:"adbPath"`
 	HostPort      string `json:"hostPort"`
-	Mode          string `json:"mode"`          // dex, so, all
+	Mode          string `json:"mode"`          // apk, dex, so
+	JniMap        bool   `json:"jniMap"`        // 启用 JNIMAP 扫描
+	JniLib        string `json:"jniLib"`        // JNIMAP 库过滤 (可选)
+	JniMin        int    `json:"jniMin"`        // JNIMAP 最小连续条目 (默认2)
 	Restart       bool   `json:"restart"`       // 是否重启 app
 	Watch         bool   `json:"watch"`         // 是否启用 watch
 	DryLimit      int    `json:"dryLimit"`      // watch 连续几轮无新 DEX 停止
@@ -121,13 +140,16 @@ type WatchProgress struct {
 	Done      bool `json:"done"`
 }
 
-// nhdd 输出解析正则
+// nhdd 输出解析正则 (v9.0-cpp format)
 var (
-	reRound   = regexp.MustCompile(`round\s+(\d+):\s*\+(\d+)\s+new unique DEX\s+\(total=(\d+),\s*dry=(\d+)/(\d+)`)
-	reProc    = regexp.MustCompile(`Resolved.*->\s*(\d+)\s+process`)
-	reDone    = regexp.MustCompile(`Done\..*DEX unique=(\d+).*dedup_skipped=(\d+).*SO=(\d+)`)
-	reDexFile = regexp.MustCompile(`^\[\+\]\s+DEX:`)
-	reSoFile  = regexp.MustCompile(`^\[\+\]\s+SO:`)
+	reRound    = regexp.MustCompile(`round\s+(\d+):\s*\+(\d+)\s+new\s+(?:unique\s+)?.*\(DEX=(\d+),\s*SO=(\d+).*dry=(\d+)/(\d+)`)
+	reRoundOld = regexp.MustCompile(`round\s+(\d+):\s*\+(\d+)\s+new unique DEX\s+\(total=(\d+),\s*dry=(\d+)/(\d+)`)
+	reProc     = regexp.MustCompile(`Resolved.*->\s*(\d+)\s+process`)
+	reDone     = regexp.MustCompile(`Done\..*DEX(?: unique)?=(\d+).*\((\d+)\s*hits.*(\d+)\s*dedup\).*SO=(\d+)`)
+	reDoneOld  = regexp.MustCompile(`Done\..*DEX unique=(\d+).*dedup_skipped=(\d+).*SO=(\d+)`)
+	reDexFile  = regexp.MustCompile(`^\[\+\]\s+DEX`)
+	reSoFile   = regexp.MustCompile(`^\[\+\]\s+SO[^\(]`) // match [+] SO: but not [+] SO(memelf)
+	reSoMemElf = regexp.MustCompile(`^\[\+\]\s+SO\(memelf\)`)
 )
 
 // StartDump 执行脱壳流程（对齐 TUI 逻辑）
@@ -148,7 +170,7 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 
 	// 默认值
 	if params.Mode == "" {
-		params.Mode = "dex"
+		params.Mode = "apk"
 	}
 	if params.OutputDir == "" {
 		params.OutputDir = "./nhdd_output"
@@ -201,11 +223,20 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 	switch strings.ToLower(strings.TrimSpace(params.Mode)) {
 	case "so":
 		modeArg = "--so"
-	case "all":
+	case "apk", "all":
 		modeArg = "--all"
 	}
 
 	nhddCmdParts := []string{"/data/local/tmp/nhdd", pkg, deviceDumpDir, modeArg}
+	if params.JniMap {
+		nhddCmdParts = append(nhddCmdParts, "--jnimap")
+		if params.JniLib != "" {
+			nhddCmdParts = append(nhddCmdParts, "--jni-lib", params.JniLib)
+		}
+		if params.JniMin > 0 {
+			nhddCmdParts = append(nhddCmdParts, "--jni-min", strconv.Itoa(params.JniMin))
+		}
+	}
 	if params.Watch {
 		nhddCmdParts = append(nhddCmdParts, "--watch", strconv.Itoa(params.DryLimit),
 			"--max-seconds", strconv.Itoa(params.MaxSeconds),
@@ -314,7 +345,7 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 	if err != nil {
 		a.log(fmt.Sprintf("修复 DEX 出错: %v", err))
 	} else {
-		a.log(fmt.Sprintf("[6/6] 修复完成: %d OK, %d 修复, %d 损坏已隔离", stats.OK, stats.Fixed, stats.Bad))
+		a.log(fmt.Sprintf("[6/6] DEX 修复: %d OK, %d 修复, %d 损坏", stats.OK, stats.Fixed, stats.Bad))
 		if stats.Bad > 0 {
 			a.log(fmt.Sprintf("  [警告] 损坏文件: %v", stats.BadFiles))
 		}
@@ -335,7 +366,7 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 		if soErr != nil {
 			a.log(fmt.Sprintf("修复 SO 出错: %v", soErr))
 		} else {
-			a.log(fmt.Sprintf("[6b] SO 修复完成: %d OK, %d 修复, %d 损坏已隔离", soStats.OK, soStats.Fixed, soStats.Bad))
+			a.log(fmt.Sprintf("[6b] SO 增强修复: %d OK, %d 修复, %d 损坏", soStats.OK, soStats.Fixed, soStats.Bad))
 			if soStats.Bad > 0 {
 				a.log(fmt.Sprintf("  [警告] 损坏 SO: %v", soStats.BadFiles))
 			}
@@ -360,6 +391,24 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 	a.log(fmt.Sprintf("脱壳完成! %d DEX, %d SO, %.2f KB, 输出: %s",
 		dexCount, soCount, float64(totalSize)/1024.0, targetDir))
 
+	// APK 模式: 自动生成 jadx 分析 APK
+	if strings.ToLower(strings.TrimSpace(params.Mode)) == "apk" {
+		a.log("APK 模式: 自动生成 jadx 分析 APK...")
+		repackParams := RepackParams{
+			Package:   pkg,
+			DumpDir:   targetDir,
+			OutputDir: outputDir,
+			AdbPath:   params.AdbPath,
+			HostPort:  params.HostPort,
+		}
+		repackResult, repackErr := DoRepackAPK(repackParams, a.log)
+		if repackErr != nil {
+			a.log(fmt.Sprintf("自动 repack 失败: %v", repackErr))
+		} else if repackResult.Success {
+			a.log(fmt.Sprintf("分析 APK: %s", repackResult.OutputAPK))
+		}
+	}
+
 	return &DumpResult{
 		Success:    true,
 		DexCount:   dexCount,
@@ -376,7 +425,18 @@ func (a *App) StartDump(params DumpParams) *DumpResult {
 
 // parseNhddLine 解析 nhdd 输出行，更新进度
 func parseNhddLine(line string, progress *WatchProgress) {
+	// v9.0 format: round N: +X new (DEX=Y, SO=Z, dry=a/b)
 	if m := reRound.FindStringSubmatch(line); m != nil {
+		progress.Round, _ = strconv.Atoi(m[1])
+		progress.NewThis, _ = strconv.Atoi(m[2])
+		progress.Total, _ = strconv.Atoi(m[3])
+		progress.SoFiles, _ = strconv.Atoi(m[4])
+		progress.Dry, _ = strconv.Atoi(m[5])
+		progress.DryLimit, _ = strconv.Atoi(m[6])
+		return
+	}
+	// v8.0 format: round N: +X new unique DEX (total=Y, dry=a/b)
+	if m := reRoundOld.FindStringSubmatch(line); m != nil {
 		progress.Round, _ = strconv.Atoi(m[1])
 		progress.NewThis, _ = strconv.Atoi(m[2])
 		progress.Total, _ = strconv.Atoi(m[3])
@@ -388,7 +448,15 @@ func parseNhddLine(line string, progress *WatchProgress) {
 		progress.Processes, _ = strconv.Atoi(m[1])
 		return
 	}
+	// v9.0 format: Done. rounds=N, procs=N, DEX=N (N hits, N dedup), SO=N, JNI=N
 	if m := reDone.FindStringSubmatch(line); m != nil {
+		progress.Total, _ = strconv.Atoi(m[1])
+		progress.Dedup, _ = strconv.Atoi(m[3])
+		progress.SoFiles, _ = strconv.Atoi(m[4])
+		return
+	}
+	// v8.0 format: Done..DEX unique=N..dedup_skipped=N..SO=N
+	if m := reDoneOld.FindStringSubmatch(line); m != nil {
 		progress.Total, _ = strconv.Atoi(m[1])
 		progress.Dedup, _ = strconv.Atoi(m[2])
 		progress.SoFiles, _ = strconv.Atoi(m[3])
@@ -398,7 +466,7 @@ func parseNhddLine(line string, progress *WatchProgress) {
 		progress.DexFiles++
 		return
 	}
-	if reSoFile.MatchString(line) {
+	if reSoFile.MatchString(line) || reSoMemElf.MatchString(line) {
 		progress.SoFiles++
 	}
 }
@@ -424,6 +492,29 @@ func (a *App) IsDumping() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.dumping
+}
+
+// RepackAPK 重打包 APK（将修复后的 DEX/SO 替换回原始 APK，供 jadx 分析，不签名）
+func (a *App) RepackAPK(params RepackParams) *RepackResult {
+	a.mu.Lock()
+	if a.repacking {
+		a.mu.Unlock()
+		return &RepackResult{Success: false, Message: "正在重打包中，请等待..."}
+	}
+	a.repacking = true
+	a.mu.Unlock()
+
+	defer func() {
+		a.mu.Lock()
+		a.repacking = false
+		a.mu.Unlock()
+	}()
+
+	result, err := DoRepackAPK(params, a.log)
+	if err != nil {
+		return result
+	}
+	return result
 }
 
 // log 发送日志事件到前端

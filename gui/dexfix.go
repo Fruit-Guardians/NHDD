@@ -7,9 +7,15 @@ import (
 	"hash/adler32"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 )
+
+// moveToBadDir 将文件移到源文件所在目录的 bad/ 子目录
+func moveToBadDir(path string) error {
+	badDir := filepath.Join(filepath.Dir(path), "bad")
+	os.MkdirAll(badDir, 0755)
+	return os.Rename(path, filepath.Join(badDir, filepath.Base(path)))
+}
 
 const (
 	dexMagic      = "dex\n"
@@ -26,13 +32,13 @@ func FixDexFile(path string) (bool, bool, error) {
 	}
 
 	if len(data) < dexMinSize {
-		os.Remove(path)
-		return false, true, fmt.Errorf("too small (%d bytes), deleted", len(data))
+		moveToBadDir(path)
+		return false, true, fmt.Errorf("too small (%d bytes), moved to bad/", len(data))
 	}
 
 	if string(data[0:4]) != dexMagic {
-		os.Remove(path)
-		return false, true, fmt.Errorf("not a DEX file, deleted")
+		moveToBadDir(path)
+		return false, true, fmt.Errorf("not a DEX file, moved to bad/")
 	}
 
 	// 深度验证：检查 map_list 和 section bounds
@@ -42,16 +48,13 @@ func FixDexFile(path string) (bool, bool, error) {
 			data = newData
 			// 重建后重新验证
 			if !validateDexDeep(data) {
-				os.Remove(path)
-				return false, true, fmt.Errorf("still invalid after map_list rebuild, deleted")
+				moveToBadDir(path)
+				return false, true, fmt.Errorf("still invalid after map_list rebuild, moved to bad/")
 			}
 		} else {
-			// 无法修复，移到 invalid/ 子目录
-			invalidDir := filepath.Join(filepath.Dir(path), "invalid")
-			os.MkdirAll(invalidDir, 0755)
-			newPath := filepath.Join(invalidDir, filepath.Base(path))
-			os.Rename(path, newPath)
-			return false, true, fmt.Errorf("invalid DEX (map_list/section corrupted), moved to invalid/")
+			// 无法修复，移到 bad/ 子目录
+			moveToBadDir(path)
+			return false, true, fmt.Errorf("invalid DEX (map_list/section corrupted), moved to bad/")
 		}
 	}
 
@@ -117,7 +120,6 @@ func FixDexDirectory(dir string) (*DexStats, error) {
 	}
 
 	stats := &DexStats{Total: len(dexFiles)}
-	invalidDir := filepath.Join(dir, "invalid")
 
 	for _, f := range dexFiles {
 		fixed, deleted, err := FixDexFile(f)
@@ -133,21 +135,28 @@ func FixDexDirectory(dir string) (*DexStats, error) {
 		}
 		stats.OK++
 	}
-
-	// 统计 invalid/ 目录中由 FixDexFile 隔离但未在主循环计数的 DEX
-	if entries, err := os.ReadDir(invalidDir); err == nil {
-		for _, e := range entries {
-			if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".dex") {
-				stats.BadFiles = append(stats.BadFiles, e.Name())
-			}
-		}
-	}
-
 	return stats, nil
 }
 
 func findDexFiles(dir string) ([]string, error) {
-	return findFilesByExt(dir, ".dex")
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			name := strings.ToLower(entry.Name())
+			if path != dir && (name == "bad" || name == "partial") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(strings.ToLower(entry.Name()), ".dex") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
 }
 
 func findFilesByExt(dir, ext string) ([]string, error) {
@@ -390,9 +399,13 @@ func RebuildMapList(data []byte) []byte {
 	}
 
 	// 按 offset 排序
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].off < entries[j].off
-	})
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[i].off > entries[j].off {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
 
 	mapListSize := 4 + len(entries)*12
 	oldMapOff := binary.LittleEndian.Uint32(data[0x34:0x38])

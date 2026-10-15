@@ -15,7 +15,8 @@
 //   - DEX content de-duplication (by recomputed SHA-1 signature) — across both
 //     processes and snapshot rounds, the same DEX is written only once.
 //   - Dump DEX files (default) with auto-fix SHA-1 + Adler32 + header fields
-//   - Dump SO files (--so) with auto-fix ELF header, spanning contiguous maps
+//   - Dump SO files (--so) via maps-driven classification + precise offset merge
+//     (system/vendor/oat libraries are classified and skipped; only app SOs dumped)
 //   - Snapshot mode (--snapshot N --interval T): re-scan the target N times so
 //     even a DEX that only briefly exists in memory gets captured.
 //   - Static binary, no dependencies
@@ -38,7 +39,6 @@
 
 // ---- Magic constants ----
 static const uint8_t kDexMagic[] = {0x64, 0x65, 0x78, 0x0a}; // "dex\n"
-static const uint8_t kElfMagic[] = {0x7f, 0x45, 0x4c, 0x46}; // \x7fELF
 // DEX endian_tag at offset 0x28 — always 0x12345678 for a valid DEX.
 // Second-gen packers often erase the "dex\n" magic but rarely touch this.
 static const uint32_t kDexEndianTag = 0x12345678;
@@ -83,14 +83,77 @@ static uint32_t dex_map_item_size(uint16_t type) {
 typedef struct {
     uintptr_t start;
     uintptr_t end;
-    char      perms[8];   // e.g. "r-xp"
-    char      path[512];  // mapped file path ("" if anonymous)
+    char      perms[8];       // e.g. "r-xp"
+    uint64_t  offset;         // file offset (maps column 4)
+    uint64_t  inode;          // inode (maps column 5)
+    uint32_t  dev_major;      // device major
+    uint32_t  dev_minor;      // device minor
+    char      path[512];      // mapped file path ("" if anonymous)
+    int       readable;       // permission shortcuts
+    int       writable;
+    int       executable;
 } maps_region;
 
 typedef struct {
     maps_region *regs;
     size_t       count;
 } maps_list;
+
+// ---- Object kind / origin / policy enums (SO classification) ----
+enum {
+    OBJ_UNKNOWN = 0,
+    OBJ_ELF_SO,
+    OBJ_ELF_EXEC,
+    OBJ_DEX,
+    OBJ_OAT,
+    OBJ_ODEX,
+    OBJ_APK_ZIP,
+    OBJ_LINKER,
+    OBJ_VDSO,
+    OBJ_MEMFD,
+    OBJ_INVALID
+};
+
+enum {
+    ORIGIN_UNKNOWN = 0,
+    ORIGIN_APP_APK,      // /data/app/<pkg>/...
+    ORIGIN_APP_DATA,     // /data/data/<pkg>/ or /data/user/0/<pkg>/
+    ORIGIN_APP_ANON,     // anonymous, suspected app-related
+    ORIGIN_SYSTEM,       // /system /system_ext /product
+    ORIGIN_APEX,         // /apex
+    ORIGIN_VENDOR,       // /vendor /odm
+    ORIGIN_RUNTIME,      // linker64, app_process64, boot.oat
+    ORIGIN_WEBVIEW,
+    ORIGIN_SPECIAL       // [vdso], memfd, etc
+};
+
+enum {
+    POLICY_SKIP = 0,
+    POLICY_DUMP_MERGE,          // dump via maps merge, no repair
+    POLICY_DUMP_AND_FIX,        // dump + basic elf repair
+    POLICY_DUMP_AND_SOFIXER_FIX // dump + SoFixer full repair
+};
+
+// Grouped object from maps: all regions sharing the same path+inode
+typedef struct {
+    char     path[512];
+    char     name[256];
+    uint64_t inode;
+
+    uintptr_t base_addr;       // min(start - offset)
+    uintptr_t min_start, max_end;
+    uint64_t min_offset;
+    uint64_t file_size;        // max(offset + (end-start))
+
+    int region_count;
+    int has_r, has_w, has_x;
+
+    int kind;
+    int origin;
+    int policy;
+
+    char     reason[256];
+} MappedObject;
 
 // ---- Cross-process / cross-snapshot de-dup tables ----
 // DEX identity = the 20-byte SHA-1 signature recomputed in fix_dex_header_and_checksums
@@ -281,6 +344,45 @@ static int dex_hit_valid(const uint8_t *buf, size_t n, size_t magic_off, uint32_
     if (class_defs_off >= dex_size) return 0;
 
     *out_size = dex_size;
+    return 1;
+}
+
+// Strong DEX header validation: check endian_tag + all section table ranges
+static int dex_header_strong_valid(const uint8_t *hdr, uint32_t file_size) {
+    // endian_tag must be 0x12345678
+    uint32_t endian_tag = 0;
+    memcpy(&endian_tag, hdr + 0x28, 4);
+    if (endian_tag != 0x12345678) return 0;
+
+    // Read all section table offsets and sizes
+    uint32_t string_ids_off=0, string_ids_size=0;
+    uint32_t type_ids_off=0, type_ids_size=0;
+    uint32_t proto_ids_off=0, proto_ids_size=0;
+    uint32_t field_ids_off=0, field_ids_size=0;
+    uint32_t method_ids_off=0, method_ids_size=0;
+    uint32_t class_defs_off=0, class_defs_size=0;
+
+    memcpy(&string_ids_off, hdr + 0x3C, 4);
+    memcpy(&string_ids_size, hdr + 0x40, 4);
+    memcpy(&type_ids_off, hdr + 0x44, 4);
+    memcpy(&type_ids_size, hdr + 0x48, 4);
+    memcpy(&proto_ids_off, hdr + 0x4C, 4);
+    memcpy(&proto_ids_size, hdr + 0x50, 4);
+    memcpy(&field_ids_off, hdr + 0x54, 4);
+    memcpy(&field_ids_size, hdr + 0x58, 4);
+    memcpy(&method_ids_off, hdr + 0x5C, 4);
+    memcpy(&method_ids_size, hdr + 0x60, 4);
+    memcpy(&class_defs_off, hdr + 0x64, 4);
+    memcpy(&class_defs_size, hdr + 0x68, 4);
+
+    // Each section must be fully within file_size
+    if (string_ids_off + string_ids_size * 4 > file_size) return 0;
+    if (type_ids_off + type_ids_size * 4 > file_size) return 0;
+    if (proto_ids_off + proto_ids_size * 12 > file_size) return 0;
+    if (field_ids_off + field_ids_size * 8 > file_size) return 0;
+    if (method_ids_off + method_ids_size * 8 > file_size) return 0;
+    if (class_defs_off + class_defs_size * 32 > file_size) return 0;
+
     return 1;
 }
 
@@ -531,7 +633,7 @@ static void fix_dex_header_and_checksums(uint8_t *data, size_t size) {
     memcpy(data + 0x08, &cksum, 4);
 }
 
-// ---- Load /proc/<pid>/maps into memory once, reused for scanning & SO lookup ----
+// ---- Load /proc/<pid>/maps into memory, parsing full columns ----
 static maps_list *load_maps(const char *pid) {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%s/maps", pid);
@@ -544,7 +646,7 @@ static maps_list *load_maps(const char *pid) {
     ml->regs = calloc(cap, sizeof(maps_region));
     if (!ml->regs) { fclose(f); free(ml); return NULL; }
 
-    char line[512];
+    char line[1024];
     while (fgets(line, sizeof(line), f)) {
         if (ml->count == cap) {
             cap *= 2;
@@ -556,35 +658,49 @@ static maps_list *load_maps(const char *pid) {
         maps_region *r = &ml->regs[ml->count];
         memset(r, 0, sizeof(*r));
 
-        // addr range + perms always present.
-        if (sscanf(line, "%lx-%lx %7s", &r->start, &r->end, r->perms) < 3) continue;
+        // Parse: start-end perms offset dev_major:dev_minor inode [path]
+        // Maps format: 7f000000-7f001000 r-xp 00000000 fd:02 12345 /path/to/file.so
+        unsigned long dmaj = 0, dmin = 0, off = 0, ino = 0;
+        int n = sscanf(line, "%lx-%lx %7s %lx %lx:%lx %lu",
+                       &r->start, &r->end, r->perms, &off, &dmaj, &dmin, &ino);
+        if (n < 7) {
+            // Fallback: parse just address+perms for broken/incomplete lines
+            if (sscanf(line, "%lx-%lx %7s", &r->start, &r->end, r->perms) < 3) continue;
+            off = 0; dmaj = 0; dmin = 0; ino = 0;
+        }
+        r->offset = (uint64_t)off;
+        r->inode = (uint64_t)ino;
+        r->dev_major = (uint32_t)dmaj;
+        r->dev_minor = (uint32_t)dmin;
 
-        // Pathname (optional): the 6th whitespace-delimited field. Walk past
-        // start-end/perms/offset/dev/inode, then capture the rest as the path.
-        // Robust against anonymous mappings that have no path token.
-        const char *p = strchr(line, '\n');
-        char tmp[768];
-        snprintf(tmp, sizeof(tmp), "%s", line);
-        // Find the path: take substring after the inode field.
+        // Permission shortcuts
+        for (int i = 0; i < 4; i++) {
+            if (r->perms[i] == 'r') r->readable = 1;
+            if (r->perms[i] == 'w') r->writable = 1;
+            if (r->perms[i] == 'x') r->executable = 1;
+        }
+
+        // Extract path: everything after the 5th whitespace field (address, perms, offset, dev, inode)
+        // Maps format guarantees: addr-perms-offset-dev-inode are always 5 whitespace-delimited tokens.
+        // The 6th token onwards (including spaces) is the path.
+        char *p = line;
         int fields = 0;
-        char *q = tmp;
-        while (fields < 5 && *q) {
-            while (*q == ' ') q++;
-            if (!*q) break;
-            while (*q && *q != ' ') q++;
+        // Skip exactly 5 whitespace-delimited fields (addr, perms, offset, dev:inode as two, inode)
+        while (fields < 5 && *p) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+            while (*p && *p != ' ' && *p != '\n') p++;
             fields++;
         }
-        if (fields == 5) {
-            while (*q == ' ') q++;
-            // q now points at the path (or end of line). Trim trailing newline.
-            size_t plen = strlen(q);
-            while (plen > 0 && (q[plen-1] == '\n' || q[plen-1] == '\r' ||
-                               q[plen-1] == ' ' || q[plen-1] == '\t')) {
-                q[--plen] = '\0';
-            }
-            snprintf(r->path, sizeof(r->path), "%s", q);
+        // Now p points at the whitespace before the path (or end of line)
+        while (*p == ' ') p++;  // skip leading spaces
+        if (*p && *p != '\n') {
+            // Copy rest of line as path, trimming trailing newline
+            size_t plen = strlen(p);
+            while (plen > 0 && (p[plen-1] == '\n' || p[plen-1] == '\r')) plen--;
+            snprintf(r->path, sizeof(r->path), "%.*s", (int)plen, p);
         }
-        (void)p;
+
         ml->count++;
     }
     fclose(f);
@@ -597,29 +713,540 @@ static void free_maps(maps_list *ml) {
     free(ml);
 }
 
-// Find the SO's full contiguous extent by walking forward over regions that
-// share the same mapped path. ELF segments of one .so are mapped adjacently.
-static uintptr_t so_extent_end(const maps_list *ml, size_t idx, uintptr_t base_end) {
-    if (!ml || idx >= ml->count) return base_end;
-    const char *path = ml->regs[idx].path;
-    uintptr_t end = ml->regs[idx].end;
-    for (size_t i = idx + 1; i < ml->count; i++) {
+// ---- Group maps regions by path + inode into MappedObject array ----
+static int group_maps_by_path_inode(const maps_list *ml, MappedObject *objs, int max_objs) {
+    int count = 0;
+    for (size_t i = 0; i < ml->count && count < max_objs; i++) {
         const maps_region *r = &ml->regs[i];
-        // Stop at a gap or when the path changes / becomes a different file.
-        if (r->start > end + (1U << 20)) break;          // large hole => different area
-        if (path[0] != '\0' && strcmp(r->path, path) != 0) {
-            // Allow an anonymous continuation of the same SO (writable data etc.)
-            if (r->path[0] != '\0') break;
+
+        // Anonymous mappings (path=="" or inode==0) each get their own object
+        if (r->path[0] == '\0' || r->inode == 0) {
+            MappedObject *o = &objs[count];
+            memset(o, 0, sizeof(*o));
+            snprintf(o->path, sizeof(o->path), "anon_%lx", (unsigned long)r->start);
+            snprintf(o->name, sizeof(o->name), "anon_%lx", (unsigned long)r->start);
+            o->inode = 0;
+            o->base_addr = r->start - r->offset;
+            o->min_start = r->start;
+            o->max_end = r->end;
+            o->min_offset = r->offset;
+            o->file_size = r->offset + (r->end - r->start);
+            o->region_count = 1;
+            if (r->readable) o->has_r = 1;
+            if (r->writable) o->has_w = 1;
+            if (r->executable) o->has_x = 1;
+            count++;
+            continue;
         }
-        end = r->end;
+
+        // Group key = path + inode
+        int found = 0;
+        for (int j = 0; j < count; j++) {
+            if (objs[j].inode == r->inode &&
+                strcmp(objs[j].path, r->path) == 0) {
+                // Extend bounds
+                if (r->start < objs[j].min_start) objs[j].min_start = r->start;
+                if (r->end > objs[j].max_end) objs[j].max_end = r->end;
+                if (r->offset < objs[j].min_offset) objs[j].min_offset = r->offset;
+                uint64_t seg_end = r->offset + (r->end - r->start);
+                if (seg_end > objs[j].file_size) objs[j].file_size = seg_end;
+                objs[j].region_count++;
+                if (r->readable) objs[j].has_r = 1;
+                if (r->writable) objs[j].has_w = 1;
+                if (r->executable) objs[j].has_x = 1;
+                // Recalc base_addr
+                uintptr_t base = r->start - r->offset;
+                if (base < objs[j].base_addr || objs[j].region_count == 1)
+                    objs[j].base_addr = base;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            MappedObject *o = &objs[count];
+            memset(o, 0, sizeof(*o));
+            snprintf(o->path, sizeof(o->path), "%s", r->path);
+            const char *bn = strrchr(r->path, '/');
+            snprintf(o->name, sizeof(o->name), "%s", bn ? bn + 1 : r->path);
+            o->inode = r->inode;
+            o->base_addr = r->start - r->offset;
+            o->min_start = r->start;
+            o->max_end = r->end;
+            o->min_offset = r->offset;
+            o->file_size = r->offset + (r->end - r->start);
+            o->region_count = 1;
+            if (r->readable) o->has_r = 1;
+            if (r->writable) o->has_w = 1;
+            if (r->executable) o->has_x = 1;
+            count++;
+        }
     }
-    return end > base_end ? end : base_end;
+    return count;
 }
 
-// ---- Extract basename from path ----
-static const char *my_basename(const char *path) {
-    const char *p = strrchr(path, '/');
-    return p ? p + 1 : path;
+// ---- Classify object origin by path ----
+static int classify_origin(const char *path, const char *pkg) {
+    if (!path || path[0] == '\0') return ORIGIN_APP_ANON;
+    if (strstr(path, "[vdso]")) return ORIGIN_SPECIAL;
+    if (strstr(path, "memfd")) return ORIGIN_SPECIAL;
+    if (strstr(path, "/data/app/") && strstr(path, pkg))
+        return ORIGIN_APP_APK;
+    if ((strstr(path, "/data/data/") || strstr(path, "/data/user/0/")) && strstr(path, pkg))
+        return ORIGIN_APP_DATA;
+    if (strstr(path, "/apex/"))
+        return ORIGIN_APEX;
+    if (strstr(path, "/vendor/") || strstr(path, "/odm/"))
+        return ORIGIN_VENDOR;
+    if (strstr(path, "/system/") || strstr(path, "/system_ext/") || strstr(path, "/product/"))
+        return ORIGIN_SYSTEM;
+    return ORIGIN_UNKNOWN;
+}
+
+// ---- Classify object kind from header bytes + path hints ----
+static int classify_kind(const char *path, const uint8_t *head, size_t head_size) {
+    if (!head || head_size < 4) return OBJ_UNKNOWN;
+
+    // Path-based hints checked first (ODEX/OAT are ELF-wrapped but NOT SOs)
+    if (path && strstr(path, "[vdso]")) return OBJ_VDSO;
+    if (path && strstr(path, "memfd")) return OBJ_MEMFD;
+    if (path && strstr(path, ".odex")) return OBJ_ODEX;
+    if (path && strstr(path, ".oat")) return OBJ_OAT;
+    if (path && (strstr(path, "linker64") || strstr(path, "linker")))
+        return OBJ_LINKER;
+
+    // ELF check
+    if (memcmp(head, "\x7f""ELF", 4) == 0) {
+        if (head_size < 18) return OBJ_ELF_SO;
+        uint16_t e_type = head[16] | (head[17] << 8);
+        if (e_type == 3) return OBJ_ELF_SO;      // ET_DYN
+        if (e_type == 2 || e_type == 1) return OBJ_ELF_EXEC; // ET_EXEC/ET_REL
+        return OBJ_ELF_SO;
+    }
+    if (memcmp(head, "dex\n", 4) == 0) return OBJ_DEX;
+    if (memcmp(head, "oat\n", 4) == 0) return OBJ_OAT;
+    if (memcmp(head, "PK\x03\x04", 4) == 0) return OBJ_APK_ZIP;
+    return OBJ_UNKNOWN;
+}
+
+// ---- Decide repair policy for SO objects ----
+static int decide_policy(const MappedObject *o) {
+    // Skip non-SO types
+    if (o->kind == OBJ_OAT || o->kind == OBJ_ODEX || o->kind == OBJ_APK_ZIP ||
+        o->kind == OBJ_VDSO || o->kind == OBJ_MEMFD || o->kind == OBJ_DEX ||
+        o->kind == OBJ_ELF_EXEC || o->kind == OBJ_LINKER)
+        return POLICY_SKIP;
+    // Skip system/vendor/apex — only care about app-logic SOs
+    if (o->origin == ORIGIN_SYSTEM || o->origin == ORIGIN_APEX ||
+        o->origin == ORIGIN_VENDOR || o->origin == ORIGIN_RUNTIME ||
+        o->origin == ORIGIN_WEBVIEW || o->origin == ORIGIN_SPECIAL)
+        return POLICY_SKIP;
+    // Dump app-related SOs
+    if (o->kind == OBJ_ELF_SO && o->origin != ORIGIN_UNKNOWN)
+        return POLICY_DUMP_AND_FIX;
+    // Unknown anonymous ELF SO (might be shell-loaded app code)
+    if (o->kind == OBJ_ELF_SO && o->origin == ORIGIN_UNKNOWN && o->has_x)
+        return POLICY_DUMP_MERGE;
+    return POLICY_SKIP;
+}
+
+// ---- Dump object by precise offset-based maps merging ----
+static int dump_object_by_maps(int mem_fd, pid_t pid, MappedObject *obj,
+                               const maps_list *ml, const char *out_path) {
+    if (obj->file_size > 64 * 1024 * 1024) {
+        fprintf(stderr, "  [-] SO too large (%llu bytes), skip\n",
+                (unsigned long long)obj->file_size);
+        return -1;
+    }
+    if (obj->file_size == 0) return -1;
+
+    uint8_t *buf = calloc(1, (size_t)obj->file_size);
+    if (!buf) {
+        fprintf(stderr, "  [-] OOM for SO %s (%llu bytes)\n",
+                obj->name, (unsigned long long)obj->file_size);
+        return -1;
+    }
+
+    // Read each region of this object by offset
+    for (size_t i = 0; i < ml->count; i++) {
+        const maps_region *r = &ml->regs[i];
+        if (r->inode != obj->inode || strcmp(r->path, obj->path) != 0)
+            continue;
+        if (!r->readable) continue;
+
+        size_t seg_len = (size_t)(r->end - r->start);
+        if ((uint64_t)obj->file_size < r->offset + seg_len) continue;
+
+        if (g_use_vm_readv) {
+            vm_readv_retry(pid, buf + r->offset, seg_len, r->start);
+        } else if (mem_fd >= 0) {
+            pread_retry(mem_fd, buf + r->offset, seg_len, (off_t)r->start);
+        }
+    }
+
+    // Extend dump to cover all PT_LOAD segments from ELF header
+    if (obj->file_size >= 0x40 && memcmp(buf, "\x7f""ELF", 4) == 0) {
+        int is64 = (buf[4] == 2);
+        uint64_t e_phoff = is64 ? *(uint64_t*)(buf + 32) : *(uint32_t*)(buf + 28);
+        uint16_t e_phentsize = is64 ? *(uint16_t*)(buf + 54) : *(uint16_t*)(buf + 42);
+        uint16_t e_phnum = is64 ? *(uint16_t*)(buf + 56) : *(uint16_t*)(buf + 44);
+        if (e_phoff > 0 && e_phentsize > 0 && e_phnum < 64 &&
+            e_phoff + (uint64_t)e_phnum * e_phentsize <= obj->file_size) {
+            uint64_t needed = 0;
+            for (uint16_t i = 0; i < e_phnum; i++) {
+                uint64_t base = e_phoff + (uint64_t)i * e_phentsize;
+                uint32_t p_type = *(uint32_t*)(buf + base);
+                uint64_t p_vaddr, p_memsz;
+                if (is64) { p_vaddr = *(uint64_t*)(buf + base + 16); p_memsz = *(uint64_t*)(buf + base + 40); }
+                else { p_vaddr = *(uint32_t*)(buf + base + 8); p_memsz = *(uint32_t*)(buf + base + 20); }
+                if (p_type == 1 && p_vaddr + p_memsz > needed) needed = p_vaddr + p_memsz;
+            }
+            if (needed > obj->file_size && needed <= 64*1024*1024) {
+                uint8_t *nbuf = realloc(buf, (size_t)needed);
+                if (nbuf) {
+                    buf = nbuf;
+                    memset(buf + obj->file_size, 0, (size_t)(needed - obj->file_size));
+                    // Try to read additional LOAD segments from process memory
+                    for (uint16_t i = 0; i < e_phnum; i++) {
+                        uint64_t base = e_phoff + (uint64_t)i * e_phentsize;
+                        uint32_t p_type = *(uint32_t*)(buf + base);
+                        if (p_type != 1) continue;
+                        uint64_t p_offset, p_filesz;
+                        if (is64) { p_offset = *(uint64_t*)(buf + base + 8); p_filesz = *(uint64_t*)(buf + base + 32); }
+                        else { p_offset = *(uint32_t*)(buf + base + 4); p_filesz = *(uint32_t*)(buf + base + 16); }
+                        // Only read if segment is beyond what maps captured
+                        if (p_offset + p_filesz > obj->file_size && p_offset < needed) {
+                            size_t to_read = (size_t)(needed - p_offset);
+                            if (to_read > (size_t)(p_filesz)) to_read = (size_t)p_filesz;
+                            if (p_offset < obj->file_size) to_read -= (size_t)(obj->file_size - p_offset);
+                            uintptr_t remote_addr = (uintptr_t)(obj->base_addr + p_offset);
+                            if (g_use_vm_readv)
+                                vm_readv_retry(pid, buf + p_offset, to_read, remote_addr);
+                            else if (mem_fd >= 0)
+                                pread_retry(mem_fd, buf + p_offset, to_read, (off_t)remote_addr);
+                        }
+                    }
+                    obj->file_size = needed;
+                }
+            }
+        }
+    }
+
+    FILE *out = fopen(out_path, "wb");
+    if (!out) { free(buf); return -1; }
+    size_t written = fwrite(buf, 1, (size_t)obj->file_size, out);
+    fclose(out);
+    free(buf);
+
+    if (written != (size_t)obj->file_size) {
+        fprintf(stderr, "  [!] Partial write for %s (%zu/%llu)\n",
+                obj->name, written, (unsigned long long)obj->file_size);
+    }
+    return (written > 0) ? 0 : -1;
+}
+
+// ---- Enhanced ELF repair: never-give-up, always save ----
+static int elf_repair_basic(const char *path) {
+    FILE *f = fopen(path, "r+b");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    if (fsize < 0x40) { fclose(f); return -1; }
+
+    uint8_t *data = malloc((size_t)fsize + 32768);
+    if (!data) { fclose(f); return -1; }
+    fseek(f, 0, SEEK_SET);
+    fread(data, 1, (size_t)fsize, f);
+    fclose(f);
+
+    // Bare minimum: must have ELF magic
+    if (memcmp(data, "\x7f""ELF", 4) != 0) {
+        // Check if offset 0 looks like ARM64 code → might be header-less dump
+        // Just write magic and hope
+        memcpy(data, "\x7f""ELF", 4);
+    }
+
+    // Always fix e_ident
+    int is64 = (data[4] == 2);
+    if (data[4] != 1 && data[4] != 2) {
+        is64 = 1; // default to ELF64 (Android is 64-bit)
+        data[4] = 2;
+    }
+    data[5] = 1; // EI_DATA = little-endian
+    data[6] = 1; // EI_VERSION = 1
+
+    // Always fix e_type (dump SOs are always ET_DYN)
+    if (is64) {
+        uint16_t e_type = *(uint16_t*)(data + 16);
+        if (e_type != 3) { e_type = 3; memcpy(data + 16, &e_type, 2); }
+        // Fix e_machine if invalid
+        uint16_t e_mach = *(uint16_t*)(data + 18);
+        if (e_mach != 183 && e_mach != 40) { e_mach = 183; memcpy(data + 18, &e_mach, 2); }
+    } else {
+        uint16_t e_type = *(uint16_t*)(data + 16);
+        if (e_type != 3) { e_type = 3; memcpy(data + 16, &e_type, 2); }
+        uint16_t e_mach = *(uint16_t*)(data + 18);
+        if (e_mach != 183 && e_mach != 40) { e_mach = 40; memcpy(data + 18, &e_mach, 2); }
+    }
+
+    // Parse PHT
+    uint64_t e_phoff;
+    uint16_t e_phentsize, e_phnum;
+    if (is64) {
+        e_phoff = *(uint64_t*)(data + 32);
+        e_phentsize = *(uint16_t*)(data + 54);
+        e_phnum = *(uint16_t*)(data + 56);
+    } else {
+        e_phoff = *(uint32_t*)(data + 28);
+        e_phentsize = *(uint16_t*)(data + 42);
+        e_phnum = *(uint16_t*)(data + 44);
+    }
+    if (e_phnum == 0 || e_phentsize == 0 ||
+        e_phoff + (uint64_t)e_phnum * e_phentsize > (uint64_t)fsize) {
+        // PHT is broken beyond repair — still save with fixes applied so far
+        goto save_and_exit;
+    }
+
+    // Calculate actual needed size from PT_LOAD to extend truncated dumps
+    {
+        uint64_t needed_size = 0;
+        for (uint16_t i = 0; i < e_phnum; i++) {
+            uint64_t base = e_phoff + (uint64_t)i * e_phentsize;
+            uint32_t p_type = *(uint32_t*)(data + base);
+            if (p_type != 1) continue; // PT_LOAD only
+            uint64_t p_vaddr, p_memsz;
+            if (is64) { p_vaddr = *(uint64_t*)(data + base + 16); p_memsz = *(uint64_t*)(data + base + 40); }
+            else { p_vaddr = *(uint32_t*)(data + base + 8); p_memsz = *(uint32_t*)(data + base + 20); }
+            if (p_vaddr + p_memsz > needed_size) needed_size = p_vaddr + p_memsz;
+        }
+        if (needed_size > (uint64_t)fsize && needed_size <= 64u*1024*1024) {
+            uint8_t *n = realloc(data, (size_t)needed_size + 32768);
+            if (n) { data = n; memset(data + fsize, 0, (size_t)(needed_size - fsize)); fsize = (long)needed_size; }
+        }
+    }
+
+    // Fix p_offset = p_vaddr + p_filesz = p_memsz, track PT_DYNAMIC
+    uint64_t dyn_vaddr = 0, dyn_filesz = 0;
+    for (uint16_t i = 0; i < e_phnum; i++) {
+        uint64_t base = e_phoff + (uint64_t)i * e_phentsize;
+        uint32_t p_type = *(uint32_t*)(data + base);
+        uint64_t p_offset, p_vaddr, p_filesz, p_memsz;
+        if (is64) {
+            p_offset = *(uint64_t*)(data + base + 8);
+            p_vaddr = *(uint64_t*)(data + base + 16);
+            p_filesz = *(uint64_t*)(data + base + 32);
+            p_memsz = *(uint64_t*)(data + base + 40);
+        } else {
+            p_offset = *(uint32_t*)(data + base + 4);
+            p_vaddr = *(uint32_t*)(data + base + 8);
+            p_filesz = *(uint32_t*)(data + base + 16);
+            p_memsz = *(uint32_t*)(data + base + 20);
+        }
+        if (p_type == 1 || p_type == 2) { // PT_LOAD or PT_DYNAMIC
+            if (p_offset != p_vaddr) {
+                if (is64) memcpy(data + base + 8, &p_vaddr, 8);
+                else { uint32_t v32 = (uint32_t)p_vaddr; memcpy(data + base + 4, &v32, 4); }
+            }
+            if (p_type == 1 && p_filesz < p_memsz) {
+                if (is64) memcpy(data + base + 32, &p_memsz, 8);
+                else { uint32_t m32 = (uint32_t)p_memsz; memcpy(data + base + 16, &m32, 4); }
+            }
+            if (p_type == 2) { // PT_DYNAMIC
+                dyn_vaddr = p_vaddr;
+                dyn_filesz = p_filesz;
+            }
+        }
+    }
+
+    // ---- SoFixer-style section header rebuild ----
+    // Always build at least minimal SHT for IDA compatibility
+    {
+        uint64_t dt_symtab = 0, dt_strtab = 0, dt_strsz = 0;
+        uint64_t dt_hash = 0, dt_nbucket = 0, dt_nchain = 0;
+        uint64_t entsize = is64 ? 16 : 8;
+
+        // Parse DT_* tags if .dynamic is accessible
+        if (dyn_vaddr > 0 && dyn_vaddr + entsize <= (uint64_t)fsize) {
+            uint64_t di = dyn_vaddr;
+            for (int cnt = 0; cnt < 256 && di + entsize <= (uint64_t)fsize; cnt++) {
+                uint64_t d_tag, d_val;
+                if (is64) {
+                    d_tag = *(uint64_t*)(data + di);
+                    d_val = *(uint64_t*)(data + di + 8);
+                } else {
+                    d_tag = *(uint32_t*)(data + di);
+                    d_val = *(uint32_t*)(data + di + 4);
+                }
+                if (d_tag == 0) break;
+                switch ((uint32_t)d_tag) {
+                    case 5:  dt_strtab = d_val; break;
+                    case 6:  dt_symtab = d_val; break;
+                    case 4:  dt_hash = d_val; break;
+                    case 10: dt_strsz = d_val; break;
+                }
+                di += entsize;
+            }
+        }
+
+        // Read hash nbucket/nchain if dt_hash is accessible
+        if (dt_hash > 0 && dt_hash + 8 <= (uint64_t)fsize) {
+            dt_nbucket = *(uint32_t*)(data + dt_hash);
+            dt_nchain = *(uint32_t*)(data + dt_hash + 4);
+        }
+
+        // Build shstrtab + section headers at end of file
+        uint32_t shoff = (uint32_t)fsize;
+        uint8_t *out = data + shoff;
+        uint32_t out_off = 0;
+
+        // Helper: write bytes to out buffer
+        #define SH_PUT(buf, len) do { memcpy(out + out_off, (buf), (len)); out_off += (len); } while(0)
+        #define SH_PUT32(v) do { uint32_t _v = (uint32_t)(v); SH_PUT(&_v, 4); } while(0)
+        #define SH_PUT64(v) do { uint64_t _v = (uint64_t)(v); SH_PUT(&_v, 8); } while(0)
+
+        // shstrtab: section name strings (use sizeof, not strlen — first byte is \0)
+        uint32_t shstrtab_off = out_off;
+        static const char shstrtab[] =
+            "\0.shstrtab\0.dynsym\0.dynstr\0.hash\0.dynamic\0";
+        uint32_t shstrtab_len = sizeof(shstrtab);
+        SH_PUT(shstrtab, shstrtab_len);
+        // Name offsets in shstrtab:
+        #define SHN_SHSTRTAB  1
+        #define SHN_DYNSYM   11
+        #define SHN_DYNSTR   19
+        #define SHN_HASH     27
+        #define SHN_DYNAMIC  33
+
+        // Count sections: always include NULL, .dynsym, .dynstr, .dynamic, .shstrtab
+        uint16_t sh_count = 1; // SHT_NULL at index 0
+        uint16_t sh_dynsym = sh_count++;
+        uint16_t sh_dynstr = sh_count++;
+        uint16_t sh_dynamic = sh_count++;
+        uint16_t sh_hash = 0;
+        if (dt_hash) { sh_hash = sh_count++; }
+        uint16_t sh_shstrtab = sh_count++;
+
+        // Calculate SHT size
+        uint32_t shentsize = is64 ? 64 : 40;
+        uint32_t sht_off = out_off;
+        uint32_t sht_size = sh_count * shentsize;
+        memset(out + out_off, 0, sht_size);
+        out_off += sht_size;
+
+        // Helper: write SHT entry at index
+        #define SHDR(idx, name_off, type, flags, addr, off, size, link, info, align, esize) do { \
+            uint8_t *s = out + sht_off + (idx) * shentsize; \
+            SHDR32(s, 0, name_off); \
+            SHDR32(s, 4, type); \
+            if (is64) { SHDR64(s, 8, flags); SHDR64(s, 16, addr); SHDR64(s, 24, off); \
+                        SHDR64(s, 32, size); SHDR32(s, 40, link); SHDR32(s, 44, info); \
+                        SHDR64(s, 48, align); SHDR64(s, 56, esize); } \
+            else { SHDR32(s, 8, flags); SHDR32(s, 12, addr); SHDR32(s, 16, off); \
+                   SHDR32(s, 20, size); SHDR32(s, 24, link); SHDR32(s, 28, info); \
+                   SHDR32(s, 32, align); SHDR32(s, 36, esize); } \
+        } while(0)
+        #define SHDR32(s, off, v) do { uint32_t _v = (uint32_t)(v); memcpy((s)+(off), &_v, 4); } while(0)
+        #define SHDR64(s, off, v) do { uint64_t _v = (uint64_t)(v); memcpy((s)+(off), &_v, 8); } while(0)
+
+        // SHT[0] = NULL (implicitly zero)
+        // .dynsym (always present, even if dt_symtab unknown)
+        SHDR(sh_dynsym, SHN_DYNSYM, 11/*SHT_DYNSYM*/, 2/*SHF_ALLOC*/,
+             dt_symtab ? dt_symtab : dyn_vaddr, dt_symtab ? dt_symtab : dyn_vaddr,
+             0, sh_dynstr, 1, is64?8:4, is64?24:16);
+        // .dynstr (always present)
+        SHDR(sh_dynstr, SHN_DYNSTR, 3/*SHT_STRTAB*/, 2,
+             dt_strtab ? dt_strtab : dyn_vaddr, dt_strtab ? dt_strtab : dyn_vaddr,
+             dt_strsz ? dt_strsz : 1, 0, 0, 1, 0);
+        // .hash
+        if (sh_hash) SHDR(sh_hash, SHN_HASH, 5/*SHT_HASH*/, 2, dt_hash, dt_hash, (dt_nbucket+dt_nchain)*4+8, sh_dynsym, 0, 4, 4);
+        // .dynamic
+        SHDR(sh_dynamic, SHN_DYNAMIC, 6/*SHT_DYNAMIC*/, 3/*SHF_ALLOC|SHF_WRITE*/, dyn_vaddr, dyn_vaddr, dyn_filesz, sh_dynstr, 0, is64?8:4, entsize);
+        // .shstrtab (last section)
+        SHDR(sh_shstrtab, SHN_SHSTRTAB, 3/*SHT_STRTAB*/, 0, 0, shoff + shstrtab_off, shstrtab_len, 0, 0, 1, 0);
+
+        // Fix dynsym .sh_link to point to .dynstr
+        if (sh_dynsym) { uint32_t link = sh_dynstr; memcpy(out + sht_off + sh_dynsym * shentsize + (is64 ? 40 : 24), &link, 4); }
+
+        // Fix .sh_size for .dynsym: pad to next section's sh_addr
+        if (sh_dynsym && sh_dynstr && sh_count > 0) {
+            uint64_t ds_addr = 0, dn_addr = 0;
+            if (is64) { ds_addr = *(uint64_t*)(out + sht_off + sh_dynsym * 64 + 16); dn_addr = *(uint64_t*)(out + sht_off + sh_dynstr * 64 + 16); }
+            else { ds_addr = *(uint32_t*)(out + sht_off + sh_dynsym * 40 + 12); dn_addr = *(uint32_t*)(out + sht_off + sh_dynstr * 40 + 12); }
+            if (dn_addr > ds_addr) {
+                uint64_t sz = dn_addr - ds_addr;
+                if (is64) memcpy(out + sht_off + sh_dynsym * 64 + 32, &sz, 8);
+                else { uint32_t s32 = (uint32_t)sz; memcpy(out + sht_off + sh_dynsym * 40 + 20, &s32, 4); }
+            }
+        }
+
+        // Update ELF header: e_shoff, e_shnum, e_shstrndx
+        if (is64) {
+            uint64_t sho = shoff + sht_off;
+            memcpy(data + 0x28, &sho, 8);
+            memcpy(data + 0x3C, &sh_count, 2);
+            memcpy(data + 0x3E, &sh_shstrtab, 2);
+        } else {
+            uint32_t sho = (uint32_t)(shoff + sht_off);
+            memcpy(data + 0x20, &sho, 4);
+            memcpy(data + 0x30, &sh_count, 2);
+            memcpy(data + 0x32, &sh_shstrtab, 2);
+        }
+
+        fsize = (long)(shoff + out_off);
+
+        #undef SH_PUT
+        #undef SH_PUT32
+        #undef SH_PUT64
+        #undef SHDR
+        #undef SHDR32
+        #undef SHDR64
+    } // end SHT rebuild
+
+save_and_exit:
+    // Re-open for truncating write (always save, even partial repair)
+    f = fopen(path, "wb");
+    if (!f) { free(data); return -1; }
+    fwrite(data, 1, (size_t)fsize, f);
+    fclose(f);
+    free(data);
+    return (fsize > 0) ? 0 : -1;
+}
+
+// ---- Write manifest JSON for SO objects ----
+static void so_manifest_write(const char *so_dir, const MappedObject *objs, int count,
+                               int dumped, int skipped_system, int skipped_other) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/manifest.json", so_dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    fprintf(f, "{\n  \"total_objects\": %d,\n  \"so_dumped\": %d,\n", count, dumped);
+    fprintf(f, "  \"skipped_system\": %d,\n  \"skipped_other\": %d,\n", skipped_system, skipped_other);
+    fprintf(f, "  \"objects\": [\n");
+
+    int first = 1;
+    for (int i = 0; i < count; i++) {
+        const MappedObject *o = &objs[i];
+        const char *kind_str = "unknown";
+        switch (o->kind) {
+            case OBJ_ELF_SO: kind_str = "elf_so"; break;
+            case OBJ_ELF_EXEC: kind_str = "elf_exec"; break;
+            case OBJ_DEX: kind_str = "dex"; break;
+            case OBJ_OAT: kind_str = "oat"; break;
+            case OBJ_ODEX: kind_str = "odex"; break;
+            case OBJ_APK_ZIP: kind_str = "apk_zip"; break;
+            case OBJ_VDSO: kind_str = "vdso"; break;
+            case OBJ_MEMFD: kind_str = "memfd"; break;
+        }
+
+        if (!first) fprintf(f, ",\n");
+        fprintf(f, "    {\"path\":\"%s\",\"name\":\"%s\",\"kind\":\"%s\",\"origin\":%d,"
+                "\"policy\":%d,\"size\":%llu}",
+                o->path, o->name, kind_str, o->origin, o->policy,
+                (unsigned long long)o->file_size);
+        first = 0;
+    }
+    fprintf(f, "\n  ]\n}\n");
+    fclose(f);
 }
 
 // Counters carried across PID + snapshot iterations.
@@ -675,10 +1302,7 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
     fprintf(stderr, "[*] Scanning PID %s (%s): %zu regions%s\n", pid, pkg, ml->count,
             g_use_vm_readv ? " (stealth2: vm_readv)" : "");
 
-    uint8_t buf[4096];
-    // Per-PID SO base de-dup (same base within one process is the same SO).
-    uintptr_t dumped_so_bases[256];
-    int dumped_so_base_count = 0;
+    uint8_t buf[4096 + 0x70];  // +0x70 overlap for cross-page magic/header coverage
     int pid_dex_unique = 0, pid_dex_seen = 0;
 
     for (size_t ri = 0; ri < ml->count; ri++) {
@@ -695,8 +1319,12 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
         // Stealth: brief pause between regions to look less like bulk extraction.
         if (g_region_delay_us > 0) usleep((useconds_t)g_region_delay_us);
 
+        #define PAGE_READ_SIZE (4096 + 0x70)
         for (uintptr_t addr = r->start; addr < r->end; addr += 4096) {
-            ssize_t n = READ_REMOTE(buf, sizeof(buf), addr);
+            size_t to_read = PAGE_READ_SIZE;
+            if (addr + to_read > r->end)
+                to_read = (size_t)(r->end - addr);
+            ssize_t n = READ_REMOTE(buf, to_read, addr);
             if (n < 64) continue;
 
             for (int i = 0; i <= n - 4; i++) {
@@ -748,6 +1376,16 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                         dex_size = recovered;
                     }
                     if (dex_size < 0x70 || dex_size > 0x10000000) continue;
+
+                    // Strong validation: check endian_tag + all section table ranges
+                    {
+                        uint8_t hdr_check[0x70];
+                        if (READ_REMOTE(hdr_check, 0x70, dex_addr) == 0x70) {
+                            if (!dex_header_strong_valid(hdr_check, dex_size)) {
+                                continue;  // structural checks failed — likely false positive
+                            }
+                        }
+                    }
 
                     c->dex_total++;
                     pid_dex_seen++;
@@ -816,119 +1454,10 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
                     i += (dex_size > 4096 ? 4096 : dex_size);
                 }
 
-                // ---- SO (ELF) scanning ----
-                if ((mode & MODE_SO) && memcmp(buf + i, kElfMagic, 4) == 0) {
-                    uintptr_t elf_addr = addr + i;
-                    // Only treat page-boundary ELF as a real SO start.
-                    if (i != 0) continue;
+                // ---- SO (ELF) via maps grouping + classification ----
+                // DEX continues with magic-scan; SO is now maps-driven.
+                // Handled below after the region loop.
 
-                    // Per-PID base de-dup.
-                    int already = 0;
-                    for (int j = 0; j < dumped_so_base_count; j++)
-                        if (dumped_so_bases[j] == elf_addr) { already = 1; break; }
-                    if (already) continue;
-
-                    uint8_t elf_hdr[64];
-                    if (READ_REMOTE(elf_hdr, 64, elf_addr) < 64) continue;
-
-                    int is_64 = (elf_hdr[4] == 2);
-                    if (elf_hdr[4] != 1 && elf_hdr[4] != 2) continue;
-
-                    uint16_t e_type = elf_hdr[16] | (elf_hdr[17] << 8);
-                    if (e_type != 3) continue; // ET_DYN only
-
-                    // SO name from the maps region we are inside.
-                    const char *so_path = r->path;
-                    // Cross-process de-dup by path (anonymous SOs cannot dedup globally).
-                    if (so_path_seen(so_path)) {
-                        i += 4096;
-                        continue;
-                    }
-
-                    // SO extent = contiguous same-path regions, not just this line.
-                    uintptr_t so_end = so_extent_end(ml, ri, r->end);
-                    uintptr_t so_start = elf_addr;
-                    size_t max_so_size = 64 * 1024 * 1024;
-                    size_t so_size = so_end - so_start;
-                    if (so_size > max_so_size) so_size = max_so_size;
-
-                    // Refine size from ELF program headers if smaller & sane.
-                    if (is_64) {
-                        uint64_t e_phoff = 0;
-                        memcpy(&e_phoff, elf_hdr + 32, 8);
-                        uint16_t e_phentsize = elf_hdr[54] | (elf_hdr[55] << 8);
-                        uint16_t e_phnum = elf_hdr[56] | (elf_hdr[57] << 8);
-                        uint64_t max_addr = 0;
-                        for (int p = 0; p < e_phnum && p < 32; p++) {
-                            uint8_t phdr[56];
-                            if (READ_REMOTE(phdr, 56, elf_addr + e_phoff + p * e_phentsize) < 56) break;
-                            uint32_t p_type = 0;
-                            memcpy(&p_type, phdr, 4);
-                            if (p_type != 1) continue;
-                            uint64_t p_vaddr = 0, p_memsz = 0;
-                            memcpy(&p_vaddr, phdr + 16, 8);
-                            memcpy(&p_memsz, phdr + 40, 8);
-                            uint64_t seg_end = p_vaddr + p_memsz;
-                            if (seg_end > max_addr) max_addr = seg_end;
-                        }
-                        if (max_addr > 0 && max_addr < so_size) so_size = (size_t)max_addr;
-                    } else {
-                        uint32_t e_phoff = 0;
-                        memcpy(&e_phoff, elf_hdr + 28, 4);
-                        uint16_t e_phentsize = elf_hdr[42] | (elf_hdr[43] << 8);
-                        uint16_t e_phnum = elf_hdr[44] | (elf_hdr[45] << 8);
-                        uint32_t max_addr = 0;
-                        for (int p = 0; p < e_phnum && p < 32; p++) {
-                            uint8_t phdr[32];
-                            if (READ_REMOTE(phdr, 32, elf_addr + e_phoff + p * e_phentsize) < 32) break;
-                            uint32_t p_type = 0;
-                            memcpy(&p_type, phdr, 4);
-                            if (p_type != 1) continue;
-                            uint32_t p_vaddr = 0, p_memsz = 0;
-                            memcpy(&p_vaddr, phdr + 12, 4);
-                            memcpy(&p_memsz, phdr + 20, 4);
-                            uint32_t seg_end = p_vaddr + p_memsz;
-                            if (seg_end > max_addr) max_addr = seg_end;
-                        }
-                        if (max_addr > 0 && max_addr < so_size) so_size = (size_t)max_addr;
-                    }
-
-                    if (dumped_so_base_count < 256) dumped_so_bases[dumped_so_base_count++] = elf_addr;
-                    so_path_remember(so_path);
-
-                    char outfile[768];
-                    if (so_path[0] != '\0') {
-                        const char *bname = my_basename(so_path);
-                        snprintf(outfile, sizeof(outfile), "%s/%s", so_dir, bname);
-                    } else {
-                        snprintf(outfile, sizeof(outfile), "%s/so_%s_%d.so", so_dir, pid, c->so_count + 1);
-                    }
-
-                    uint8_t *so_data = (uint8_t *)malloc(so_size);
-                    if (!so_data) { fprintf(stderr, "[-] malloc failed\n"); continue; }
-
-                    ssize_t read_total = 0;
-                    while (read_total < (ssize_t)so_size) {
-                        ssize_t rr = READ_REMOTE(so_data + read_total,
-                                          so_size - read_total,
-                                          elf_addr + read_total);
-                        if (rr <= 0) break;
-                        read_total += rr;
-                    }
-
-                    if (read_total > 0) {
-                        int fd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-                        if (fd >= 0) {
-                            write(fd, so_data, read_total);
-                            close(fd);
-                            c->so_count++;
-                            printf("[+] SO: %s (%zd bytes) from %s pid=%s\n", outfile, read_total,
-                                   so_path[0] ? so_path : "(anon)", pid);
-                        }
-                    }
-                    free(so_data);
-                    i += 4096;
-                }
 
                 // ---- Relaxed DEX scanning (endian_tag based, no magic) ----
                 // For second-gen shells that erase "dex\n" but keep the header structure.
@@ -1060,6 +1589,121 @@ static int scan_pid(const char *pid, const char *dex_dir, const char *so_dir,
         }
     }
 
+    // ---- SO classification-driven dump (maps-based, runs after DEX magic-scan) ----
+    if (mode & MODE_SO) {
+        MappedObject objs[1024];
+        int obj_count = group_maps_by_path_inode(ml, objs, 1024);
+        int so_dumped = 0, so_skipped_sys = 0, so_skipped_other = 0;
+
+        // Read ELF header: prefer offset==0 readable region, fallback to any readable
+        for (int i = 0; i < obj_count; i++) {
+            MappedObject *o = &objs[i];
+
+            // Read header bytes from memory for kind detection
+            uint8_t head[64] = {0};
+            int have_head = 0;
+
+            // First pass: look for offset==0 && readable
+            for (size_t j = 0; j < ml->count; j++) {
+                const maps_region *rg = &ml->regs[j];
+                if (rg->inode != o->inode || strcmp(rg->path, o->path) != 0) continue;
+                if (rg->offset != 0) continue;
+                if (!rg->readable) continue;
+                if (g_use_vm_readv) {
+                    ssize_t n = vm_readv_retry(target_pid, head, sizeof(head), rg->start);
+                    if (n > 0) { have_head = 1; break; }
+                } else if (mem_fd >= 0) {
+                    ssize_t n = pread_retry(mem_fd, head, sizeof(head), (off_t)rg->start);
+                    if (n > 0) { have_head = 1; break; }
+                }
+            }
+
+            // Second pass (fallback): any readable region
+            if (!have_head) {
+                for (size_t j = 0; j < ml->count; j++) {
+                    const maps_region *rg = &ml->regs[j];
+                    if (rg->inode != o->inode || strcmp(rg->path, o->path) != 0) continue;
+                    if (!rg->readable) continue;
+                    if (g_use_vm_readv) {
+                        ssize_t n = vm_readv_retry(target_pid, head, sizeof(head), rg->start);
+                        if (n > 0) { have_head = 1; break; }
+                    } else if (mem_fd >= 0) {
+                        ssize_t n = pread_retry(mem_fd, head, sizeof(head), (off_t)rg->start);
+                        if (n > 0) { have_head = 1; break; }
+                    }
+                }
+            }
+
+            o->kind = have_head ? classify_kind(o->path, head, sizeof(head)) : OBJ_UNKNOWN;
+            o->origin = classify_origin(o->path, pkg);
+            o->policy = decide_policy(o);
+
+            if (o->policy == POLICY_SKIP) {
+                if (o->origin == ORIGIN_SYSTEM || o->origin == ORIGIN_APEX || o->origin == ORIGIN_VENDOR)
+                    so_skipped_sys++;
+                else
+                    so_skipped_other++;
+                snprintf(o->reason, sizeof(o->reason), "skipped: kind=%d origin=%d", o->kind, o->origin);
+                continue;
+            }
+
+            // Cross-process de-dup by path
+            if (so_path_seen(o->path)) {
+                so_skipped_other++;
+                snprintf(o->reason, sizeof(o->reason), "skipped: cross-process duplicate");
+                continue;
+            }
+
+            // Build output filename
+            char outfile[768];
+            if (o->path[0] != '\0') {
+                snprintf(outfile, sizeof(outfile), "%s/%s", so_dir, o->name);
+            } else {
+                snprintf(outfile, sizeof(outfile), "%s/so_%s_%d.so", so_dir, pid, c->so_count + 1);
+            }
+            // Handle name conflicts: append _2, _3, etc.
+            {
+                struct stat st;
+                if (stat(outfile, &st) == 0) {
+                    char alt[768];
+                    for (int k = 2; k < 100; k++) {
+                        if (o->name[0] != '\0')
+                            snprintf(alt, sizeof(alt), "%s/%s_%d.so", so_dir, o->name, k);
+                        else
+                            snprintf(alt, sizeof(alt), "%s/so_%s_%d_%d.so", so_dir, pid, c->so_count + 1, k);
+                        if (stat(alt, &st) != 0) {
+                            snprintf(outfile, sizeof(outfile), "%s", alt);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Dump via precise offset-based maps merge
+            int rc = dump_object_by_maps(mem_fd, target_pid, o, ml, outfile);
+            if (rc == 0) {
+                so_path_remember(o->path);
+                c->so_count++;
+                so_dumped++;
+                printf("[+] SO: %s (%llu bytes, %d segs) origin=%d kind=%d pid=%s\n",
+                       outfile, (unsigned long long)o->file_size, o->region_count,
+                       o->origin, o->kind, pid);
+
+                // Repair deferred to main()'s unified batch pass (avoids double-repair)
+                snprintf(o->reason, sizeof(o->reason), "dumped: %llu bytes, %d regions",
+                         (unsigned long long)o->file_size, o->region_count);
+            } else {
+                so_skipped_other++;
+                snprintf(o->reason, sizeof(o->reason), "dump failed");
+            }
+        }
+
+        // Write manifest
+        so_manifest_write(so_dir, objs, obj_count, so_dumped, so_skipped_sys, so_skipped_other);
+        fprintf(stderr, "[*] SO classification: %d total objects, %d dumped, %d skipped (system), %d skipped (other)\n",
+                obj_count, so_dumped, so_skipped_sys, so_skipped_other);
+    }
+
     if (mem_fd >= 0) close(mem_fd);
     #undef READ_REMOTE
     free_maps(ml);
@@ -1111,7 +1755,6 @@ int main(int argc, char **argv) {
     int stealth = 0;             // --stealth: add region delay + auto-disguise
     int keep = 0;                // --keep: do NOT wipe stale dex/so output
     const char *disguise = NULL; // --name/--disguise: fake process name
-    const char *sofixer_path = NULL; // --sofixer <path>: override default lookup
 
     const char *target = NULL;
     const char *out_dir = NULL;
@@ -1119,7 +1762,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--so") == 0) { mode = MODE_SO; continue; }
         if (strcmp(argv[i], "--dex") == 0) { mode = MODE_DEX; continue; }
-        if (strcmp(argv[i], "--all") == 0) { mode = MODE_ALL; continue; }
+        if (strcmp(argv[i], "--all") == 0 || strcmp(argv[i], "--apk") == 0) { mode = MODE_ALL; continue; }
         if (strcmp(argv[i], "--keep") == 0) { keep = 1; continue; }
         if (strcmp(argv[i], "--snapshot") == 0 && i + 1 < argc) {
             snapshot_rounds = atoi(argv[++i]);
@@ -1152,9 +1795,6 @@ int main(int argc, char **argv) {
         }
         if ((strcmp(argv[i], "--name") == 0 || strcmp(argv[i], "--disguise") == 0)
             && i + 1 < argc) { disguise = argv[++i]; continue; }
-        if (strcmp(argv[i], "--sofixer") == 0 && i + 1 < argc) {
-            sofixer_path = argv[++i]; continue;
-        }
         if (!target) { target = argv[i]; continue; }
         if (!out_dir) { out_dir = argv[i]; continue; }
     }
@@ -1168,7 +1808,6 @@ int main(int argc, char **argv) {
     // we still need first.
     if (target) target = strdup(target);
     if (out_dir) out_dir = strdup(out_dir);
-    if (sofixer_path) sofixer_path = strdup(sofixer_path);
     if (disguise) disguise = strdup(disguise);
     // Apply disguise early, before we open any target /proc files.
     disguise_self(argc, argv, disguise);
@@ -1179,7 +1818,7 @@ int main(int argc, char **argv) {
             "Usage: %s <pid|package> [output_dir] [--so|--dex|--all]\n"
             "                       [--watch [K]] [--snapshot ROUNDS] [--interval SECS]\n"
             "                       [--stealth] [--stealth2] [--relaxed] [--anon]\n"
-            "                       [--region-delay MS] [--name NAME] [--sofixer PATH]\n"
+            "                       [--region-delay MS] [--name NAME]\n"
             "                       [--max-rounds N] [--max-seconds S] [--keep]\n"
             "\n"
             "  Modes:\n"
@@ -1215,7 +1854,7 @@ int main(int argc, char **argv) {
             "  Output:\n"
             "    --keep          Do NOT wipe stale .dex/.so in the output dir before\n"
             "                   scanning (default: wipe, so re-runs don't mix old+new).\n"
-            "    --sofixer PATH  Use SoFixer at PATH (default: /data/local/tmp/sofixer).\n"
+            "  SO files are automatically repaired with built-in elf_repair_basic.\n"
             "\n"
             "  DEX checksums (SHA-1 + Adler32) are auto-fixed; hits are validated\n"
             "  (DEX version tag + header fields) to reject false positives.\n"
@@ -1292,7 +1931,7 @@ int main(int argc, char **argv) {
             }
         }
         rounds_run++;
-        int unique_before = c.dex_unique;
+        int unique_before = c.dex_unique + c.so_count;
 
         if (rounds_limit > 1) fprintf(stderr, "\n[*] === Round %d ===\n", round + 1);
 
@@ -1314,10 +1953,10 @@ int main(int argc, char **argv) {
         }
 
         if (watch) {
-            int new_this = c.dex_unique - unique_before;
+            int new_this = (c.dex_unique + c.so_count) - unique_before;
             if (new_this > 0) dry_rounds = 0; else dry_rounds++;
-            fprintf(stderr, "[*] round %d: +%d new unique DEX (total=%d, dry=%d/%d)\n",
-                    round + 1, new_this, c.dex_unique, dry_rounds, watch_dry_limit);
+            fprintf(stderr, "[*] round %d: +%d new unique (DEX=%d, SO=%d, dry=%d/%d)\n",
+                    round + 1, new_this, c.dex_unique, c.so_count, dry_rounds, watch_dry_limit);
             if (dry_rounds >= watch_dry_limit) {
                 fprintf(stderr, "[*] stable set reached (%d dry rounds), stopping.\n", watch_dry_limit);
                 break;
@@ -1333,65 +1972,31 @@ int main(int argc, char **argv) {
             rounds_run, watch ? " (watch)" : "", c.procs, c.dex_unique,
             c.dex_total, c.dex_dedup, c.so_count);
 
-    // ---- Auto-fix SO files with SoFixer ----
+    // ---- Auto-fix SO files with built-in repair ----
     if (c.so_count > 0) {
-        const char *sofixer_paths[] = {
-            "/data/local/tmp/sofixer",
-            "/data/local/tmp/SoFixer64",
-            NULL
-        };
-        const char *sofixer = NULL;
-        // --sofixer <path> takes precedence over default lookup locations.
-        if (sofixer_path && access(sofixer_path, X_OK) == 0) {
-            sofixer = sofixer_path;
-        } else {
-            for (int i = 0; sofixer_paths[i]; i++) {
-                if (access(sofixer_paths[i], X_OK) == 0) {
-                    sofixer = sofixer_paths[i];
-                    break;
+        fprintf(stderr, "[*] Fixing %d SO files with built-in ELF repair...\n", c.so_count);
+        int fixed = 0, failed = 0;
+
+        DIR *d = opendir(so_dir);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d))) {
+                if (de->d_type != DT_REG && de->d_type != DT_UNKNOWN) continue;
+                size_t namelen = strlen(de->d_name);
+                if (namelen < 4 || strcmp(de->d_name + namelen - 3, ".so") != 0) continue;
+
+                char path[768];
+                snprintf(path, sizeof(path), "%s/%s", so_dir, de->d_name);
+                if (elf_repair_basic(path) == 0) {
+                    fixed++;
+                } else {
+                    failed++;
+                    fprintf(stderr, "[-] Repair failed: %s\n", de->d_name);
                 }
             }
+            closedir(d);
         }
-
-        if (sofixer) {
-            fprintf(stderr, "\n[*] Fixing SO files with SoFixer...\n");
-            int fixed = 0, failed = 0;
-
-            DIR *d = opendir(so_dir);
-            if (d) {
-                struct dirent *de;
-                while ((de = readdir(d))) {
-                    if (de->d_type != DT_REG && de->d_type != DT_UNKNOWN) continue;
-                    size_t namelen = strlen(de->d_name);
-                    if (namelen < 4 || strcmp(de->d_name + namelen - 3, ".so") != 0) continue;
-
-                    char src[768], dst[768];
-                    snprintf(src, sizeof(src), "%s/%s", so_dir, de->d_name);
-                    snprintf(dst, sizeof(dst), "%s/fixed_%s", so_dir, de->d_name);
-
-                    char cmd[2048];
-                    snprintf(cmd, sizeof(cmd), "%s -s %s -o %s -m 0x0 2>/dev/null", sofixer, src, dst);
-                    int ret = system(cmd);
-                    if (ret == 0) {
-                        unlink(src);
-                        rename(dst, src);
-                        fixed++;
-                        fprintf(stderr, "[+] Fixed: %s\n", de->d_name);
-                    } else {
-                        unlink(dst);
-                        failed++;
-                        fprintf(stderr, "[-] Fix failed: %s (kept raw dump)\n", de->d_name);
-                    }
-                }
-                closedir(d);
-            }
-            fprintf(stderr, "[*] SoFixer: %d fixed, %d failed\n", fixed, failed);
-        } else {
-            fprintf(stderr, "[!] SoFixer not found at /data/local/tmp/sofixer. "
-                    "SO files are raw memory dumps.\n"
-                    "[!] Get SoFixer: https://github.com/F8LEFT/SoFixer\n"
-                    "[!] Usage: sofixer -s input.so -o output.so -m 0x0\n");
-        }
+        fprintf(stderr, "[*] Built-in repair: %d fixed, %d failed\n", fixed, failed);
     }
 
     return 0;

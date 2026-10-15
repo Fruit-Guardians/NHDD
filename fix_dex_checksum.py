@@ -744,13 +744,23 @@ def validate_dex_deep_bool(data):
     return True
 
 
+def _move_to_bad(path):
+    """将文件移到同级 bad/ 子目录"""
+    bad_dir = os.path.join(os.path.dirname(path), "bad")
+    os.makedirs(bad_dir, exist_ok=True)
+    try:
+        os.rename(path, os.path.join(bad_dir, os.path.basename(path)))
+    except OSError:
+        pass
+
+
 def fix_dex_file_aligned(path):
     """镜像 GUI FixDexFile (dexfix.go)。一段式: 校验→重建→重校验→修头+校验和。
 
     文件处置与 GUI 完全一致:
-      - len < 0x70 或非 'dex\\n' magic  → 删除文件
-      - 深度校验失败 → 尝试 rebuild_map_list → 仍失败 → 删除
-      - rebuild 返回 None(无法重建) → 移到同级 invalid/ 子目录
+      - len < 0x70 或非 'dex\\n' magic  → 移到 bad/
+      - 深度校验失败 → 尝试 rebuild_map_list → 仍失败 → 移到 bad/
+      - rebuild 返回 None(无法重建) → 移到 bad/
       - 否则修 header_size/endian_tag/file_size/SHA-1/Adler32,有改动才落盘
 
     返回 (fixed, deleted, err_msg): deleted=True 表示已删除或已隔离。
@@ -762,34 +772,25 @@ def fix_dex_file_aligned(path):
         return False, False, f"read {path}: {e}"
 
     if len(data) < DEX_HEADER_SIZE:
-        try: os.remove(path)
-        except OSError: pass
-        return False, True, f"too small ({len(data)} bytes), deleted"
+        _move_to_bad(path)
+        return False, True, f"too small ({len(data)} bytes), moved to bad/"
 
     if bytes(data[0:4]) != b'dex\n':
-        try: os.remove(path)
-        except OSError: pass
-        return False, True, "not a DEX file, deleted"
+        _move_to_bad(path)
+        return False, True, "not a DEX file, moved to bad/"
 
     if not validate_dex_deep_bool(data):
         new_data = rebuild_map_list(data)
         if new_data is not None:
             data = new_data
-            # 重建后立即重校验(同 GUI),仍无效则删除
+            # 重建后立即重校验(同 GUI),仍无效则移到 bad/
             if not validate_dex_deep_bool(data):
-                try: os.remove(path)
-                except OSError: pass
-                return False, True, "still invalid after map_list rebuild, deleted"
+                _move_to_bad(path)
+                return False, True, "still invalid after map_list rebuild, moved to bad/"
         else:
-            # 无法重建 → 移到 invalid/(同 GUI)
-            invalid_dir = os.path.join(os.path.dirname(path), "invalid")
-            os.makedirs(invalid_dir, exist_ok=True)
-            new_path = os.path.join(invalid_dir, os.path.basename(path))
-            try:
-                os.rename(path, new_path)
-            except OSError:
-                pass
-            return False, True, "invalid DEX (map_list/section corrupted), moved to invalid/"
+            # 无法重建 → 移到 bad/
+            _move_to_bad(path)
+            return False, True, "invalid DEX (map_list/section corrupted), moved to bad/"
 
     fixed = False
     if u32(data, 0x24) != DEX_HEADER_SIZE:

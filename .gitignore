@@ -14,3 +14,5 @@ nhdd_output/
 gui/nhdd_output/
 third_party/SoFixer/build_android64/
 third_party/SoFixer/build/
+__pycache__/
+*.pyc

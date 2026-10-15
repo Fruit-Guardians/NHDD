@@ -18,6 +18,10 @@ export function IsDumping() {
   return window['go']['main']['App']['IsDumping']();
 }
 
+export function RepackAPK(arg1) {
+  return window['go']['main']['App']['RepackAPK'](arg1);
+}
+
 export function SelectDirectory() {
   return window['go']['main']['App']['SelectDirectory']();
 }
