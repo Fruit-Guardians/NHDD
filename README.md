@@ -1,83 +1,77 @@
 # NHDD — No-Hook DEX/SO Dumper
-简体中文 | [English](./README.EN.md)
+English | [简体中文](./README.zh-CN.md)
 
-NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存 DEX/SO Dump 工具**。它的核心程序 `nhdd` 以独立 root 进程运行，通过读取目标进程的 `/proc/<pid>/maps` 和 `/proc/<pid>/mem`（或使用 `process_vm_readv` 的 stealth2 模式），在内存中扫描 DEX/ELF magic，并将已加载到内存中的 DEX 或 SO 导出到文件。
+NHDD is an Android **external-memory DEX/SO dumping tool** for authorized reverse engineering, malware analysis, app debugging, and mobile security research. The Android-side scanner, `nhdd`, runs as an independent root process. It reads `/proc/<pid>/maps` and `/proc/<pid>/mem` (or uses `process_vm_readv` in stealth2 mode), scans the target process memory for DEX/ELF magic, and writes resident DEX or SO images to disk.
 
-和 Frida/Xposed/FART/fdex2 这类"进程内 Hook/注入"路线不同，NHDD 的核心思路是：**不向目标 App 注入代码，不修改目标进程方法入口，不依赖 ART Hook**。这可以显著降低由进程内 Hook、注入库、异常线程名、方法入口跳转等特征带来的暴露面。
+Unlike Frida/Xposed/FART/fdex2-style approaches, NHDD does **not** inject code into the target app, does **not** patch method entries, and does **not** require ART hooks. This reduces exposure to common in-process hook indicators such as injected libraries, suspicious threads, method-entry trampolines, and runtime framework modifications.
 
-> 重要说明：No-Hook 不等于"绝对无法检测"。目标 App、系统策略或加固方案仍可能通过进程状态变化、外部访问副作用、root 环境、SELinux 策略、进程被杀等方式影响结果。NHDD 的优势是低侵入、外部读取、部署简单，而不是承诺零风险或万能脱壳。
+> Important: no-hook does not mean “impossible to detect.” A target app, system policy, packer, or root environment can still affect results through process termination, permission restrictions, SELinux policy, root detection, or other side effects. NHDD’s practical advantage is low intrusiveness and simple deployment, not a guarantee of universal or risk-free dumping.
 
-## 适用范围
+## Scope
 
-适合：
+NHDD works best when:
 
-- 运行时会把完整或接近完整 DEX 放入内存的一代壳、普通加固壳、热修复/插件化加载场景。
-- 需要快速从真机 root 环境中批量扫描 DEX/SO 的逆向分析流程。
-- 不希望在目标进程内加载 Frida agent、Xposed 模块或修改 ART 的场景。
+- The protected app loads a complete or near-complete DEX into memory at runtime.
+- You need a fast root-based scanner for DEX/SO files already resident in an app process.
+- You want to avoid Frida agents, Xposed modules, Zygisk modules, or ART patching in the target process.
 
-不适合单独解决：
+NHDD alone is not enough when:
 
-- 只在方法调用时临时解密 CodeItem 的二代抽取壳。
-- DEX 结构存在大量空洞、方法体被擦除、仅动态恢复指令的场景。
-- 需要完整方法体回填、ClassLinker/LoadMethod 级别采集的场景。
+- The packer decrypts method bodies only on demand.
+- CodeItem data is erased, virtualized, or restored only during execution.
+- You need full method-body recovery and backfilling.
 
-对于二代抽取壳，建议使用 `--stealth2 --relaxed` 模式。`--stealth2` 使用 `process_vm_readv(2)` 替代打开 `/proc/<pid>/mem`，避免壳通过监控文件描述符检测到内存访问；`--relaxed` 通过 `endian_tag` (0x12345678) 和 header 结构验证 DEX，不依赖被壳抹除的 `dex\n` magic。完整方法体恢复通常还需要 DefineClass、LoadMethod、CodeItem backfill 或 FART 类流水线配合。
+For second-generation extraction shells, use NHDD with `--stealth2 --relaxed` mode. The `--stealth2` flag uses `process_vm_readv(2)` instead of opening `/proc/<pid>/mem`, which avoids detection by packers that monitor file descriptor access. The `--relaxed` flag validates DEX headers by `endian_tag` (0x12345678) and structure rather than relying on the `dex\n` magic that packers may erase. Full method-body recovery usually requires DefineClass/LoadMethod hooks, CodeItem capture/backfill, or a FART-style pipeline.
 
-## 当前仓库状态
+## Repository status
 
-| 模块 | 状态 | 说明 |
-|---|---|---|
-| `nhdd.c` | 可用 | 核心 Android ARM64 扫描器 v8.0，支持 DEX/SO、包名多进程、快照、watch、去重、DEX 校验修复、stealth2 (process_vm_readv)、relaxed DEX 验证、匿名映射扫描。 |
-| `nhdd_tui.py` | 推荐 | 终端交互版，支持 root 命令配置、watch 实时进度、拉取结果。当前最适合作为日常入口。 |
-| `gui/` | Wails GUI | Go + Wails v2 桌面 GUI，Web 前端，不需要 CGO。 |
-| `fix_dex_checksum.py` | 可用 | 独立 DEX header、SHA-1、Adler32 修复工具。 |
+| Component | Status | Notes |
+|---|---:|---|
+| `nhdd.c` | Ready | Core Android ARM64 scanner. v8.0: supports DEX/SO, package multi-process scanning, snapshots, watch mode, de-duplication, DEX checksum repair, stealth2 (process_vm_readv), relaxed DEX validation, and anonymous mapping scan. |
+| `nhdd_tui.py` | Recommended | Terminal UI with root-command configuration, watch progress, and result pulling. Best daily entry point in this snapshot. |
+| `gui/` | Wails GUI | Go + Wails v2 desktop GUI with Web frontend. No CGO required. |
+| `fix_dex_checksum.py` | Ready | Standalone DEX header, SHA-1, and Adler32 repair tool. |
 
-## 核心特性
+## Features
 
-- **外部读取**：通过 `/proc/<pid>/mem` 或 `process_vm_readv(2)` (stealth2) 读取目标虚拟地址空间，不注入目标进程。
-- **DEX dump**：扫描 `dex\n` magic（或 relaxed 模式下的 endian_tag），读取 header 中的 `file_size` 并按页导出。
-- **SO dump**：扫描 ELF magic，识别 ET_DYN，共享库导出后可调用 SoFixer 修复。
-- **包名多进程扫描**：传入包名时，会扫描所有 cmdline 匹配的进程，包括 `:remote` 等子进程。
-- **快照轮询**：`--snapshot N --interval T` 多轮扫描，适合捕获短暂存在的 DEX。
-- **watch 模式**：`--watch [K]` 持续扫描，连续 K 轮没有新 DEX 后停止，适合手动点开功能页捕获 lazy-load DEX。
-- **内容去重**：DEX 按重算后的 SHA-1 signature 去重，跨进程、跨轮次重复命中不会重复写入。
-- **DEX 自动修复**：修复 `file_size`、`header_size`、`endian_tag`、SHA-1 signature 和 Adler32 checksum。
-- **输出隔离**：默认清理旧的 `.dex/.so` 输出，避免多次运行结果混在一起；可用 `--keep` 保留。
-- **低侵入运行选项**：`--region-delay`、`--stealth`、`--stealth2`、`--relaxed`、`--anon`、`--name` 可调整扫描节奏、内存访问方式、DEX 验证策略和自身进程名，但不保证规避所有检测。
+- **External memory reading**: reads target process memory via `/proc/<pid>/mem` or `process_vm_readv(2)` (stealth2); no target-process injection.
+- **DEX dumping**: scans for `dex\n` magic (or `endian_tag` in relaxed mode), reads DEX `file_size`, and exports data page by page.
+- **SO dumping**: scans ELF ET_DYN mappings and optionally repairs dumps with SoFixer.
+- **Package multi-process scan**: when given a package name, scans all matching processes, including `:remote` child processes.
+- **Snapshot mode**: `--snapshot N --interval T` performs repeated fixed-round scans.
+- **Watch mode**: `--watch [K]` scans until K consecutive dry rounds, useful for lazy-loaded DEX while you navigate the app.
+- **Content de-duplication**: DEX files are de-duplicated by recomputed SHA-1 signature across processes and scan rounds.
+- **DEX auto-repair**: fixes `file_size`, `header_size`, `endian_tag`, SHA-1 signature, and Adler32 checksum.
+- **Output isolation**: old `.dex/.so` files are removed by default before a run; use `--keep` for incremental runs.
+- **Low-intrusion runtime options**: `--region-delay`, `--stealth`, `--stealth2`, `--relaxed`, `--anon`, and `--name` can adjust scan timing, memory access method, DEX validation strategy, and the scanner's visible process name. These are not detection-bypass guarantees.
 
-## 原理概览
+## How it works
 
 ```text
-目标 App 进程
-├── 壳/加固逻辑
+Target app process
+├── Packer/protection logic
 ├── ART/ClassLoader
-├── 已加载的 DEX 内存区域
-└── 已加载的 SO 映射区域
+├── Resident DEX memory regions
+└── Mapped SO regions
 
-独立 root 进程：nhdd
-├── 读取 /proc/<pid>/maps 获取可读内存区间
-├── 打开 /proc/<pid>/mem  (默认模式)
-│   或使用 process_vm_readv(2)  (--stealth2 模式，不打开 fd)
-├── 按页扫描 DEX/ELF magic
-│   或扫描 endian_tag 0x12345678  (--relaxed 模式)
-├── 根据 DEX header 或 ELF program header 计算导出范围
-├── 写入 out_dir/dex 或 out_dir/so
-└── 修复 DEX header/checksum，必要时调用 SoFixer
+Independent root process: nhdd
+├── Reads /proc/<pid>/maps
+├── Opens /proc/<pid>/mem  (default mode)
+│   OR uses process_vm_readv(2)  (--stealth2 mode, no fd opened)
+├── Scans readable pages for DEX/ELF magic
+│   OR scans for endian_tag 0x12345678  (--relaxed mode)
+├── Computes dump ranges from DEX headers or ELF program headers
+├── Writes files under out_dir/dex and out_dir/so
+└── Repairs DEX checksums and optionally invokes SoFixer
 ```
 
-关键点：`pread(/proc/<pid>/mem, ..., virtual_address)` 的 offset 是目标进程虚拟地址。只要 root/系统策略允许读取，就可以从外部读取目标进程地址空间中的内容。
+`pread(/proc/<pid>/mem, ..., virtual_address)` uses the target process virtual address as the file offset. If root permissions and system policy allow it, the scanner can read bytes from the target process address space without executing code inside that process.
 
-## 构建 Android 端 `nhdd`
+## Build Android-side `nhdd`
 
-要求：Android NDK r25+，目标设备为 ARM64。
+Requirements: Android NDK r25+ and an ARM64 Android target.
 
 ```bash
-<<<<<<< HEAD
-# 推荐：使用仓库脚本
-NDK=/path/to/android-ndk-r27 API=34 ./scripts/build_nhdd_android.sh
-
-# 或手动编译
-=======
 # Recommended cross-platform builder (Windows/macOS/Linux)
 python3 scripts/build_nhdd_android.py
 
@@ -91,28 +85,24 @@ NDK=/path/to/android-ndk-r27 API=34 ./scripts/build_nhdd_android.sh
 powershell -ExecutionPolicy Bypass -File scripts/build_nhdd_android.ps1 -Ndk C:\Android\android-ndk-r27
 
 # Manual command
->>>>>>> 144a47d2591c27f1bf7b2c92b15574c0e6078509
 /path/to/android-ndk-r27/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang \
   -O2 -static -Wall -Wextra -o nhdd nhdd.c
 ```
 
-推送到设备：
+Push to the device:
 
 ```bash
 adb push ./nhdd /data/local/tmp/nhdd
 adb shell chmod 755 /data/local/tmp/nhdd
 ```
 
-如果使用 SoFixer 修复 SO，也需要把 SoFixer 的 Android 可执行文件放到设备上，例如：
+If you want automatic SO repair, also push a SoFixer binary:
 
 ```bash
 adb push ./sofixer /data/local/tmp/sofixer
 adb shell chmod 755 /data/local/tmp/sofixer
 ```
 
-<<<<<<< HEAD
-## 命令行使用
-=======
 ## Environment doctor
 
 Before the first run, or after moving to a new machine, run:
@@ -140,25 +130,24 @@ python3 scripts/doctor.py --ndk /path/to/android-ndk-r27 --su-cmd "su -c"
 When a check fails, the `fix:` line gives the next command to run, such as installing the NDK, initializing submodules, connecting a device, or running `make android push` again.
 
 ## Command-line usage
->>>>>>> 144a47d2591c27f1bf7b2c92b15574c0e6078509
 
-### 1. 推荐：扫已运行 App + watch
+### 1. Recommended: scan a running app with watch mode
 
-先手动打开目标 App，让它进入稳定运行状态，然后执行：
+Open the target app manually and let it reach a stable state, then run:
 
 ```bash
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch 3 --max-seconds 120'
 ```
 
-运行过程中，在手机上手动进入登录、首页、搜索、个人中心、支付/订单等功能页。按需加载的 DEX 进入内存后会被 watch 模式捕获。
+While NHDD is running, navigate through important app pages such as login, home, search, profile, payment, order, or plugin-related screens. Lazy-loaded DEX files can be captured as they enter memory.
 
-拉取结果：
+Pull results:
 
 ```bash
 adb pull /data/local/tmp/nhdd_dump ./nhdd_output/com.example.app
 ```
 
-输出结构：
+Output layout:
 
 ```text
 nhdd_dump/
@@ -170,7 +159,7 @@ nhdd_dump/
     └── libyyy.so
 ```
 
-### 2. 冷启动后固定等待扫描
+### 2. Fixed wait after cold launch
 
 ```bash
 adb shell am force-stop com.example.app
@@ -179,25 +168,25 @@ sleep 4
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --dex'
 ```
 
-固定等待适合简单场景，但对强对抗壳不一定稳定。很多时候"扫已运行进程 + watch"比"强制重启 + 等 4 秒"更稳。
+Fixed waits are simple, but not always stable against aggressive packers. In many cases, scanning an already running process with watch mode is more reliable than force-stopping and relying on a 4-second window.
 
-### 3. 快照轮询
+### 3. Snapshot mode
 
 ```bash
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --snapshot 5 --interval 1'
 ```
 
-表示扫描 5 轮，每轮间隔 1 秒。
+This scans five rounds with a one-second interval between rounds.
 
-### 4. 同时导出 DEX 和 SO
+### 4. Dump both DEX and SO
 
 ```bash
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --all'
 ```
 
-### 5. KernelSU / APatch / 其他 root 命令
+### 5. KernelSU / APatch / other root commands
 
-不同 root 方案的命令可能不同：
+Different root setups may expose different command wrappers:
 
 ```bash
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
@@ -205,80 +194,77 @@ adb shell ksud -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dum
 adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
 ```
 
-### 6. 二代抽取壳（反检测模式）
+### 6. Second-generation extraction shells (anti-detection mode)
 
-对于检测 `/proc/<pid>/mem` 被打开后杀死进程的壳，使用 `--stealth2` 通过 `process_vm_readv(2)` 读取内存，不需要打开 mem 文件。配合 `--relaxed` 处理壳抹除 DEX magic 的情况：
+For packers that detect `/proc/<pid>/mem` being opened and kill the process, use `--stealth2` to read memory via `process_vm_readv(2)` instead. Combine with `--relaxed` for packers that erase DEX magic:
 
 ```bash
 adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --stealth2 --relaxed --stealth'
 ```
 
-- `--stealth2`：使用 `process_vm_readv(2)` 替代打开 `/proc/<pid>/mem`，不创建文件描述符，壳更难检测到内存访问。
-- `--relaxed`：通过 `endian_tag` (0x12345678) 和 header 结构验证 DEX，不依赖被壳抹除的 `dex\n` magic。
-- `--anon`：仅扫描匿名内存映射（跳过有文件路径的映射），适用于 DEX 被加载到匿名 mmap 区域的场景。
-- `--stealth`：添加区域间延时和伪装扫描器进程名。
+- `--stealth2`: Uses `process_vm_readv(2)` instead of opening `/proc/<pid>/mem`. No file descriptor is created, making it harder for packers to detect memory access.
+- `--relaxed`: Validates DEX headers by `endian_tag` (0x12345678) and header structure, instead of relying on `dex\n` magic that packers may erase.
+- `--anon`: Only scans anonymous memory mappings (no file-backed regions). Useful when DEX is loaded into anonymous mmap regions.
+- `--stealth`: Adds region delay and disguises the scanner process name.
 
-**技巧**：对于强对抗壳，扫描单个 PID 而非包名可以缩小检测窗口：
+**Tip**: For aggressive packers, scan a single PID instead of the full package name to minimize the detection window:
 
 ```bash
 adb shell kp -c '/data/local/tmp/nhdd 12345 /data/local/tmp/nhdd_dump --stealth2 --relaxed --stealth'
 ```
 
-## `nhdd` 参数
+## `nhdd` options
 
-| 参数 | 说明 |
+| Option | Description |
 |---|---|
-| `<pid\|package>` | 数字 PID 表示只扫单进程；包名表示扫描所有匹配进程。 |
-| `[output_dir]` | 输出目录，默认 `/data/local/tmp/nhdd_dump`。 |
-| `--dex` | 只导出 DEX，默认模式。 |
-| `--so` | 只导出 SO。 |
-| `--all` | 同时导出 DEX 和 SO。 |
-| `--snapshot N` | 固定扫描 N 轮。 |
-| `--interval T` | 每轮间隔秒数，默认 1。 |
-| `--watch [K]` | 持续扫描，连续 K 轮无新增 DEX 后停止，默认 K=3。 |
-| `--max-rounds N` | watch 最大轮数，默认 60。 |
-| `--max-seconds S` | watch 最大运行秒数，默认 120。 |
-| `--keep` | 不清理输出目录中旧的 `.dex/.so`。 |
-| `--stealth` | 启用默认区域延时，并使用默认伪装进程名。 |
-| `--stealth2` | 使用 `process_vm_readv(2)` 替代打开 `/proc/<pid>/mem`，避免壳通过 FD 检测到内存访问。二代壳推荐。 |
-| `--relaxed` | 通过 `endian_tag` (0x12345678) 和 header 结构验证 DEX，不依赖被壳抹除的 `dex\n` magic。 |
-| `--anon` | 仅扫描匿名内存映射（跳过有文件路径的映射）。 |
-| `--region-delay MS` | 每个 maps 区域之间延迟 MS 毫秒。 |
-| `--name NAME` / `--disguise NAME` | 修改自身 `/proc/self/comm` 和 `/proc/self/cmdline` 展示名。 |
-| `--sofixer PATH` | 指定 SoFixer 路径，默认查找 `/data/local/tmp/sofixer` 或 `/data/local/tmp/SoFixer64`。 |
+| `<pid\|package>` | Numeric PID scans one process; package name scans all matching processes. |
+| `[output_dir]` | Output directory. Default: `/data/local/tmp/nhdd_dump`. |
+| `--dex` | Dump DEX only. Default mode. |
+| `--so` | Dump SO only. |
+| `--all` | Dump both DEX and SO. |
+| `--snapshot N` | Run N fixed scan rounds. |
+| `--interval T` | Seconds between rounds. Default: 1. |
+| `--watch [K]` | Keep scanning until K consecutive dry rounds. Default K: 3. |
+| `--max-rounds N` | Maximum rounds in watch mode. Default: 60. |
+| `--max-seconds S` | Maximum wall time in watch mode. Default: 120. |
+| `--keep` | Do not remove old `.dex/.so` files before scanning. |
+| `--stealth` | Enable a default region delay and a default disguised process name. |
+| `--stealth2` | Use `process_vm_readv(2)` instead of opening `/proc/<pid>/mem`. Avoids FD-based detection by packers. Recommended for second-generation shells. |
+| `--relaxed` | Validate DEX by `endian_tag` (0x12345678) and header structure instead of `dex\n` magic. For packers that erase DEX magic. |
+| `--anon` | Only scan anonymous memory mappings (skip file-backed regions). |
+| `--region-delay MS` | Sleep MS milliseconds between memory map regions. |
+| `--name NAME` / `--disguise NAME` | Change the scanner’s visible `/proc/self/comm` and `/proc/self/cmdline` name. |
+| `--sofixer PATH` | Specify SoFixer path. Defaults to `/data/local/tmp/sofixer` or `/data/local/tmp/SoFixer64`. |
 
-## TUI 使用方式（推荐）
+## Recommended TUI workflow
 
-安装依赖：
+Install dependency:
 
 ```bash
 python3 -m pip install rich
 ```
 
-运行：
+Run:
 
 ```bash
 python3 nhdd_tui.py
 python3 nhdd_tui.py com.example.app -o ./nhdd_output
 ```
 
-如果 ADB server 在宿主机或远程机器上：
+If your ADB server runs on another host or on the Windows host from a VM:
 
 ```bash
 NHDD_ADB='adb -H 192.168.238.1 -P 5037' python3 nhdd_tui.py com.example.app -o ./nhdd_output
 ```
 
-TUI 会提示：
+The TUI lets you configure:
 
-- 是否重启 App。
-- 是否启用 watch。
-- root 命令使用 `su -c`、`kp -c`、`ksud -c` 还是留空。
-- dump 模式选择 DEX、SO 或 ALL。
-- 本地输出目录。
+- Whether to restart the app.
+- Whether to use watch mode.
+- Root command: `su -c`, `kp -c`, `ksud -c`, or empty.
+- Dump mode: DEX, SO, or ALL.
+- Local output directory.
 
-<<<<<<< HEAD
-## 桌面 GUI 使用方式
-=======
 Each TUI run gets an isolated run id. Results are saved under:
 
 ```text
@@ -291,18 +277,17 @@ nhdd_output/<package>/<YYYYMMDD-HHMMSS>/
 This keeps repeated tests for the same app from mixing old files into the current run statistics.
 
 ## Desktop GUI workflow
->>>>>>> 144a47d2591c27f1bf7b2c92b15574c0e6078509
 
-桌面 GUI 基于 Go + Wails v2，提供原生窗口 + Web 前端，不需要 CGO 或 GCC。
+The desktop GUI is built with Go + Wails v2, providing a native window with a Web frontend. No CGO or GCC required.
 
-构建：
+Build:
 
 ```bash
 cd gui
 wails build
 ```
 
-运行时把 Android ARM64 版 `nhdd` 放在 GUI 可执行文件同目录：
+Place the Android ARM64 `nhdd` binary next to the GUI executable:
 
 ```text
 NHDD-run/
@@ -310,102 +295,102 @@ NHDD-run/
 └── nhdd
 ```
 
-GUI 支持：ADB 连接、应用列表、root 命令配置、dump 模式（DEX/SO/ALL）、watch 模式、结果拉取。
+The GUI supports: ADB connection, app list, root command configuration, dump mode (DEX/SO/ALL), watch mode, and result pulling.
 
-## 独立修复 DEX
+## Standalone DEX repair
 
-`nhdd` 已经内置 DEX 修复。如果需要对已有 dump 文件重新修复：
+`nhdd` already repairs DEX files during dumping. To repair existing dumps manually:
 
 ```bash
 python3 fix_dex_checksum.py path/to/classes.dex
 ```
 
-修复内容包括：
+Repair order:
 
 1. `header_size -> 0x70`
 2. `endian_tag -> 0x12345678`
-3. `file_size -> 实际文件长度`
-4. SHA-1 signature，覆盖 `data[0x20:]`
-5. Adler32 checksum，覆盖 `data[0x0c:]`
+3. `file_size -> actual file length`
+4. SHA-1 signature over `data[0x20:]`
+5. Adler32 checksum over `data[0x0c:]`
 
-## 常见问题
+## FAQ
 
-### 1. 为什么传包名比传 PID 更推荐？
+### Why is package-name mode recommended over PID mode?
 
-很多 App 会有多个进程，真实解密后的 DEX 可能在 `:remote`、`:push`、`:sandbox` 等子进程里。传包名时，`nhdd` 会根据 `/proc/*/cmdline` 匹配所有相关进程；传单个 PID 只会扫描一个进程，容易漏。
+Many Android apps run multiple processes. The actual decrypted DEX may live in a `:remote`, `:push`, or sandbox child process. Package-name mode scans all matching cmdline entries. PID mode scans only one process and may miss the important one.
 
-### 2. 为什么 GUI 结果比命令行/TUI 少？
+### Why can the GUI produce fewer results than command line or TUI?
 
-GUI 在某些场景下可能使用固定等待流程。遇到多进程壳或 lazy-load 场景，建议用：
+The GUI may use a fixed-wait flow in some scenarios. For multi-process or lazy-load targets, use:
 
 ```bash
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch'
 ```
 
-或直接使用 `nhdd_tui.py`。
+or use `nhdd_tui.py`.
 
-### 3. 为什么 dump 出来的 DEX 可以打开，但代码不完整？
+### Why can a dumped DEX open but still have incomplete code?
 
-`nhdd` 会按 header 中的 `file_size` 导出 DEX。如果某些页在读取时不可读，当前实现会保留文件大小并将缺失页填 0。这样有利于保留结构和偏移，但并不代表方法体一定完整。二代抽取壳常需要方法级采集与回填。
+NHDD exports according to the DEX `file_size`. If some pages cannot be read, the current implementation keeps the file size and zero-fills missing pages. This helps preserve structure and offsets, but it does not guarantee that every method body is present. Extraction shells may require method-level capture and backfill.
 
-### 4. 为什么没有扫到 DEX？
+### Why did NHDD find zero DEX files?
 
-常见原因：
+Common causes:
 
-- App 未运行或刚启动即被杀。
-- root 命令没有真正获得读取 `/proc/<pid>/mem` 的权限。
-- 目标 DEX 只短暂存在，单轮扫描错过了时机。
-- 真实 DEX 在子进程，但你传入了单个 PID。
-- 壳不是"完整 DEX 驻留内存"模型，而是方法级抽取/动态恢复。
-- **壳检测到 `/proc/<pid>/mem` 被打开后杀死了进程。** 使用 `--stealth2` 模式。
+- The app is not running or is killed during scanning.
+- Your root command does not actually allow reading `/proc/<pid>/mem`.
+- The DEX exists only briefly and a single scan missed it.
+- The real DEX is in a child process, but you passed a single PID.
+- The packer is not a full-resident-DEX model and uses method-level extraction or virtualization.
+- **The packer detected `/proc/<pid>/mem` being opened and killed the process.** Use `--stealth2` mode.
 
-建议先用包名 + watch：
+Start with package-name watch mode:
 
 ```bash
 adb shell su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --watch 3 --max-seconds 120'
 ```
 
-如果扫描时 App 崩溃，尝试反检测模式：
+If the app crashes during scanning, try anti-detection mode:
 
 ```bash
 adb shell kp -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --stealth2 --relaxed --stealth'
 ```
 
-### 5. Android App 能直接编译吗？
+### Can the Android app module be built directly?
 
-当前仓库不包含 `app/` 模块。
+Not in this snapshot. The `app/` module is not included in this repository.
 
-## 项目结构
+## Project layout
 
 ```text
 NHDD/
-├── nhdd.c                         # Android 端核心扫描器
-├── fix_dex_checksum.py            # 独立 DEX 修复工具
-├── nhdd_tui.py                    # 推荐 TUI 控制器
+├── nhdd.c                         # Android-side core scanner
+├── fix_dex_checksum.py            # Standalone DEX repair tool
+├── nhdd_tui.py                    # Recommended TUI controller
 ├── scripts/
-│   ├── build_nhdd_android.sh      # 构建 Android ARM64 nhdd
+│   ├── build_nhdd_android.sh      # Build Android ARM64 nhdd
 │   ├── build_fyne_windows.ps1
 │   └── build_fyne_windows_from_linux.sh
-├── gui/                           # Go/Wails v2 桌面 GUI
-└── BUILD_WINDOWS.md               # Windows/Linux GUI 构建说明
+├── gui/                           # Go/Wails v2 desktop GUI
+└── BUILD_WINDOWS.md               # Windows/Linux GUI build notes
 ```
 
-## 作者
+## Authors
 
 - **漫宿骄盛**
 - **weixiao**
 
-仓库地址：https://github.com/mansujiaosheng/NHDD
+Repository: https://github.com/mansujiaosheng/NHDD
 
-## 合法使用声明
+## Authorized use only
 
-本项目仅用于：
+This project is intended for:
 
-- 自有 App 调试与兼容性分析。
-- 获得明确授权的移动安全测试。
-- 恶意样本分析、加固评估、逆向学习与研究。
+- Debugging and analyzing your own apps.
+- Authorized mobile security testing.
+- Malware analysis, packer evaluation, reverse-engineering education, and research.
 
-请勿将本项目用于未授权访问、绕过商业授权、窃取代码或数据、侵犯第三方权益等行为。使用者需要自行确认所在地法律法规、目标授权范围和测试边界。项目作者不对任何未授权使用造成的后果负责。
+Do not use this project for unauthorized access, bypassing commercial licensing, stealing code or data, or violating third-party rights. Users are responsible for complying with applicable laws, permissions, and testing boundaries. The authors are not responsible for misuse.
 
 ## License
 

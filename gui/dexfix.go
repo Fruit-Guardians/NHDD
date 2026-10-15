@@ -7,7 +7,6 @@ import (
 	"hash/adler32"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -121,10 +120,6 @@ func FixDexDirectory(dir string) (*DexStats, error) {
 	}
 
 	stats := &DexStats{Total: len(dexFiles)}
-<<<<<<< HEAD
-=======
-	invalidDir := filepath.Join(dir, "invalid")
->>>>>>> 144a47d2591c27f1bf7b2c92b15574c0e6078509
 
 	for _, f := range dexFiles {
 		fixed, deleted, err := FixDexFile(f)
@@ -140,24 +135,28 @@ func FixDexDirectory(dir string) (*DexStats, error) {
 		}
 		stats.OK++
 	}
-<<<<<<< HEAD
-=======
-
-	// 统计 invalid/ 目录中由 FixDexFile 隔离但未在主循环计数的 DEX
-	if entries, err := os.ReadDir(invalidDir); err == nil {
-		for _, e := range entries {
-			if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".dex") {
-				stats.BadFiles = append(stats.BadFiles, e.Name())
-			}
-		}
-	}
-
->>>>>>> 144a47d2591c27f1bf7b2c92b15574c0e6078509
 	return stats, nil
 }
 
 func findDexFiles(dir string) ([]string, error) {
-	return findFilesByExt(dir, ".dex")
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			name := strings.ToLower(entry.Name())
+			if path != dir && (name == "bad" || name == "partial") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(strings.ToLower(entry.Name()), ".dex") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
 }
 
 func findFilesByExt(dir, ext string) ([]string, error) {
@@ -400,9 +399,13 @@ func RebuildMapList(data []byte) []byte {
 	}
 
 	// 按 offset 排序
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].off < entries[j].off
-	})
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[i].off > entries[j].off {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
 
 	mapListSize := 4 + len(entries)*12
 	oldMapOff := binary.LittleEndian.Uint32(data[0x34:0x38])
