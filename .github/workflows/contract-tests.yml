@@ -1,0 +1,62 @@
+name: contract-tests
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "fix_dex_checksum.py"
+      - "fix_so.py"
+      - "gui/dexfix.go"
+      - "gui/sofix.go"
+      - "NHDD-cpp-modular/**"
+      - "tests/**"
+      - ".github/workflows/contract-tests.yml"
+  pull_request:
+    paths:
+      - "fix_dex_checksum.py"
+      - "fix_so.py"
+      - "gui/dexfix.go"
+      - "gui/sofix.go"
+      - "NHDD-cpp-modular/**"
+      - "tests/**"
+      - ".github/workflows/contract-tests.yml"
+  workflow_dispatch:
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Prepare wails embed placeholder
+        run: |
+          mkdir -p gui/frontend/dist
+          echo '<html><body>ci placeholder</body></html>' > gui/frontend/dist/index.html
+
+      - name: Run contract comparison (python / go / v9)
+        run: python3 tests/contract/compare.py
+
+      - name: Check against frozen baseline (if present)
+        run: |
+          if [ -f tests/contract/expected.json ]; then
+            python3 tests/contract/compare.py --check
+          else
+            echo "expected.json not frozen yet — report-only mode"
+          fi
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-report
+          path: |
+            tests/contract/REPORT.md
+            tests/contract/.work/*.json
+          if-no-files-found: warn

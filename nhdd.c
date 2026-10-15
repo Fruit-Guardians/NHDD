@@ -1857,8 +1857,7 @@ int main(int argc, char **argv) {
             "  SO files are automatically repaired with built-in elf_repair_basic.\n"
             "\n"
             "  DEX checksums (SHA-1 + Adler32) are auto-fixed; hits are validated\n"
-            "  (DEX version tag + header fields) to reject false positives.\n"
-            "  SO files are dumped from memory (auto-fixed via SoFixer if present).\n",
+            "  (DEX version tag + header fields) to reject false positives.\n",
             argv[0]);
         return 1;
     }
