@@ -1338,6 +1338,79 @@ def repair_elf(data_in: bytes, *, strip_bad_sht: bool = True, rebuild_bad_sht: b
 SO_MIN_SIZE = 0x40  # 最小 ELF 头大小，用于快速跳过明显非 ELF 文件
 
 
+def repair_elf_aligned(data_in: bytes) -> Tuple[bytes, List[str]]:
+    """严格镜像 gui/sofix.go repairSo 的最小化修复(对齐管线专用)。
+
+    只做再加载必需的四件事:
+      1. 补回 magic + EI_DATA=1 + EI_VERSION=1(不动 e_ehsize 等其余头字段);
+      2. PT_LOAD / PT_DYNAMIC 的 p_offset = p_vaddr;
+      3. PT_LOAD 的 p_filesz < p_memsz 时抬到 p_memsz(SoFixer parity,消空洞);
+      4. 其余一概不动:不重建/清空 SHT、不裁 extent、不动 PT_DYNAMIC 类型。
+
+    文件无法判读时抛 ValueError,由调用方按基线隔离到 bad/。
+    需要"修到 IDA 友好"的完整能力请走 repair_elf(CLI --deep 路径)。
+    """
+    data = bytearray(data_in)
+    actions: List[str] = []
+    if len(data) < SO_MIN_SIZE:
+        raise ValueError(f"smaller than ELF header ({len(data)} bytes)")
+    if data[4] not in (1, 2):
+        raise ValueError("bad EI_CLASS")
+    is64 = data[4] == 2
+    if is64:
+        e_phoff = u64(data, 32)
+        e_phentsize = u16(data, 54)
+        e_phnum = u16(data, 56)
+    else:
+        e_phoff = u32(data, 28)
+        e_phentsize = u16(data, 42)
+        e_phnum = u16(data, 44)
+    if e_phnum == 0 or e_phentsize == 0:
+        raise ValueError("empty PHT")
+    if e_phoff + e_phnum * e_phentsize > len(data):
+        raise ValueError("PHT extends past EOF")
+
+    if bytes(data[0:4]) != ELF_MAGIC:
+        data[0:4] = ELF_MAGIC
+        actions.append("restore e_ident magic")
+    if data[5] != 1:
+        data[5] = 1
+        actions.append("set EI_DATA=ELFDATA2LSB")
+    if data[6] != 1:
+        data[6] = 1
+        actions.append("set EI_VERSION=EV_CURRENT")
+
+    for i in range(e_phnum):
+        base = e_phoff + i * e_phentsize
+        p_type = u32(data, base)
+        if is64:
+            p_offset = u64(data, base + 8)
+            p_vaddr = u64(data, base + 16)
+            p_filesz = u64(data, base + 32)
+            p_memsz = u64(data, base + 40)
+            if p_type in (PT_LOAD, PT_DYNAMIC) and p_offset != p_vaddr:
+                p64(data, base + 8, p_vaddr)
+                actions.append(f"PHDR[{i}].p_offset: 0x{p_offset:x} -> 0x{p_vaddr:x}")
+            if p_type == PT_LOAD and p_filesz < p_memsz:
+                p64(data, base + 32, p_memsz)
+                actions.append(f"PHDR[{i}].p_filesz: 0x{p_filesz:x} -> 0x{p_memsz:x}")
+        else:
+            p_offset = u32(data, base + 4)
+            p_vaddr = u32(data, base + 8)
+            p_filesz = u32(data, base + 16)
+            p_memsz = u32(data, base + 20)
+            if p_type in (PT_LOAD, PT_DYNAMIC) and p_offset != p_vaddr:
+                p32(data, base + 4, p_vaddr)
+                actions.append(f"PHDR[{i}].p_offset: 0x{p_offset:x} -> 0x{p_vaddr:x}")
+            if p_type == PT_LOAD and p_filesz < p_memsz:
+                p32(data, base + 16, p_memsz)
+                actions.append(f"PHDR[{i}].p_filesz: 0x{p_filesz:x} -> 0x{p_memsz:x}")
+
+    if not actions:
+        actions.append("no structural change")
+    return bytes(data), actions
+
+
 def validate_elf_deep(data: bytes) -> bool:
     """深度校验 ELF/SO 结构是否可信。兼容 repack_apk.py 的导入。
 
@@ -1534,6 +1607,8 @@ def classify_so_full(path: str, layout: str = "file") -> Tuple[str, str, Dict[st
 def fix_so_file(path: str, layout: str = "file") -> Tuple[bool, bool, Optional[str]]:
     """兼容旧版 fix_so.py：返回 (fixed, deleted, err)。
 
+    对齐管线:修复走 repair_elf_aligned(Go sofix.go 镜像),修复后再做一次
+    深度校验,仍不合格按基线隔离到 bad/。
     fixed: 文件是否被修改；deleted: 是否移动到 bad/；err: None 或错误说明。
     """
     try:
@@ -1547,10 +1622,14 @@ def fix_so_file(path: str, layout: str = "file") -> Tuple[bool, bool, Optional[s
         return False, True, f"bad: {reason}, moved to bad/"
 
     try:
-        new, actions = repair_elf(old)
+        new, actions = repair_elf_aligned(old)
     except Exception as e:
         _move_to_bad(path)
         return False, True, f"repair failed: {e}, moved to bad/"
+
+    if not validate_elf_deep(new):
+        _move_to_bad(path)
+        return False, True, "still invalid after repair, moved to bad/"
 
     changed = new != old
     if changed:

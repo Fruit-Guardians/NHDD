@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "baseline": "go",
+  "files": {
+    "dex_valid.dex": {
+      "class": "OK",
+      "sha256": "7b3e954a9dd535e0d67890fb61d8c6636bbb49a4bac7d8e747d13fd75a873713",
+      "where": "inplace"
+    },
+    "dex_bad_adler32.dex": {
+      "class": "FIXED",
+      "sha256": "7b3e954a9dd535e0d67890fb61d8c6636bbb49a4bac7d8e747d13fd75a873713",
+      "where": "inplace"
+    },
+    "dex_bad_sha1.dex": {
+      "class": "FIXED",
+      "sha256": "7b3e954a9dd535e0d67890fb61d8c6636bbb49a4bac7d8e747d13fd75a873713",
+      "where": "inplace"
+    },
+    "dex_filesize_low.dex": {
+      "class": "FIXED",
+      "sha256": "7b3e954a9dd535e0d67890fb61d8c6636bbb49a4bac7d8e747d13fd75a873713",
+      "where": "inplace"
+    },
+    "dex_header_size_bad.dex": {
+      "class": "FIXED",
+      "sha256": "7b3e954a9dd535e0d67890fb61d8c6636bbb49a4bac7d8e747d13fd75a873713",
+      "where": "inplace"
+    },
+    "dex_endian_bad.dex": {
+      "class": "FIXED",
+      "sha256": "7b3e954a9dd535e0d67890fb61d8c6636bbb49a4bac7d8e747d13fd75a873713",
+      "where": "inplace"
+    },
+    "dex_maplist_off_bad.dex": {
+      "class": "FIXED",
+      "sha256": "6727045050b6791fbaa6712f84d81754d58c97bccd8ff598e292a536e2129fbd",
+      "where": "inplace"
+    },
+    "dex_maplist_count_huge.dex": {
+      "class": "FIXED",
+      "sha256": "22be434fa02ac387bd1c885eb53ae14f35387f46e11cd15422ca0aa1d6a919f1",
+      "where": "inplace"
+    },
+    "dex_too_small.dex": {
+      "class": "BAD",
+      "sha256": "e9dffcc8238358820041e21c3c04e9a693f10afa242ac84b6e36524f64c0a81b",
+      "where": "bad/"
+    },
+    "dex_magic_erased.dex": {
+      "class": "BAD",
+      "sha256": "41f5b1fff6d53267108e77dde8508274fdf8fa77a6d171f80e5b5520945054f1",
+      "where": "bad/"
+    },
+    "so_valid.so": {
+      "class": "OK",
+      "sha256": "549fc8869b1613b4418cd28a8ae9da1fde78fc6bba20a6eb4800fb1d3467cd14",
+      "where": "inplace"
+    },
+    "so_magic_erased.so": {
+      "class": "FIXED",
+      "sha256": "549fc8869b1613b4418cd28a8ae9da1fde78fc6bba20a6eb4800fb1d3467cd14",
+      "where": "inplace"
+    },
+    "so_offset_skew.so": {
+      "class": "FIXED",
+      "sha256": "549fc8869b1613b4418cd28a8ae9da1fde78fc6bba20a6eb4800fb1d3467cd14",
+      "where": "inplace"
+    },
+    "so_et_exec.so": {
+      "class": "BAD",
+      "sha256": "ba4215d532aae8837b355c8c60606c07ad80d8f3d155f8594c5259d879355b53",
+      "where": "bad/"
+    },
+    "so_tiny.so": {
+      "class": "BAD",
+      "sha256": "1f9a8a9339effe4f2b0027e148d4651c6d3bd81e5501961a26784b51e6f5a9e6",
+      "where": "bad/"
+    },
+    "so_not_elf.so": {
+      "class": "BAD",
+      "sha256": "c9d8e3352f9f790d8b0be13cb1c18ed7963009888be04acc065ee5efbd934076",
+      "where": "bad/"
+    },
+    "so_phnum_bogus.so": {
+      "class": "BAD",
+      "sha256": "9da6d84f7bde42c7111f07e6363443704efef97001887365d63a41141c301be8",
+      "where": "bad/"
+    }
+  }
+}
