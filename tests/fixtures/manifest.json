@@ -134,8 +134,8 @@
       "size": 512,
       "predict": {
         "go": "OK",
-        "python": "FIXED",
-        "v9": "OK"
+        "python": "OK",
+        "v9": "FIXED"
       }
     },
     {
