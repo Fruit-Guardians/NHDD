@@ -10,6 +10,7 @@
       "predict": {
         "go": "OK",
         "python": "OK",
+        "v8": "OK",
         "v9": "OK"
       }
     },
@@ -22,6 +23,7 @@
       "predict": {
         "go": "FIXED",
         "python": "FIXED",
+        "v8": "FIXED",
         "v9": "FIXED"
       },
       "final_equiv": "dex_valid.dex"
@@ -35,6 +37,7 @@
       "predict": {
         "go": "FIXED",
         "python": "FIXED",
+        "v8": "FIXED",
         "v9": "FIXED"
       },
       "final_equiv": "dex_valid.dex"
@@ -48,6 +51,7 @@
       "predict": {
         "go": "FIXED",
         "python": "FIXED",
+        "v8": "FIXED",
         "v9": "FIXED"
       },
       "final_equiv": "dex_valid.dex"
@@ -61,6 +65,7 @@
       "predict": {
         "go": "FIXED",
         "python": "FIXED",
+        "v8": "FIXED",
         "v9": "FIXED"
       },
       "final_equiv": "dex_valid.dex"
@@ -74,6 +79,7 @@
       "predict": {
         "go": "FIXED",
         "python": "FIXED",
+        "v8": "FIXED",
         "v9": "FIXED"
       },
       "final_equiv": "dex_valid.dex"
@@ -87,6 +93,7 @@
       "predict": {
         "go": "FIXED",
         "python": "FIXED",
+        "v8": "FIXED",
         "v9": "?"
       }
     },
@@ -99,6 +106,7 @@
       "predict": {
         "go": "FIXED",
         "python": "FIXED",
+        "v8": "FIXED",
         "v9": "?"
       }
     },
@@ -111,6 +119,7 @@
       "predict": {
         "go": "BAD",
         "python": "BAD",
+        "v8": "OK",
         "v9": "N/A"
       }
     },
@@ -123,6 +132,7 @@
       "predict": {
         "go": "BAD",
         "python": "BAD",
+        "v8": "OK",
         "v9": "N/A"
       }
     },
@@ -135,6 +145,7 @@
       "predict": {
         "go": "OK",
         "python": "OK",
+        "v8": "FIXED",
         "v9": "FIXED"
       },
       "cli": {
@@ -151,6 +162,7 @@
       "predict": {
         "go": "FIXED",
         "python": "FIXED",
+        "v8": "FIXED",
         "v9": "FIXED"
       },
       "final_equiv": "so_valid.so",
@@ -168,6 +180,7 @@
       "predict": {
         "go": "FIXED",
         "python": "FIXED",
+        "v8": "FIXED",
         "v9": "FIXED"
       },
       "final_equiv": "so_valid.so",
@@ -185,6 +198,7 @@
       "predict": {
         "go": "BAD",
         "python": "BAD",
+        "v8": "FIXED",
         "v9": "N/A"
       },
       "cli": {
@@ -200,6 +214,7 @@
       "predict": {
         "go": "BAD",
         "python": "BAD",
+        "v8": "OK",
         "v9": "N/A"
       },
       "cli": {
@@ -215,6 +230,7 @@
       "predict": {
         "go": "BAD",
         "python": "BAD",
+        "v8": "FIXED",
         "v9": "N/A"
       },
       "cli": {
@@ -230,6 +246,7 @@
       "predict": {
         "go": "BAD",
         "python": "BAD",
+        "v8": "OK",
         "v9": "N/A"
       },
       "cli": {

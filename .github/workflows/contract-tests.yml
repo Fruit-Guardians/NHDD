@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, dev]
     paths:
+      - "nhdd.c"
       - "fix_dex_checksum.py"
       - "fix_so.py"
       - "gui/dexfix.go"
@@ -13,6 +14,7 @@ on:
       - ".github/workflows/contract-tests.yml"
   pull_request:
     paths:
+      - "nhdd.c"
       - "fix_dex_checksum.py"
       - "fix_so.py"
       - "gui/dexfix.go"
@@ -41,7 +43,7 @@ jobs:
           mkdir -p gui/frontend/dist
           echo '<html><body>ci placeholder</body></html>' > gui/frontend/dist/index.html
 
-      - name: Run contract comparison (python / go / v9)
+      - name: Run contract comparison (python / go / v8 / v9 / python_cli)
         run: python3 tests/contract/compare.py
 
       - name: Check against frozen baseline (if present)
