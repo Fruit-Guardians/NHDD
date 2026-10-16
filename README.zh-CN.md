@@ -293,7 +293,7 @@ TUI 会提示：
 - dump 模式选择 DEX、SO 或 ALL。
 - 本地输出目录。
 
-设备端流程：TUI 会优先把 **v9 C++ 版二进制**（`NHDD-cpp-modular` 构建产物）推送到 `/data/local/tmp/nhdd`，找不到才回退根目录的 v8 `nhdd`；每次运行前先用 root 命令清理重建设备端输出目录 `/data/local/tmp/.cache/nhdd`，拉取时优先 `adb root`，不可用则回退 root `chmod`/`chcon`。注意：上文原始 `nhdd` 命令行示例默认写入 `/data/local/tmp/nhdd_dump`，而 TUI/GUI 各自管理自己的输出位置。
+设备端流程：TUI 会优先把 **v9 C++ 版二进制**（`NHDD-cpp-modular` 构建产物）推送到 `/data/local/tmp/nhdd`，找不到才回退根目录的 v8 `nhdd`；设备端输出目录统一为 `/data/local/tmp/nhdd_dump`（与命令行默认值和 GUI 相同），TUI 每次运行前用 root 命令清理重建该目录，即“最近一次运行优先”；拉取时优先 `adb root`，不可用则回退 root `chmod`/`chcon`。
 
 拉取后 TUI 会自动用 `fix_dex_checksum.py` / `fix_so.py` 修复结果（分类口径与 GUI 一致），写入 `log.txt`，并可用 `scripts/repack_apk_fast.py` 把 dump 重打包进 APK（不签名，仅供 jadx 静态分析）。
 

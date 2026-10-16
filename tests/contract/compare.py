@@ -97,6 +97,13 @@ def run_impl(impl: str, out_json: str) -> dict:
         if proc.returncode != 0:
             return {"impl": impl, "skipped": True,
                     "reason": "v9 runner failed: " + (proc.stderr or proc.stdout)[-400:]}
+    elif impl == "python_cli":
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HERE, "run_python_cli.py")],
+            env=env, capture_output=True, text=True, cwd=REPO)
+        if proc.returncode != 0:
+            return {"impl": impl, "skipped": True,
+                    "reason": "cli runner failed: " + (proc.stderr or proc.stdout)[-400:]}
     with open(out_json, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
@@ -112,9 +119,11 @@ def build_report(fixtures: list, runs: dict) -> tuple[list, list]:
     go = index_results(runs["go"])
     py = index_results(runs["python"])
     v9 = index_results(runs["v9"])
+    cli = index_results(runs.get("python_cli", {}))
     go_skipped = runs["go"].get("skipped")
     py_skipped = runs["python"].get("skipped")
     v9_skipped = runs["v9"].get("skipped")
+    cli_skipped = runs.get("python_cli", {}).get("skipped")
 
     for fx in fixtures:
         name = fx["name"]
@@ -124,7 +133,7 @@ def build_report(fixtures: list, runs: dict) -> tuple[list, list]:
         pred = fx.get("predict", {})
 
         def cell(r):
-            return r["status"] if r else ("SKIP" if True else "")
+            return r["status"] if r else "—"
 
         # prediction checks (informational)
         for impl_name, r in (("go", g), ("python", p), ("v9", v)):
@@ -151,10 +160,27 @@ def build_report(fixtures: list, runs: dict) -> tuple[list, list]:
         if v and pred.get("v9") not in ("?", "N/A", None, ""):
             pass  # drift already covered by PREDICTION-MISMATCH loop above
 
+        # CLI 全量修复路径:独立基线,不比对 go 字节;只查硬不变量
+        c = cli.get(name) if not cli_skipped else None
+        cli_exp = fx.get("cli")
+        if c and cli_exp:
+            if cli_exp.get("rejected"):
+                if c["status"] != "REJECTED":
+                    divergences.append(
+                        f"CLI-INVARIANT {name}: expected REJECTED, got {c['status']}")
+            elif c["status"] in ("OK", "FIXED"):
+                if cli_exp.get("deep_valid") and c.get("deep_valid") is False:
+                    divergences.append(
+                        f"CLI-INVARIANT {name}: repaired output fails validate_elf_deep")
+                if cli_exp.get("dynamic_kept") and c.get("dynamic_kept") is False:
+                    divergences.append(
+                        f"CLI-INVARIANT {name}: repair dropped PT_DYNAMIC")
+
         row = {
             "name": name,
             "intent": fx["intent"],
             "go": cell(g), "python": cell(p), "v9": cell(v),
+            "cli": cell(c),
             "hash_match_go_py": (g["sha256"] == p["sha256"]) if (g and p) else None,
         }
         rows.append(row)
@@ -165,17 +191,19 @@ def render_md(fixtures: list, rows: list, divergences: list, runs: dict) -> str:
     lines = ["# NHDD 修复管线契约报告 (contract report)", ""]
     lines.append("基线口径: Go dev 版 bad/ 隔离。v9 为原语级 harness,不做隔离判定。")
     lines.append("")
-    for impl in ("go", "python", "v9"):
-        if runs[impl].get("skipped"):
-            lines.append(f"- **{impl}: SKIPPED** — {runs[impl].get('reason','')}")
+    for impl, label in (("go", "go"), ("python", "python"), ("v9", "v9"), ("python_cli", "python_cli")):
+        if runs.get(impl, {}).get("skipped"):
+            lines.append(f"- **{label}: SKIPPED** — {runs[impl].get('reason','')}")
         else:
-            lines.append(f"- {impl}: ok ({len(runs[impl].get('results', []))} fixtures)")
+            lines.append(f"- {label}: ok ({len(runs[impl].get('results', []))} fixtures)")
     lines.append("")
-    lines.append("| fixture | go | python | v9 | go==py bytes |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("CLI 列 = `python3 fix_so.py` 全量修复路径(IDA 友好取向,独立基线,不与 Go 比字节)。")
+    lines.append("")
+    lines.append("| fixture | go | python | v9 | python_cli | go==py bytes |")
+    lines.append("|---|---|---|---|---|---|")
     for r in rows:
         hm = "-" if r["hash_match_go_py"] is None else ("yes" if r["hash_match_go_py"] else "**NO**")
-        lines.append(f"| {r['name']} | {r['go']} | {r['python']} | {r['v9']} | {hm} |")
+        lines.append(f"| {r['name']} | {r['go']} | {r['python']} | {r['v9']} | {r['cli']} | {hm} |")
     lines.append("")
     if divergences:
         lines.append(f"## 差异 ({len(divergences)})")
@@ -190,12 +218,18 @@ def render_md(fixtures: list, rows: list, divergences: list, runs: dict) -> str:
 
 def freeze_expected(fixtures: list, runs: dict) -> None:
     go = index_results(runs["go"])
-    payload = {"schema": 1, "baseline": "go", "files": {}}
+    payload = {"schema": 2, "baseline": "go", "files": {}}
     for fx in fixtures:
         r = go.get(fx["name"])
         if r:
             payload["files"][fx["name"]] = {"class": r["status"], "sha256": r["sha256"],
                                             "where": r["where"]}
+    cli = index_results(runs.get("python_cli", {}))
+    if not runs.get("python_cli", {}).get("skipped"):
+        payload["python_cli"] = {
+            name: {"class": r["status"], "sha256": r["sha256"]}
+            for name, r in cli.items()
+        }
     with open(EXPECTED, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
         fh.write("\n")
@@ -205,7 +239,8 @@ def check_expected(runs: dict) -> list:
     if not os.path.exists(EXPECTED):
         return []
     with open(EXPECTED, "r", encoding="utf-8") as fh:
-        exp = json.load(fh)["files"]
+        exp_doc = json.load(fh)
+    exp = exp_doc["files"]
     problems = []
     for impl in ("go", "python"):
         res = index_results(runs[impl])
@@ -218,6 +253,18 @@ def check_expected(runs: dict) -> list:
                 problems.append(f"EXPECTED-CLASS {name}: {impl} {r['status']} != {e['class']}")
             elif r["sha256"] != e["sha256"]:
                 problems.append(f"EXPECTED-HASH {name}: {impl} bytes differ from frozen baseline")
+    exp_cli = exp_doc.get("python_cli")
+    if exp_cli and not runs.get("python_cli", {}).get("skipped"):
+        res = index_results(runs["python_cli"])
+        for name, e in exp_cli.items():
+            r = res.get(name)
+            if not r:
+                problems.append(f"EXPECTED-MISSING {name}: no python_cli result")
+                continue
+            if r["status"] != e["class"]:
+                problems.append(f"EXPECTED-CLASS {name}: python_cli {r['status']} != {e['class']}")
+            elif r["sha256"] != e["sha256"]:
+                problems.append(f"EXPECTED-HASH {name}: python_cli bytes differ from frozen golden")
     return problems
 
 
@@ -241,7 +288,7 @@ def main() -> int:
     fixtures = load_manifest()
 
     runs = {impl: run_impl(impl, os.path.join(WORK, f"{impl}.json"))
-            for impl in ("python", "go", "v9")}
+            for impl in ("python", "go", "v9", "python_cli")}
 
     if runs["go"].get("skipped"):
         print("[!] go baseline skipped — divergence analysis limited")
@@ -264,7 +311,8 @@ def main() -> int:
         if problems:
             return 1
     if args.strict:
-        real = [d for d in divergences if d.startswith(("CLASS-DIVERGENCE", "HASH-DIVERGENCE"))]
+        real = [d for d in divergences if d.startswith(
+            ("CLASS-DIVERGENCE", "HASH-DIVERGENCE", "CLI-INVARIANT"))]
         if real:
             print(f"[strict] {len(real)} python-vs-go divergences")
             return 1

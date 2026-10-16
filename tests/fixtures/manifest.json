@@ -136,6 +136,10 @@
         "go": "OK",
         "python": "OK",
         "v9": "FIXED"
+      },
+      "cli": {
+        "deep_valid": true,
+        "dynamic_kept": true
       }
     },
     {
@@ -149,7 +153,11 @@
         "python": "FIXED",
         "v9": "FIXED"
       },
-      "final_equiv": "so_valid.so"
+      "final_equiv": "so_valid.so",
+      "cli": {
+        "deep_valid": true,
+        "dynamic_kept": true
+      }
     },
     {
       "name": "so_offset_skew.so",
@@ -162,7 +170,11 @@
         "python": "FIXED",
         "v9": "FIXED"
       },
-      "final_equiv": "so_valid.so"
+      "final_equiv": "so_valid.so",
+      "cli": {
+        "deep_valid": true,
+        "dynamic_kept": true
+      }
     },
     {
       "name": "so_et_exec.so",
@@ -174,6 +186,9 @@
         "go": "BAD",
         "python": "BAD",
         "v9": "N/A"
+      },
+      "cli": {
+        "rejected": true
       }
     },
     {
@@ -186,6 +201,9 @@
         "go": "BAD",
         "python": "BAD",
         "v9": "N/A"
+      },
+      "cli": {
+        "rejected": true
       }
     },
     {
@@ -198,6 +216,9 @@
         "go": "BAD",
         "python": "BAD",
         "v9": "N/A"
+      },
+      "cli": {
+        "rejected": true
       }
     },
     {
@@ -210,6 +231,9 @@
         "go": "BAD",
         "python": "BAD",
         "v9": "N/A"
+      },
+      "cli": {
+        "rejected": true
       }
     }
   ]

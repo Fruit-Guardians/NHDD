@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "baseline": "go",
   "files": {
     "dex_valid.dex": {
@@ -86,6 +86,36 @@
       "class": "BAD",
       "sha256": "9da6d84f7bde42c7111f07e6363443704efef97001887365d63a41141c301be8",
       "where": "bad/"
+    }
+  },
+  "python_cli": {
+    "so_valid.so": {
+      "class": "FIXED",
+      "sha256": "6d3d2ec9f5bd4a8ae9dc2f31f1dc16afa42b7a51f55f1c08abc779dea979b105"
+    },
+    "so_magic_erased.so": {
+      "class": "FIXED",
+      "sha256": "6d3d2ec9f5bd4a8ae9dc2f31f1dc16afa42b7a51f55f1c08abc779dea979b105"
+    },
+    "so_offset_skew.so": {
+      "class": "FIXED",
+      "sha256": "6d3d2ec9f5bd4a8ae9dc2f31f1dc16afa42b7a51f55f1c08abc779dea979b105"
+    },
+    "so_et_exec.so": {
+      "class": "REJECTED",
+      "sha256": "ba4215d532aae8837b355c8c60606c07ad80d8f3d155f8594c5259d879355b53"
+    },
+    "so_tiny.so": {
+      "class": "REJECTED",
+      "sha256": "1f9a8a9339effe4f2b0027e148d4651c6d3bd81e5501961a26784b51e6f5a9e6"
+    },
+    "so_not_elf.so": {
+      "class": "REJECTED",
+      "sha256": "c9d8e3352f9f790d8b0be13cb1c18ed7963009888be04acc065ee5efbd934076"
+    },
+    "so_phnum_bogus.so": {
+      "class": "REJECTED",
+      "sha256": "9da6d84f7bde42c7111f07e6363443704efef97001887365d63a41141c301be8"
     }
   }
 }

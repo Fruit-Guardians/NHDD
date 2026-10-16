@@ -10,26 +10,29 @@ D:\project\NHDD\NHDD-cpp-modular\src/process_memory.hpp:10:10: fatal error: sys/
    10 | #include <sys/uio.h>
       |          ^~~~~~~~~~~
 compilation terminated.
+- python_cli: ok (7 fixtures)
 
-| fixture | go | python | v9 | go==py bytes |
-|---|---|---|---|---|
-| dex_valid.dex | OK | OK | SKIP | yes |
-| dex_bad_adler32.dex | FIXED | FIXED | SKIP | yes |
-| dex_bad_sha1.dex | FIXED | FIXED | SKIP | yes |
-| dex_filesize_low.dex | FIXED | FIXED | SKIP | yes |
-| dex_header_size_bad.dex | FIXED | FIXED | SKIP | yes |
-| dex_endian_bad.dex | FIXED | FIXED | SKIP | yes |
-| dex_maplist_off_bad.dex | FIXED | FIXED | SKIP | yes |
-| dex_maplist_count_huge.dex | FIXED | FIXED | SKIP | yes |
-| dex_too_small.dex | BAD | BAD | SKIP | yes |
-| dex_magic_erased.dex | BAD | BAD | SKIP | yes |
-| so_valid.so | OK | OK | SKIP | yes |
-| so_magic_erased.so | FIXED | FIXED | SKIP | yes |
-| so_offset_skew.so | FIXED | FIXED | SKIP | yes |
-| so_et_exec.so | BAD | BAD | SKIP | yes |
-| so_tiny.so | BAD | BAD | SKIP | yes |
-| so_not_elf.so | BAD | BAD | SKIP | yes |
-| so_phnum_bogus.so | BAD | BAD | SKIP | yes |
+CLI 列 = `python3 fix_so.py` 全量修复路径(IDA 友好取向,独立基线,不与 Go 比字节)。
+
+| fixture | go | python | v9 | python_cli | go==py bytes |
+|---|---|---|---|---|---|
+| dex_valid.dex | OK | OK | — | — | yes |
+| dex_bad_adler32.dex | FIXED | FIXED | — | — | yes |
+| dex_bad_sha1.dex | FIXED | FIXED | — | — | yes |
+| dex_filesize_low.dex | FIXED | FIXED | — | — | yes |
+| dex_header_size_bad.dex | FIXED | FIXED | — | — | yes |
+| dex_endian_bad.dex | FIXED | FIXED | — | — | yes |
+| dex_maplist_off_bad.dex | FIXED | FIXED | — | — | yes |
+| dex_maplist_count_huge.dex | FIXED | FIXED | — | — | yes |
+| dex_too_small.dex | BAD | BAD | — | — | yes |
+| dex_magic_erased.dex | BAD | BAD | — | — | yes |
+| so_valid.so | OK | OK | — | FIXED | yes |
+| so_magic_erased.so | FIXED | FIXED | — | FIXED | yes |
+| so_offset_skew.so | FIXED | FIXED | — | FIXED | yes |
+| so_et_exec.so | BAD | BAD | — | REJECTED | yes |
+| so_tiny.so | BAD | BAD | — | REJECTED | yes |
+| so_not_elf.so | BAD | BAD | — | REJECTED | yes |
+| so_phnum_bogus.so | BAD | BAD | — | REJECTED | yes |
 
 ## 差异
 
