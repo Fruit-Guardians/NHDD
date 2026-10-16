@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """NHDD repair-pipeline contract runner.
 
-Regenerates fixtures, runs each implementation (python / go / v9-best-effort)
-over an isolated copy, and reports per-fixture classification + byte-level
+Regenerates fixtures, runs each implementation (python / go / v8+python_cli /
+v9-best-effort) over an isolated copy, and reports per-fixture classification + byte-level
 divergences. Baseline convention (agreed): the Go dev-version bad/ quarantine
 behaviour is the reference; Python must mirror it; v9 is judged only where its
 primitive semantics apply.
@@ -90,6 +90,13 @@ def run_impl(impl: str, out_json: str) -> dict:
         if proc.returncode != 0:
             return {"impl": impl, "skipped": True,
                     "reason": "go test failed: " + (proc.stderr or proc.stdout)[-400:]}
+    elif impl == "v8":
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HERE, "run_v8.py")],
+            env=env, capture_output=True, text=True, cwd=REPO)
+        if proc.returncode != 0:
+            return {"impl": impl, "skipped": True,
+                    "reason": "v8 runner failed: " + (proc.stderr or proc.stdout)[-400:]}
     elif impl == "v9":
         proc = subprocess.run(
             [sys.executable, os.path.join(HERE, "run_v9.py")],
@@ -118,10 +125,12 @@ def build_report(fixtures: list, runs: dict) -> tuple[list, list]:
     divergences = []
     go = index_results(runs["go"])
     py = index_results(runs["python"])
+    v8 = index_results(runs["v8"])
     v9 = index_results(runs["v9"])
     cli = index_results(runs.get("python_cli", {}))
     go_skipped = runs["go"].get("skipped")
     py_skipped = runs["python"].get("skipped")
+    v8_skipped = runs["v8"].get("skipped")
     v9_skipped = runs["v9"].get("skipped")
     cli_skipped = runs.get("python_cli", {}).get("skipped")
 
@@ -129,6 +138,7 @@ def build_report(fixtures: list, runs: dict) -> tuple[list, list]:
         name = fx["name"]
         g = go.get(name) if not go_skipped else None
         p = py.get(name) if not py_skipped else None
+        t = v8.get(name) if not v8_skipped else None
         v = v9.get(name) if not v9_skipped else None
         pred = fx.get("predict", {})
 
@@ -136,7 +146,7 @@ def build_report(fixtures: list, runs: dict) -> tuple[list, list]:
             return r["status"] if r else "—"
 
         # prediction checks (informational)
-        for impl_name, r in (("go", g), ("python", p), ("v9", v)):
+        for impl_name, r in (("go", g), ("python", p), ("v8", t), ("v9", v)):
             expect = pred.get(impl_name, "?")
             if r and expect not in ("?", "N/A") and r["status"] != expect:
                 divergences.append(
@@ -179,7 +189,7 @@ def build_report(fixtures: list, runs: dict) -> tuple[list, list]:
         row = {
             "name": name,
             "intent": fx["intent"],
-            "go": cell(g), "python": cell(p), "v9": cell(v),
+            "go": cell(g), "python": cell(p), "v8": cell(t), "v9": cell(v),
             "cli": cell(c),
             "hash_match_go_py": (g["sha256"] == p["sha256"]) if (g and p) else None,
         }
@@ -189,9 +199,10 @@ def build_report(fixtures: list, runs: dict) -> tuple[list, list]:
 
 def render_md(fixtures: list, rows: list, divergences: list, runs: dict) -> str:
     lines = ["# NHDD 修复管线契约报告 (contract report)", ""]
-    lines.append("基线口径: Go dev 版 bad/ 隔离。v9 为原语级 harness,不做隔离判定。")
+    lines.append("基线口径: Go dev 版 bad/ 隔离。v8/v9 为原语级设备管线,不做隔离判定,仅按预测漂移告警。")
     lines.append("")
-    for impl, label in (("go", "go"), ("python", "python"), ("v9", "v9"), ("python_cli", "python_cli")):
+    for impl, label in (("go", "go"), ("python", "python"), ("v8", "v8"),
+                        ("v9", "v9"), ("python_cli", "python_cli")):
         if runs.get(impl, {}).get("skipped"):
             lines.append(f"- **{label}: SKIPPED** — {runs[impl].get('reason','')}")
         else:
@@ -199,11 +210,11 @@ def render_md(fixtures: list, rows: list, divergences: list, runs: dict) -> str:
     lines.append("")
     lines.append("CLI 列 = `python3 fix_so.py` 全量修复路径(IDA 友好取向,独立基线,不与 Go 比字节)。")
     lines.append("")
-    lines.append("| fixture | go | python | v9 | python_cli | go==py bytes |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| fixture | go | python | v8 | v9 | python_cli | go==py bytes |")
+    lines.append("|---|---|---|---|---|---|---|")
     for r in rows:
         hm = "-" if r["hash_match_go_py"] is None else ("yes" if r["hash_match_go_py"] else "**NO**")
-        lines.append(f"| {r['name']} | {r['go']} | {r['python']} | {r['v9']} | {r['cli']} | {hm} |")
+        lines.append(f"| {r['name']} | {r['go']} | {r['python']} | {r['v8']} | {r['v9']} | {r['cli']} | {hm} |")
     lines.append("")
     if divergences:
         lines.append(f"## 差异 ({len(divergences)})")
@@ -288,7 +299,7 @@ def main() -> int:
     fixtures = load_manifest()
 
     runs = {impl: run_impl(impl, os.path.join(WORK, f"{impl}.json"))
-            for impl in ("python", "go", "v9", "python_cli")}
+            for impl in ("python", "go", "v8", "v9", "python_cli")}
 
     if runs["go"].get("skipped"):
         print("[!] go baseline skipped — divergence analysis limited")

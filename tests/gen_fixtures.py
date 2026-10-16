@@ -136,25 +136,33 @@ def so_fixtures() -> dict:
 #   "N/A"         = not applicable for that implementation (skip judgement).
 # v9 column = primitive-level harness (no quarantine semantics), hence N/A
 # wherever the baseline would quarantine a file.
+# v8 column = nhdd.c primitives (also no quarantine). N/A is never used for
+# v8 because the harness always runs the primitive and its on-disk result is
+# deterministic from code: fix_dex_header_and_checksums guards
+# size<0x70||magic, rewrites header fields + both checksums and NEVER touches
+# map_list; elf_repair_basic leaves <0x40 files untouched, otherwise applies
+# identity fixes, p_offset=p_vaddr and always appends an SHT (so_valid →
+# FIXED), and rewrites identical bytes when the PHT is unreadable
+# (so_phnum_bogus → OK).
 FIXTURE_META = [
-    # (name, kind, intent, go, python, v9, final_equiv)
-    ("dex_valid.dex", "dex", "structurally valid minimal DEX", "OK", "OK", "OK", None),
-    ("dex_bad_adler32.dex", "dex", "checksum field corrupted (dumped header)", "FIXED", "FIXED", "FIXED", "dex_valid.dex"),
-    ("dex_bad_sha1.dex", "dex", "SHA-1 signature corrupted", "FIXED", "FIXED", "FIXED", "dex_valid.dex"),
-    ("dex_filesize_low.dex", "dex", "file_size smaller than actual length", "FIXED", "FIXED", "FIXED", "dex_valid.dex"),
-    ("dex_header_size_bad.dex", "dex", "header_size != 0x70", "FIXED", "FIXED", "FIXED", "dex_valid.dex"),
-    ("dex_endian_bad.dex", "dex", "endian_tag wrong", "FIXED", "FIXED", "FIXED", "dex_valid.dex"),
-    ("dex_maplist_off_bad.dex", "dex", "map_off out of bounds -> needs rebuild", "FIXED", "FIXED", "?", None),
-    ("dex_maplist_count_huge.dex", "dex", "map_size 0xFFFF -> needs rebuild", "FIXED", "FIXED", "?", None),
-    ("dex_too_small.dex", "dex", "0x60 bytes: quarantine to bad/", "BAD", "BAD", "N/A", None),
-    ("dex_magic_erased.dex", "dex", "magic erased: host-level quarantine", "BAD", "BAD", "N/A", None),
-    ("so_valid.so", "so", "valid dump-style ELF64 ET_DYN (no SHT)", "OK", "OK", "FIXED", None),
-    ("so_magic_erased.so", "so", "ELF magic erased", "FIXED", "FIXED", "FIXED", "so_valid.so"),
-    ("so_offset_skew.so", "so", "p_offset != p_vaddr (raw mem dump)", "FIXED", "FIXED", "FIXED", "so_valid.so"),
-    ("so_et_exec.so", "so", "ET_EXEC: Go baseline quarantines", "BAD", "BAD", "N/A", None),
-    ("so_tiny.so", "so", "0x30 bytes: quarantine", "BAD", "BAD", "N/A", None),
-    ("so_not_elf.so", "so", "non-ELF garbage: quarantine", "BAD", "BAD", "N/A", None),
-    ("so_phnum_bogus.so", "so", "e_phnum=0xFFFF: PHT bogus", "BAD", "BAD", "N/A", None),
+    # (name, kind, intent, go, python, v8, v9, final_equiv)
+    ("dex_valid.dex", "dex", "structurally valid minimal DEX", "OK", "OK", "OK", "OK", None),
+    ("dex_bad_adler32.dex", "dex", "checksum field corrupted (dumped header)", "FIXED", "FIXED", "FIXED", "FIXED", "dex_valid.dex"),
+    ("dex_bad_sha1.dex", "dex", "SHA-1 signature corrupted", "FIXED", "FIXED", "FIXED", "FIXED", "dex_valid.dex"),
+    ("dex_filesize_low.dex", "dex", "file_size smaller than actual length", "FIXED", "FIXED", "FIXED", "FIXED", "dex_valid.dex"),
+    ("dex_header_size_bad.dex", "dex", "header_size != 0x70", "FIXED", "FIXED", "FIXED", "FIXED", "dex_valid.dex"),
+    ("dex_endian_bad.dex", "dex", "endian_tag wrong", "FIXED", "FIXED", "FIXED", "FIXED", "dex_valid.dex"),
+    ("dex_maplist_off_bad.dex", "dex", "map_off out of bounds -> needs rebuild", "FIXED", "FIXED", "FIXED", "?", None),
+    ("dex_maplist_count_huge.dex", "dex", "map_size 0xFFFF -> needs rebuild", "FIXED", "FIXED", "FIXED", "?", None),
+    ("dex_too_small.dex", "dex", "0x60 bytes: quarantine to bad/", "BAD", "BAD", "OK", "N/A", None),
+    ("dex_magic_erased.dex", "dex", "magic erased: host-level quarantine", "BAD", "BAD", "OK", "N/A", None),
+    ("so_valid.so", "so", "valid dump-style ELF64 ET_DYN (no SHT)", "OK", "OK", "FIXED", "FIXED", None),
+    ("so_magic_erased.so", "so", "ELF magic erased", "FIXED", "FIXED", "FIXED", "FIXED", "so_valid.so"),
+    ("so_offset_skew.so", "so", "p_offset != p_vaddr (raw mem dump)", "FIXED", "FIXED", "FIXED", "FIXED", "so_valid.so"),
+    ("so_et_exec.so", "so", "ET_EXEC: Go baseline quarantines", "BAD", "BAD", "FIXED", "N/A", None),
+    ("so_tiny.so", "so", "0x30 bytes: quarantine", "BAD", "BAD", "OK", "N/A", None),
+    ("so_not_elf.so", "so", "non-ELF garbage: quarantine", "BAD", "BAD", "FIXED", "N/A", None),
+    ("so_phnum_bogus.so", "so", "e_phnum=0xFFFF: PHT bogus", "BAD", "BAD", "OK", "N/A", None),
 ]
 
 # CLI full-repair path (fix_so.py main / repair_elf) expectations:
@@ -179,7 +187,7 @@ def main() -> None:
     os.makedirs(SODIR, exist_ok=True)
 
     entries = []
-    for name, kind, intent, g, p, v, feq in FIXTURE_META:
+    for name, kind, intent, g, p, e8, v, feq in FIXTURE_META:
         data = dex[name] if kind == "dex" else so[name]
         target = os.path.join(DEXDIR if kind == "dex" else SODIR, name)
         with open(target, "wb") as fh:
@@ -190,7 +198,7 @@ def main() -> None:
             "intent": intent,
             "orig_sha256": hashlib.sha256(data).hexdigest(),
             "size": len(data),
-            "predict": {"go": g, "python": p, "v9": v},
+            "predict": {"go": g, "python": p, "v8": e8, "v9": v},
         }
         if feq:
             entry["final_equiv"] = feq
