@@ -73,7 +73,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 ADB = os.environ.get("NHDD_ADB", "adb")
 NHDD_BIN = "/data/local/tmp/nhdd"
-DEVICE_DUMP_DIR = "/data/local/tmp/.cache/nhdd"
+DEVICE_DUMP_DIR = "/data/local/tmp/nhdd_dump"  # 与 GUI(gui/adb.go deviceDumpDir)及设备二进制默认值统一
 VERSION = "9.0-cpp-class"
 _device_serial = None  # set after device selection
 console = Console()

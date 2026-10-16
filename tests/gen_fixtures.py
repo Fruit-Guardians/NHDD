@@ -157,6 +157,20 @@ FIXTURE_META = [
     ("so_phnum_bogus.so", "so", "e_phnum=0xFFFF: PHT bogus", "BAD", "BAD", "N/A", None),
 ]
 
+# CLI full-repair path (fix_so.py main / repair_elf) expectations:
+#   rejected: true      -> classify_bytes must refuse (no repair attempted)
+#   deep_valid: true    -> repaired output passes validate_elf_deep
+#   dynamic_kept: true  -> input PT_DYNAMIC must not be dropped by repair
+CLI_EXPECT = {
+    "so_valid.so": {"deep_valid": True, "dynamic_kept": True},
+    "so_magic_erased.so": {"deep_valid": True, "dynamic_kept": True},
+    "so_offset_skew.so": {"deep_valid": True, "dynamic_kept": True},
+    "so_et_exec.so": {"rejected": True},
+    "so_tiny.so": {"rejected": True},
+    "so_not_elf.so": {"rejected": True},
+    "so_phnum_bogus.so": {"rejected": True},
+}
+
 
 def main() -> None:
     dex = dex_fixtures()
@@ -180,6 +194,8 @@ def main() -> None:
         }
         if feq:
             entry["final_equiv"] = feq
+        if name in CLI_EXPECT:
+            entry["cli"] = CLI_EXPECT[name]
         entries.append(entry)
 
     manifest = {"schema": 1, "fixtures": entries}

@@ -1244,6 +1244,20 @@ def repair_elf(data_in: bytes, *, strip_bad_sht: bool = True, rebuild_bad_sht: b
     if not ok:
         actions.append(f"recoverable PHT issue: {reason}")
 
+    # 0) memory-layout 兜底:p_offset 指向 EOF 之外、而 p_vaddr 落在文件范围内时,
+    #    说明 dump 是"从 0 展开的连续镜像"被错写了 file offset。先按 GUI 基线
+    #    (gui/sofix.go)语义把 p_offset 掰回 p_vaddr,再走后续推断/裁剪。
+    #    没有这一步,clamp 会把健康段 p_filesz 归零、find_dynamic_offset 找不到
+    #    .dynamic 而误杀 PT_DYNAMIC(实测 so_offset_skew 契约样例,修复反而破坏文件)。
+    info0 = ElfInfo(bytes(data))
+    for ph in info0.phdrs:
+        if ph.p_type not in (PT_LOAD, PT_DYNAMIC) or ph.p_filesz == 0:
+            continue
+        if ph.p_offset >= info0.size and ph.p_vaddr < info0.size:
+            set_ph_offset(data, info0, ph, ph.p_vaddr)
+            actions.append(f"PHDR[{ph.idx}].p_offset: 0x{ph.p_offset:x} -> 0x{ph.p_vaddr:x} (memory-layout fallback)")
+    info = ElfInfo(bytes(data))
+
     # 1) 修复 LOAD p_offset：从 memory-layout/p_offset=p_vaddr 还原为更合理的 file-layout。
     #    注意：这一步必须允许 LOAD_FILESZ_OOB 继续往下走，否则 liball_in_one 这类
     #    “offset/size 同时错”的 dump 会在清 SHT 前被直接判死。
