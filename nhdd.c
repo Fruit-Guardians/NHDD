@@ -1744,6 +1744,10 @@ static void clean_dir_ext(const char *dir, const char *ext) {
 }
 
 // ---- Main ----
+// NHDD_LIB_ONLY compiles nhdd.c without main() so the contract-test host
+// harness (tests/contract/v8_harness.c) can link the static repair primitives
+// directly. The device build never defines it — behavior is unchanged.
+#ifndef NHDD_LIB_ONLY
 int main(int argc, char **argv) {
     int mode = MODE_DEX;
     int snapshot_rounds = 1;     // fixed rounds (--snapshot N)
@@ -2000,3 +2004,4 @@ int main(int argc, char **argv) {
 
     return 0;
 }
+#endif /* NHDD_LIB_ONLY */

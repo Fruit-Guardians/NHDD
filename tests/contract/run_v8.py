@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Build + run the v8 primitive harness (nhdd.c repair primitives) over a
+fixture work dir.
+
+Emits a classification JSON, or {"skipped": true, "reason": ...} when the
+build fails (honest degradation: nhdd.c uses Android/Linux-only headers such
+as sys/uio.h, so Windows dev machines skip v8 while Linux CI covers it —
+same arrangement as v9).
+
+Env: NHDD_CONTRACT_IN, NHDD_CONTRACT_MANIFEST, NHDD_CONTRACT_OUT,
+     NHDD_CC (optional C compiler override).
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from classify import classify, load_manifest, write_result  # noqa: E402
+
+
+def find_cc() -> str | None:
+    if os.environ.get("NHDD_CC"):
+        return os.environ["NHDD_CC"]
+    for cand in ("gcc", "clang", "cc"):
+        path = shutil.which(cand)
+        if path:
+            return path
+    return None
+
+
+def main() -> int:
+    work = os.environ["NHDD_CONTRACT_IN"]
+    manifest = os.environ["NHDD_CONTRACT_MANIFEST"]
+    out = os.environ["NHDD_CONTRACT_OUT"]
+    workdir = os.path.dirname(work.rstrip(os.sep))  # .work/<impl>
+    os.makedirs(workdir, exist_ok=True)
+
+    cc = find_cc()
+    if not cc:
+        write_result(out, "v8", [], extra={"skipped": True,
+                                          "reason": "no C compiler found"})
+        return 0
+
+    exe = os.path.join(workdir, "v8_harness" + (".exe" if os.name == "nt" else ""))
+    cmd = [cc, "-std=gnu11", "-O1", "-w", "-fno-strict-aliasing",
+           os.path.join(HERE, "v8_harness.c"), "-o", exe]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        write_result(out, "v8", [], extra={"skipped": True,
+                                           "reason": "build failed: "
+                                                     + (proc.stderr or "").strip()[:400]})
+        return 0
+
+    run = subprocess.run([exe, work], capture_output=True, text=True)
+    if run.returncode != 0:
+        write_result(out, "v8", [], extra={"skipped": True,
+                                           "reason": "run failed: "
+                                                     + (run.stderr or "").strip()[:400]})
+        return 0
+
+    fixtures = load_manifest(manifest)
+    write_result(out, "v8", classify(work, fixtures))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
