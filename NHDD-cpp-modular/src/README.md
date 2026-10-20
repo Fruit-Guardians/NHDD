@@ -9,6 +9,7 @@
 | `nhdd_app.hpp` | CLI、多进程、watch / continuous 调度 |
 | `nhdd_scanner.hpp` | 单 PID 的 DEX / SO / JNI 扫描编排与增量 scope 接线 |
 | `dex_capture.hpp` | DEX 候选身份、多轮字节覆盖合并、holes 与页面完整度 |
+| `art_dex_discovery.hpp` | Build ID 绑定的 ARM64 StandardDexFile 对象特征发现、运行时缓存表交叉校验与有界堆扫描 |
 | `dex_validator.hpp` | DEX 校验、大小恢复、SHA-1 / Adler32 修复 |
 | `dex_semantics.hpp` | DEX raw/fixed 结构和引用检查，明确不等价于 ART 验证 |
 | `runtime_formats.hpp` | 版本化 CompactDex/VDEX/OAT 检查及内嵌对象偏移；含实机验证的 OAT 279 头/KV/偏移检查 |

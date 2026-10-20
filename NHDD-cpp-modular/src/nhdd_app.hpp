@@ -183,6 +183,19 @@ public:
                 cfg.relaxed = true;
                 continue;
             }
+            if (std::strcmp(argv[i], "--art-dex") == 0 && i+1<argc) {
+                const char* value=argv[++i];
+                if(std::strcmp(value,"auto") && std::strcmp(value,"off") && std::strcmp(value,"only")) {
+                    std::fprintf(stderr,"[-] --art-dex requires auto, off or only\n");return 1;
+                }
+                cfg.art_dex=std::strcmp(value,"off")!=0;
+                cfg.art_only=!std::strcmp(value,"only");continue;
+            }
+            if (std::strcmp(argv[i], "--art-scan-mb") == 0 && i+1<argc) {
+                char* end=nullptr;const unsigned long value=std::strtoul(argv[++i],&end,10);
+                if(!end || *end || value<1 || value>512)return 1;
+                cfg.art_scan_mb=static_cast<unsigned>(value);continue;
+            }
             if (std::strcmp(argv[i], "--anon") == 0) {
                 cfg.anon_only = true;
                 continue;
@@ -1028,6 +1041,8 @@ private:
             "    --stealth     Region delay + auto-disguise as kworker\n"
             "    --stealth2    Use process_vm_readv() (same ptrace/SELinux permissions; not a non-root bypass)\n"
             "    --relaxed     DEX scan without magic (endian_tag based)\n"
+            "    --art-dex auto|off|only  Verified-build ART DEX discovery (default auto); only skips header/container scan\n"
+            "    --art-scan-mb N  Native-heap read budget per round, 1..512 MiB (default 64); resumes next round\n"
             "    --anon        Only scan anonymous mappings\n"
             "    --region-delay MS  Pause between regions (ms)\n"
             "    --name NAME   Fake process name\n"

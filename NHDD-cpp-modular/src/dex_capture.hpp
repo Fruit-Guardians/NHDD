@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -88,6 +89,12 @@ public:
     size_t observations() const { return observations_; }
     uint64_t content_revision() const { return content_revision_; }
     bool relaxed_detection() const { return relaxed_detection_; }
+    uintptr_t art_object() const {return art_object_;}
+    uintptr_t art_vtable() const {return art_vtable_;}
+    const std::string& art_build_id() const {return art_build_id_;}
+    void mark_art(uintptr_t object,uintptr_t vtable,const std::string& build_id) {
+        art_object_=object;art_vtable_=vtable;art_build_id_=build_id;
+    }
     bool complete() const { return covered_bytes_ == data_.size(); }
     bool ever_published() const { return ever_published_; }
     uint64_t last_touch() const { return last_touch_; }
@@ -313,6 +320,8 @@ public:
     }
 
 private:
+    uintptr_t art_object_=0,art_vtable_=0;
+    std::string art_build_id_;
     static constexpr size_t kVolatileHeaderEnd = 0x24;
     static constexpr size_t kMaxProcessedRevisionKeys = 256;
 

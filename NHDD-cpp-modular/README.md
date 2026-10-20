@@ -42,6 +42,7 @@
 | 功能 | 可以做什么 |
 |---|---|
 | DEX 提取与修复 | 标准扫描或 `--relaxed` 弱化 magic 依赖；跨轮补齐缺页，保留不同内容 revision，导出 raw / fixed 副本 |
+| ART 辅助 DEX 发现 | 对已适配的 libdexfile Build ID 扫描 StandardDexFile 对象特征，通过运行时长度、缓存表与 map_list 交叉发现擦头 DEX；不注入、不调用目标方法 |
 | 完整度与结构检查 | 记录字节覆盖率、缺失区间；检查 DEX 表、索引、class_data、code/debug 边界以及 SHA-1 / Adler32 |
 | SO 重建 | 支持 ELF32/64，按 `PT_LOAD / load bias` 恢复文件布局；区分完整重建和缺页残件 |
 | 冷启动与多进程跟随 | 启动前布置事件源，跟随包名进程、子进程及已经发现的改名后代；隔离 PID 复用 |
@@ -108,6 +109,18 @@ adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_so -
 ```
 
 也可用 PID 替换包名，例如 `12345`。PID 模式不会自动跟随其他进程；continuous 中目标退出或 PID 世代变化后停止。
+
+### ART 辅助发现（默认启用）
+
+ART 辅助发现默认以 `--art-dex auto` 随 DEX 扫描启用；当前只适配已真机核对的 ARM64 libdexfile 构建，**不是所有 Android 16 都支持**。普通扫描与 ART 路径互补；未知 Build ID 时会明确记录原因，继续原有扫描。
+
+仅验证 ART 路径时可使用：
+
+```bash
+adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_art --dex --art-dex only --art-scan-mb 64 --snapshot 2 --interval 1'"
+```
+
+`only` 跳过 magic / endian / runtime-container 搜索；不支持的构建不会退回普通扫描。看日志的 `[ART] status` 和 metadata 的 `discovery` 判断是否命中，不能只以程序退出或导出文件数量判断成功。使用 `--art-dex off` 可关闭辅助路径。具体兼容范围、擦头测试和复现方法见 [ART 辅助发现](docs/art-discovery.md)。
 
 ### 冷启动并持续捕获
 
@@ -179,6 +192,8 @@ adb shell "/data/local/tmp/nhdd --verify /data/local/tmp/example.odex"
 | `--monitor-duration S` | continuous 调度时长，默认 0，即不限时 |
 | `--monitor-verbose` | 输出详细监控日志 |
 | `--relaxed` | 不依赖 DEX magic，但仍需可验证的 endian 和结构 |
+| `--art-dex auto\|off\|only` | 默认 auto；已确认构建的 ART 对象特征发现 / 关闭 / 仅 ART 路径 |
+| `--art-scan-mb N` | 每进程每轮 native-heap 读取预算，默认 64 MiB，范围 1–512；耗尽记录游标并在后续轮继续，不保证一轮扫完 |
 | `--stealth2` | 改用 `process_vm_readv`，不是权限绕过 |
 | `--save-maps` | 保存进程映射快照 |
 | `--keep` | 不清理既有产物，timeline 改为追加；不恢复上次内存缓存或累计状态 |
@@ -231,6 +246,7 @@ nhdd_demo/
 - `partial`：先看 holes，不能当作完整 DEX/SO。
 - `raw / fixed`：分别保留原始字节与修复副本，便于比较；fixed 不代表方法已经全部解密。
 - `structural_checks_passed`：仅静态检查通过；`art_accepted: null` 表示未进行 ART 装载验证。
+- `discovery.source`：区分 `header_scan` 与 `art_standard_dexfile` 首次发现来源；后者记录对象地址、虚表地址与 libdexfile Build ID，不表示已通过 ART 类型验证。
 - `reconstructed.so`：恢复文件布局，不承诺可重新加载；运行中的读取不是冻结快照。
 - `oat-header.bin`：明确只有头部证据，不能作为完整 OAT 使用。
 - `manifest_<pid>_g<starttime>.json`：记录 SO 发布状态；continuous 同时记录会话累计和最近一次扫描。
@@ -272,7 +288,7 @@ $nhddNdk = "C:/Android/android-ndk-r27"
 make test
 ```
 
-七组测试覆盖 DEX 合并、ELF 重建、maps 变化、manifest、进程跟随、syscall 与格式检查。设备夹具和实现细节见[源码说明](src/README.md)与[技术设计](docs/design.md)。
+八组测试覆盖 DEX 合并、ELF 重建、maps 变化、manifest、进程跟随、syscall、格式检查与 ART 对象发现反例。设备夹具和实现细节见[源码说明](src/README.md)与[技术设计](docs/design.md)。
 
 ## 常见问题
 
@@ -299,6 +315,7 @@ OAT 只导出明确标记的头部证据；系统/APEX/vendor 的 runtime 格式
 ## 更多说明
 
 - [技术设计与验证边界](docs/design.md)
+- [ART 辅助 DEX 发现与真机复现](docs/art-discovery.md)
 - [源码模块与维护约束](src/README.md)
 - [README 徽章制作方法](docs/badges.md)
 - [提交问题](https://github.com/Fruit-Guardians/NHDD/issues)：建议附设备 ABI、Android/ART 版本、命令、错误日志和脱敏 metadata，不要公开未授权 APK 或私有内存产物。

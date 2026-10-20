@@ -8,6 +8,9 @@ struct NhddConfig {
     // Scan configuration
     int  region_delay_us = 0;       // usleep between regions (stealth)
     bool relaxed = false;           // scan DEX without magic (endian_tag based)
+    bool art_dex = true;            // exact-build, read-only StandardDexFile discovery
+    bool art_only = false;          // diagnostic: skip DEX magic/container scan
+    unsigned art_scan_mb = 64;      // bounded native-heap scan per round, with resume
     bool anon_only = false;         // only scan anonymous mappings
     bool use_vm_readv = false;      // use process_vm_readv instead of /proc/pid/mem
     bool deep_so_scan = true;      // extra no-hook ELF magic scan in anonymous/app memory
