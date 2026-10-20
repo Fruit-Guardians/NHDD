@@ -26,6 +26,7 @@
 #include "dex_validator.hpp"
 #include "dex_semantics.hpp"
 #include "runtime_formats.hpp"
+#include "art_dex_discovery.hpp"
 #include "process_manager.hpp"
 #include "object_classifier.hpp"
 #include "jnimap_scanner.hpp"
@@ -535,6 +536,11 @@ static bool write_staged_dex_metadata_inline(
         pages.total_pages, pages.complete_pages, pages.partial_pages,
         pages.missing_pages);
 
+    std::fprintf(f,"  \"discovery\": {\"source\":\"%s\",\"art_object\":\"0x%llx\","
+        "\"art_vtable\":\"0x%llx\",\"libdexfile_build_id\":\"%s\"},\n",
+        capture.art_object()?"art_standard_dexfile":"header_scan",
+        static_cast<unsigned long long>(capture.art_object()),
+        static_cast<unsigned long long>(capture.art_vtable()),capture.art_build_id().c_str());
     std::fprintf(f, "  \"holes\": [");
     for (size_t i = 0; i < holes.size(); ++i) {
         if (i != 0) std::fprintf(f, ",");
@@ -768,6 +774,18 @@ public:
         auto refresh_and_publish_dex = [&](DexCapture& capture,
                                            const uint8_t* seed_header) {
             if (!generation.verify()) return;
+            auto art_still_valid=[&]() {
+                if(!capture.art_object())return true;
+                ArtDexCandidate current;
+                auto read=[&](uintptr_t a,void* p,size_t length){return generation.verify() &&
+                    READ_REMOTE(p,length,a)==static_cast<ssize_t>(length);};
+                const auto profile=ArtDexDiscovery::scan(read,regs,reg_count,0,0,[](const ArtDexCandidate&){});
+                if(!profile.supported || profile.vtable!=capture.art_vtable())return false;
+                return ArtDexDiscovery::validate(read,regs,reg_count,capture.art_vtable(),capture.art_object(),current) &&
+                    current.begin==capture.identity().address && current.size==capture.size() &&
+                    (!seed_header || !std::memcmp(current.header.data(),seed_header,112));
+            };
+            if(!art_still_valid())return;
             DexCapture observation(capture.identity(),
                                    capture.relaxed_detection());
             if (seed_header) observation.merge(0, seed_header, 0x70);
@@ -786,7 +804,7 @@ public:
             }
             // Never merge bytes into the old generation's capture until every
             // remote read has been bracketed by a matching starttime check.
-            if (!generation.verify()) return;
+            if (!generation.verify() || !art_still_valid()) return;
             const DexRefreshResult update = capture.apply_observation(observation);
             const size_t new_bytes = update.new_bytes;
             const size_t changed_bytes = update.changed_bytes;
@@ -966,7 +984,8 @@ public:
         auto observe_dex_candidate = [&](uintptr_t dex_addr, uint32_t dex_size,
                                          const uint8_t header[0x70],
                                          bool relaxed_detection,
-                                         const MapsRegion* source_mapping) {
+                                         const MapsRegion* source_mapping,
+                                         const ArtDexCandidate* art=nullptr) {
             if (!generation.verify()) return;
             DexCandidateIdentity identity;
             identity.pid = static_cast<uint32_t>(target_pid);
@@ -998,6 +1017,10 @@ public:
                     static_cast<unsigned long long>(dex_addr), dex_size,
                     static_cast<unsigned long long>(identity.header_fingerprint));
             }
+            // ART-owned captures may rebind to a newly validated object after
+            // loader churn; header-owned captures retain their initial source.
+            if(art && (created || capture->art_object()))
+                capture->mark_art(art->object,art->vtable,ArtDexDiscovery::kBuildId);
             capture->observe(relaxed_detection);
             if (!created) {
                 // Existing candidates were refreshed at the beginning of this
@@ -1130,7 +1153,33 @@ public:
                     }
                 });
 
-            for (size_t ri = 0; ri < reg_count; ri++) {
+            if(cfg.art_dex && generation.verify()) {
+                const std::string key=std::to_string(target_pid)+":"+std::to_string(process_start_time);
+                if(art_scan_cursors_.size()>1024)art_scan_cursors_.clear();
+                auto read=[&](uintptr_t a,void* p,size_t length){return generation.verify() &&
+                    READ_REMOTE(p,length,a)==static_cast<ssize_t>(length);};
+                auto& cursor=art_scan_cursors_[key];
+                const bool resume=cursor.resume_next;
+                const auto stats=ArtDexDiscovery::scan(read,regs,reg_count,uint64_t(cfg.art_scan_mb)*1024*1024,
+                    resume?cursor.next:0,[&](const ArtDexCandidate& candidate) {
+                        const auto* mapping=ArtDexDiscovery::region(regs,reg_count,candidate.begin);
+                        if(cfg.anon_only && mapping && mapping->path[0])return;
+                        std::fprintf(stderr,"[ART] DEX object=0x%llx begin=0x%llx size=%u (cached tables verified)\n",
+                            static_cast<unsigned long long>(candidate.object),
+                            static_cast<unsigned long long>(candidate.begin),candidate.size);
+                        observe_dex_candidate(candidate.begin,candidate.size,candidate.header.data(),false,mapping,&candidate);
+                    });
+                // Revisit high-priority primary heaps every other round while
+                // retaining a separate cursor for the rest of the address space.
+                if(resume || !cursor.next)cursor.next=stats.next;
+                cursor.resume_next=!resume;
+                std::fprintf(stderr,"[ART] status=%s build_id=%s heap_read=%llu matches=%llu rejected=%llu accepted=%llu read_failures=%llu budget_exhausted=%s\n",
+                    stats.status.c_str(),stats.build_id.c_str(),static_cast<unsigned long long>(stats.bytes),
+                    static_cast<unsigned long long>(stats.matches),static_cast<unsigned long long>(stats.rejected),
+                    static_cast<unsigned long long>(stats.accepted),static_cast<unsigned long long>(stats.read_failures),
+                    stats.exhausted?"true":"false");
+            }
+            if(!cfg.art_only) for (size_t ri = 0; ri < reg_count; ri++) {
                 if (generation.invalid || !generation.verify()) break;
                 MapsRegion* r = &regs[ri];
                 // Hardened loaders may transition pages to execute-only. Root
@@ -1608,4 +1657,6 @@ private:
     DexCaptureCache dex_capture_cache_;
     SoManifestSessionCacheInline so_manifest_sessions_{128};
     std::unordered_set<std::string> runtime_processed_;
+    struct ArtCursor {uintptr_t next=0;bool resume_next=false;};
+    std::unordered_map<std::string,ArtCursor> art_scan_cursors_;
 };
