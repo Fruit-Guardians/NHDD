@@ -34,6 +34,7 @@ test:
 	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror tests/fast_capture_test.cpp -o $(TEST_BIN_DIR)/fast_capture_test
 	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror tests/art_refill_test.cpp -o $(TEST_BIN_DIR)/art_refill_test
 	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror tests/art_method_merge_test.cpp -o $(TEST_BIN_DIR)/art_method_merge_test
+	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror tests/fast_schedule_test.cpp -o $(TEST_BIN_DIR)/fast_schedule_test
 	$(TEST_BIN_DIR)/dex_capture_test
 	$(TEST_BIN_DIR)/elf_reconstructor_test
 	$(TEST_BIN_DIR)/maps_monitor_test
@@ -45,6 +46,7 @@ test:
 	$(TEST_BIN_DIR)/fast_capture_test
 	$(TEST_BIN_DIR)/art_refill_test
 	$(TEST_BIN_DIR)/art_method_merge_test
+	$(TEST_BIN_DIR)/fast_schedule_test
 
 push: android
 	adb push $(NHDD_BIN) /data/local/tmp/nhdd && adb shell chmod 755 /data/local/tmp/nhdd

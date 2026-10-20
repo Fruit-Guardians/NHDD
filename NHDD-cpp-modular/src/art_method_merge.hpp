@@ -1,4 +1,4 @@
-// Main-thread-only, generation-owned method evidence. No target-memory writes.
+// Publication-thread-only, generation-owned evidence. No target-memory writes.
 #pragma once
 #include "art_refill.hpp"
 #include "sha1.hpp"
@@ -52,6 +52,21 @@ public:
         return conflict?Result::Conflict:(added?Result::Added:Result::Duplicate);
     }
     bool dirty() const {return revision!=published_revision;}
+    // Scheduling hint only. Matching old evidence never validates this new
+    // observation's live complement/identity and must not increment proofs.
+    bool known(const ArtRefillBaseline& b,const FastObservation& o,const ArtRefillPlan& p) const {
+        if(&b!=owner_ || !b.active || !p.accepted())return false;
+        for(const auto& m:p.patches) {
+            const auto it=std::find_if(methods.begin(),methods.end(),[&](const Method& item){return same(item.layout,m);});
+            if(it==methods.end())return false;
+            const uintptr_t a=b.identity.address+m.instructions_offset;
+            if(a<o.address || a-o.address>o.first.size() || m.bytes>o.first.size()-(a-o.address))return false;
+            if(std::none_of(it->variants.begin(),it->variants.end(),[&](const Variant& v) {
+                return v.bytes.size()==m.bytes && !std::memcmp(v.bytes.data(),o.first.data()+a-o.address,m.bytes);
+            }))return false;
+        }
+        return !p.patches.empty();
+    }
     std::vector<uint8_t> materialize(const ArtRefillBaseline& b) const {
         if(&b!=owner_ || !b.active || conflicted || methods.empty())return {};
         auto raw=b.raw;

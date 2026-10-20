@@ -1,4 +1,4 @@
-// ART candidate registry shared with the collector; publication stays on main.
+// ART registry shared with collector/scan threads; publication owns merge state.
 #pragma once
 #include <mutex>
 #include <functional>
@@ -12,6 +12,8 @@ public:
     struct Link {
         std::shared_ptr<ArtRefillBaseline> baseline;
         bool before=false,after=false;
+        bool refill_done=false;
+        size_t index=0;
     };
     using Read=std::function<bool(uintptr_t,void*,size_t)>;
     explicit ArtRefillService(bool enabled=true,bool merge=true):enabled_(enabled),merge_enabled_(enabled && merge),budget_(std::make_shared<ArtRefillBudget>()) {}
@@ -109,32 +111,53 @@ public:
                 b->identity.address<e.end && e.address<b->identity.address+b->raw.size())links.push_back({b,false,false});
         }
         if(links.size()>4) {++link_limit_;return {};}
-        for(auto& link:links)link.before=anchors(*link.baseline,read);
+        for(size_t i=0;i<links.size();++i) {links[i].index=i;links[i].before=anchors(*links[i].baseline,read);}
         return links;
     }
     void finish(std::vector<Link>& links,const Read& read) {
         for(auto& link:links)link.after=anchors(*link.baseline,read);
     }
-    void begin_batch() {verification_budget_=64u*1024*1024;}
+    void begin_batch() {
+        const double stamp=boot();
+        if(!verification_epoch_ || stamp-verification_epoch_>=1) {verification_epoch_=stamp;verification_budget_=64u*1024*1024;}
+    }
+    double budget_wait() const {return budget_wait_;}
     size_t publish(const std::string& source_stem,const MemorySyscallEvent& e,const FastObservation& o,
-                   const std::vector<Link>& links,size_t output_budget) {
-        size_t written=0;
+                   const std::vector<Link>& links,size_t output_budget,std::vector<Link>* retry=nullptr,unsigned attempt=1) {
+        size_t written=0;budget_wait_=0;
         for(size_t i=0;i<links.size();++i) {
             const auto& link=links[i];const auto& b=*link.baseline;
-            const auto stem=source_stem+"_art"+std::to_string(i);
+            // Link index must stay stable across subset retries (source names).
+            const auto output_stem=source_stem+"_art"+std::to_string(link.index);
+            if(link.refill_done) {
+                written+=retry_merge(output_stem,link,output_budget-std::min(written,output_budget),retry);
+                continue;
+            }
             auto plan=ArtRefill::plan(b,o,static_cast<uint32_t>(e.pid),e.starttime,link.before && link.after);
             if(!plan.accepted()) {
                 ++rejected_;
                 if(plan.reason!="no_complete_changed_method") {
                     if(written<=output_budget && output_budget-written>=1024)
-                        written+=record_rejection(stem,b,o,plan.reason.c_str());
+                        written+=record_rejection(output_stem+"_attempt"+std::to_string(attempt),b,o,plan.reason.c_str());
                     else ++output_drops_;
                 }
                 continue;
             }
+            if(merge_enabled_ && b.merge && b.merge->known(b,o,plan)) {
+                const size_t available=output_budget-std::min(written,output_budget);
+                written+=record_reuse(output_stem,source_stem,b,o,plan,available);
+                // A pending aggregate still needs its OWN live checks; this
+                // branch does not retroactively validate duplicate captures.
+                auto next=link;next.refill_done=true;
+                written+=retry_merge(output_stem,next,output_budget-std::min(written,output_budget),retry);
+                continue;
+            }
             const size_t reserve=3*b.raw.size()+1024*1024;
             if(written>output_budget || reserve>output_budget-written) {++output_drops_;continue;}
-            if(2*b.raw.size()>verification_budget_) {++verification_drops_;continue;}
+            if(2*b.raw.size()>verification_budget_) {
+                ++verification_drops_;budget_wait_=std::max(budget_wait_,verification_epoch_+1-boot());
+                if(retry)retry->push_back(link);continue;
+            }
             verification_budget_-=2*b.raw.size();
             const int fd=::open(("/proc/"+std::to_string(e.pid)+"/mem").c_str(),O_RDONLY|O_CLOEXEC);
             struct Close {int fd;~Close(){if(fd>=0)::close(fd);}} close{fd};
@@ -144,11 +167,13 @@ public:
             auto guard=[&] {return identity_now(b,read);};
             const double check_begin=boot();
             if(!ArtRefill::complement(b,plan,read,guard)) {
-                ++rejected_;written+=record_rejection(stem,b,o,"live_complement_or_identity_changed");continue;
+                ++rejected_;written+=record_rejection(output_stem+"_attempt"+std::to_string(attempt),b,o,"live_complement_or_identity_changed");
+                if(retry && guard())retry->push_back(link);
+                continue;
             }
             auto raw=ArtRefill::materialize(b,o,plan),fixed=ArtRefill::normalize(raw);
             auto report=DexSemantics::validate(fixed.data(),fixed.size());
-            if(!report.valid) {++rejected_;written+=record_rejection(stem,b,o,"refilled_structure_invalid");continue;}
+            if(!report.valid) {++rejected_;written+=record_rejection(output_stem+"_attempt"+std::to_string(attempt),b,o,"refilled_structure_invalid");continue;}
             std::vector<ArtifactTransactionEntryInline> files;
             size_t bytes=0;
             auto stage=[&](const std::string& path,const std::vector<uint8_t>& data) {
@@ -156,9 +181,9 @@ public:
                 if(!write_staged_bytes_inline(temp.c_str(),data.data(),data.size()))return false;
                 files.emplace_back(path.c_str(),temp.c_str());bytes+=data.size();return true;
             };
-            bool ok=stage(stem+".baseline.raw.dex",b.raw) && stage(stem+".refilled.raw.dex",raw) &&
-                stage(stem+".refilled.fixed.dex",fixed);
-            const auto meta=stem+".refill.json",temp=artifact_sidecar_path_inline(meta.c_str(),"tmp");
+            bool ok=stage(output_stem+".baseline.raw.dex",b.raw) && stage(output_stem+".refilled.raw.dex",raw) &&
+                stage(output_stem+".refilled.fixed.dex",fixed);
+            const auto meta=output_stem+".refill.json",temp=artifact_sidecar_path_inline(meta.c_str(),"tmp");
             FILE* f=ok?std::fopen(temp.c_str(),"w"):nullptr;
             if(f) {
                 std::fprintf(f,"{\"schema\":\"nhdd-art-refill-v1\",\"status\":\"reconstructed_method_composite\","
@@ -179,8 +204,10 @@ public:
                         "\"offset\":%u,\"length\":%u}",p?",":"",m.method_index,m.code_offset,m.instructions_offset,m.bytes);
                 }
                 const auto name=[](const std::string& path){return path.substr(path.find_last_of('/')+1);};
-                const auto short_stem=name(stem),source=name(source_stem);
-                std::fprintf(f,"],\"artifacts\":{\"source\":\"%s.json\",\"baseline\":\"%s.baseline.raw.dex\","
+                std::fprintf(f,"],\"verification_attempt\":%u,\"capture_to_verification_ms\":%.3f,\"artifacts\":{\"source\":",
+                    attempt,1000*(check_begin-o.end));
+                const auto short_stem=name(output_stem),source=name(source_stem);
+                std::fprintf(f,"\"%s.json\",\"baseline\":\"%s.baseline.raw.dex\","
                     "\"raw\":\"%s.refilled.raw.dex\",\"fixed\":\"%s.refilled.fixed.dex\"},\"semantic_raw\":",
                     source.c_str(),short_stem.c_str(),short_stem.c_str(),short_stem.c_str());
                 DexSemantics::validate(raw.data(),raw.size()).write_json(f);
@@ -197,28 +224,19 @@ public:
                     meta.c_str(),plan.patches.size(),plan.changed_bytes);
                 if(merge_enabled_) {
                     auto& state=link.baseline->merge;
-                    if(!state) {state=std::make_shared<ArtMethodMerge>(b);state->session=ArtMergePublication::name(stem);}
+                    if(!state) {state=std::make_shared<ArtMethodMerge>(b);state->session=ArtMergePublication::name(output_stem);}
                     const auto result=state->accept(b,o,plan,{ArtMergePublication::name(meta),o.begin,o.end,boot()});
                     if(result==ArtMethodMerge::Result::Duplicate)++merge_duplicates_;
                     if(result==ArtMethodMerge::Result::Conflict)++merge_conflicts_;
                     if(result==ArtMethodMerge::Result::Blocked)++merge_blocked_;
-                    auto merged=ArtMergePublication::publish(b,*state,stem,read,guard,
-                        output_budget-std::min(written,output_budget),verification_budget_,boot());
-                    written+=merged.bytes;
-                    switch(merged.status) {
-                    case ArtMergePublication::Status::Published:++merge_published_;break;
-                    case ArtMergePublication::Status::Conflict:++merge_conflict_records_;break;
-                    case ArtMergePublication::Status::Incompatible:++merge_incompatible_;break;
-                    case ArtMergePublication::Status::Budget:++merge_budget_drops_;break;
-                    case ArtMergePublication::Status::Invalid:++merge_invalid_;break;
-                    case ArtMergePublication::Status::WriteFailed:++write_failures_;break;
-                    default:break;
-                    }
+                    bool again=false;written+=publish_merge(b,output_stem,read,guard,
+                        output_budget-std::min(written,output_budget),again);
+                    if(again && retry) {auto next=link;next.refill_done=true;retry->push_back(next);}
                 }
             } else {
                 artifact_cleanup_temporaries_inline(files);
-                if(!guard()) {++rejected_;written+=record_rejection(stem,b,o,"publication_identity_changed");}
-                else ++write_failures_;
+                if(!guard()) {++rejected_;written+=record_rejection(output_stem+"_attempt"+std::to_string(attempt),b,o,"publication_identity_changed");}
+                else {++write_failures_;if(retry)retry->push_back(link);}
             }
         }
         return written;
@@ -233,8 +251,71 @@ public:
             "blocked=%llu incompatible=%llu budget_drops=%llu invalid=%llu\n",merge_enabled_?1u:0u,ull(merge_published_),
             ull(merge_duplicates_),ull(merge_conflicts_),ull(merge_conflict_records_),ull(merge_blocked_),ull(merge_incompatible_),
             ull(merge_budget_drops_),ull(merge_invalid_));
+        std::fprintf(stderr,"[*] ART schedule: reused_unverified=%llu reuse_records=%llu (raw observations retained; not new proofs)\n",
+            ull(reused_),ull(reuse_records_));
     }
 private:
+    size_t record_reuse(const std::string& stem,const std::string& source,const ArtRefillBaseline& b,
+                        const FastObservation& o,const ArtRefillPlan& plan,size_t budget) {
+        ++reused_;
+        const size_t reserve=1024+plan.patches.size()*1024;
+        if(reserve>budget) {++output_drops_;return 0;}
+        const auto path=stem+".reuse.json",temp=artifact_sidecar_path_inline(path.c_str(),"tmp");
+        FILE* f=std::fopen(temp.c_str(),"w");if(!f){++write_failures_;return 0;}
+        std::fprintf(f,"{\"schema\":\"nhdd-art-reuse-v1\",\"status\":\"duplicate_method_bytes_not_revalidated\","
+            "\"this_observation_verified\":false,\"pid\":%u,\"process_start_time_ticks\":%llu,"
+            "\"dex_address\":\"0x%llx\",\"baseline_revision\":%llu,\"capture_begin_boot\":%.9f,"
+            "\"source\":\"%s.json\",\"references\":[",b.identity.pid,ull(b.identity.process_start_time),
+            ull(b.identity.address),ull(b.revision),o.begin,ArtMergePublication::name(source).c_str());
+        for(size_t i=0;i<plan.patches.size();++i) {
+            const auto& patch=plan.patches[i];
+            for(const auto& m:b.merge->methods)if(m.layout.method_index==patch.method_index &&
+                m.layout.instructions_offset==patch.instructions_offset)for(const auto& v:m.variants)
+                if(!std::memcmp(v.bytes.data(),o.first.data()+b.identity.address+patch.instructions_offset-o.address,patch.bytes)) {
+                    std::fprintf(f,"%s{\"method_index\":%u,\"offset\":%u,\"length\":%u,\"sha1\":\"%s\",\"verified_source\":\"%s\"}",
+                        i?",":"",patch.method_index,patch.instructions_offset,patch.bytes,
+                        ArtMethodMerge::digest(v.bytes).c_str(),v.source.refill.c_str());break;
+                }
+        }
+        std::fputs("]}\n",f);const long n=std::ftell(f);
+        bool ok=std::fflush(f)==0 && ::fsync(::fileno(f))==0;if(std::fclose(f))ok=false;
+        std::vector<ArtifactTransactionEntryInline> files;files.emplace_back(path.c_str(),temp.c_str());
+        if(ok && n>0 && static_cast<size_t>(n)<=budget && artifact_publish_transaction_inline(&files)) {
+            ++reuse_records_;return static_cast<size_t>(n);
+        }
+        artifact_cleanup_temporaries_inline(files);++write_failures_;return 0;
+    }
+    template<class Guard>
+    size_t publish_merge(const ArtRefillBaseline& b,const std::string& stem,const Read& read,Guard guard,
+                         size_t budget,bool& again) {
+        if(!b.merge)return 0;
+        const auto result=ArtMergePublication::publish(b,*b.merge,stem,read,guard,budget,verification_budget_,boot());
+        switch(result.status) {
+        case ArtMergePublication::Status::Published:++merge_published_;break;
+        case ArtMergePublication::Status::Conflict:++merge_conflict_records_;break;
+        case ArtMergePublication::Status::Incompatible:++merge_incompatible_;again=b.active && guard();break;
+        case ArtMergePublication::Status::Budget:
+            ++merge_budget_drops_;again=b.active;
+            if(2*b.raw.size()>verification_budget_)budget_wait_=std::max(budget_wait_,verification_epoch_+1-boot());
+            break;
+        case ArtMergePublication::Status::Invalid:++merge_invalid_;break;
+        case ArtMergePublication::Status::WriteFailed:++write_failures_;again=b.active && guard();break;
+        default:break;
+        }
+        return result.bytes;
+    }
+    size_t retry_merge(const std::string& stem,const Link& link,size_t budget,std::vector<Link>* retry) {
+        const auto& b=*link.baseline;if(!b.active || !b.merge || !b.merge->dirty())return 0;
+        const int fd=::open(("/proc/"+std::to_string(b.identity.pid)+"/mem").c_str(),O_RDONLY|O_CLOEXEC);
+        struct Close {int fd;~Close(){if(fd>=0)::close(fd);}} close{fd};
+        Read read=[&](uintptr_t address,void* p,size_t n) {
+            return read_remote_retry_inline(fd,b.identity.pid,p,n,address,fd<0)==static_cast<ssize_t>(n);
+        };
+        auto guard=[&]{return identity_now(b,read);};bool again=false;
+        const size_t bytes=publish_merge(b,stem,read,guard,budget,again);
+        if(again && retry)retry->push_back(link);
+        return bytes;
+    }
     static unsigned long long ull(uint64_t n){return static_cast<unsigned long long>(n);}
     static double boot(){timespec t{};::clock_gettime(CLOCK_BOOTTIME,&t);return double(t.tv_sec)+double(t.tv_nsec)*1e-9;}
     static bool anchors(const ArtRefillBaseline& b,const Read& read) {
@@ -269,6 +350,7 @@ private:
         return static_cast<size_t>(n);
     }
     bool enabled_,merge_enabled_;std::shared_ptr<ArtRefillBudget> budget_;
+    double verification_epoch_=0,budget_wait_=0;uint64_t reused_=0,reuse_records_=0;
     std::mutex mutex_;std::vector<std::shared_ptr<ArtRefillBaseline>> baselines_;uint64_t revision_=0;
     uint64_t armed_=0,arm_rejected_=0,published_=0,rejected_=0,verification_budget_=0,verification_drops_=0,output_drops_=0,write_failures_=0;
     std::atomic<uint64_t> mapping_invalidations_{0},trace_invalidations_{0},link_limit_{0};

@@ -20,9 +20,11 @@ int main() {
     const auto source=ArtMethodMerge::Source{"first.refill.json",2,2,3};
     auto first=capture(0,1);auto plan=ArtRefill::plan(b,first,42,100,true);assert(plan.accepted());
     assert(merge.accept(b,first,plan,source)==ArtMethodMerge::Result::Added);
+    assert(merge.known(b,first,plan));
     assert(merge.accept(b,first,plan,source)==ArtMethodMerge::Result::Duplicate);
     assert(merge.revision==1 && merge.methods.size()==1 && merge.methods[0].variants[0].observations==2);
     auto second=capture(1,2);plan=ArtRefill::plan(b,second,42,100,true);
+    assert(!merge.known(b,second,plan));
     assert(merge.accept(b,second,plan,{"second.refill.json",4,4,5})==ArtMethodMerge::Result::Added);
     assert(merge.methods.size()==2 && merge.dirty());memory=b.raw;
     assert(merge.compatible(b,read,[]{return true;}));
@@ -49,6 +51,7 @@ int main() {
     // A conflicting same-method variant must freeze the WHOLE generation, not
     // choose whichever appears newer, nor affect the previously exported bytes.
     auto alternate=capture(0,4);plan=ArtRefill::plan(b,alternate,42,100,true);
+    assert(!merge.known(b,alternate,plan));
     assert(merge.accept(b,alternate,plan,{"conflict.refill.json",8,8,9})==ArtMethodMerge::Result::Conflict);
     assert(merge.conflicted && merge.methods[0].variants.size()==2 && merge.revision==4);
     assert(merge.materialize(b).empty() && !merge.compatible(b,read,[]{return true;}));

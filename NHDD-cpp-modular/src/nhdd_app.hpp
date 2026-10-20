@@ -493,6 +493,9 @@ public:
                 const MapsRegion* maps,size_t count,const std::function<bool(uintptr_t,void*,size_t)>& read) {
                 if(kernel_events.active())fast_capture.arm_art(capture,maps,count,read);
             });
+            if(cfg.fast_capture && kernel_events.active() && !fast_capture.start_publication(out_dir)) {
+                std::fprintf(stderr,"[-] Could not start bounded fast publication worker\n");return 1;
+            }
             if(cfg.fast_capture)std::fprintf(stderr,kernel_events.active()
                 ? "[*] Fast local capture armed: prefix=%u KiB/event, two passes/8ms, queue=32MiB, output<=256MiB; not atomic\n"
                 : "[!] Fast local capture unavailable without tracefs; polling cannot rescue vanished bytes (prefix=%u KiB)\n",
@@ -587,7 +590,6 @@ public:
             }
 
             while (!stop_numeric_continuous && !nhdd_stop_requested) {
-                if(cfg.fast_capture)fast_capture.publish(out_dir);
                 // Check duration limit
                 if (cfg.monitor_duration > 0) {
                     time_t elapsed = std::time(nullptr) - start_time;
@@ -920,7 +922,7 @@ public:
             }
 
             kernel_events.stop(); // Join acquisition before the final frozen-buffer drain.
-            if(cfg.fast_capture) {fast_capture.publish(out_dir);fast_capture.diagnostics();}
+            if(cfg.fast_capture) {fast_capture.stop_publication();fast_capture.diagnostics();}
             std::fprintf(stderr, "[*] Continuous monitoring stopped after %d checks\n", check_count);
             std::fprintf(stderr, "[*] Event diagnostics: lost=%llu malformed=%llu\n",
                          static_cast<unsigned long long>(kernel_events.losses()),
