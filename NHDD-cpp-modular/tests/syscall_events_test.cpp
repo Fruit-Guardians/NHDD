@@ -35,5 +35,19 @@ int main() {
     assert(source.ingest(exit,resolve).empty());
     source.ingest(entry,resolve);
     assert(source.ingest("worker-123 [000] .... 1234.000001: sys_exit: NR "+nr+" = -12",resolve).empty());
+    SyscallEvents early;early.early_entries(true);
+#if defined(__aarch64__)
+    const std::string protect="226",remap="216";
+#elif defined(__arm__)
+    const std::string protect="125",remap="163";
+#else
+    const std::string protect="10",remap="25";
+#endif
+    auto before=early.ingest("worker-123 [000] .... 1234.000002: sys_enter: NR "+protect+" (2000, 1000, 0, 0, 0, 0)",resolve);
+    assert(before.size()==1 && before[0].before && before[0].address==8192);
+    before=early.ingest("worker-123 [000] .... 1234.000003: sys_enter: NR "+remap+" (3000, 2000, 4000, 1, 0, 0)",resolve);
+    assert(before.size()==1 && before[0].before && before[0].address==12288 && before[0].end==20480);
+    auto after=early.ingest("worker-123 [000] .... 1234.000004: sys_exit: NR "+remap+" = 40960",resolve);
+    assert(after.size()==1 && !after[0].before && after[0].address==40960 && after[0].end==57344);
     std::puts("syscall_events_test: OK");
 }

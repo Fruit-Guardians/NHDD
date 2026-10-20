@@ -24,6 +24,7 @@
 #include "nhdd_scanner.hpp"
 #include "maps_monitor.hpp"
 #include "syscall_events.hpp"
+#include "fast_capture_service.hpp"
 
 inline volatile std::sig_atomic_t nhdd_stop_requested = 0;
 inline void nhdd_stop_handler(int) { nhdd_stop_requested = 1; }
@@ -199,6 +200,20 @@ public:
             if (std::strcmp(argv[i], "--anon") == 0) {
                 cfg.anon_only = true;
                 continue;
+            }
+            if (std::strcmp(argv[i], "--fast-capture") == 0 && i+1<argc) {
+                const char* value=argv[++i];
+                if(std::strcmp(value,"auto") && std::strcmp(value,"off")) {
+                    std::fprintf(stderr,"[-] --fast-capture requires auto or off\n");return 1;
+                }
+                cfg.fast_capture=std::strcmp(value,"off")!=0;continue;
+            }
+            if (std::strcmp(argv[i], "--fast-max-kb") == 0 && i+1<argc) {
+                char* end=nullptr;const unsigned long n=std::strtoul(argv[++i],&end,10);
+                if(!end || *end || n<4 || n>8192) {
+                    std::fprintf(stderr,"[-] --fast-max-kb requires 4..8192\n");return 1;
+                }
+                cfg.fast_max_kb=static_cast<unsigned>(n);continue;
             }
             if (std::strcmp(argv[i], "--region-delay") == 0 &&
                 i + 1 < argc) {
@@ -438,7 +453,14 @@ public:
             // package subprocess ordering changes between polls.
             std::unordered_map<std::string, MapsMonitor> monitors;
             bool stop_numeric_continuous = false;
+            FastCaptureService fast_capture(target,is_numeric,size_t(cfg.fast_max_kb)*1024,mode & ScanMode::DEX);
+            {
+                std::vector<int> filter;
+                for(int p=0;p<pid_count;++p)filter.push_back(std::atoi(pids[p]));
+                fast_capture.targets(filter);
+            }
             SyscallEvents kernel_events;
+            if(cfg.fast_capture)kernel_events.early_lines([&](const std::string& line) {fast_capture.line(line);});
             if (std::strcmp(cfg.event_backend, "poll") != 0 && !kernel_events.start()) {
                 if (std::strcmp(cfg.event_backend, "tracefs") == 0) {
                     std::fprintf(stderr, "[-] Required tracefs backend unavailable: %s\n", kernel_events.error().c_str()); return 1;
@@ -453,6 +475,10 @@ public:
             if(std::strcmp(cfg.event_backend,"tracefs")==0 && !kernel_events.active()) {
                 std::fprintf(stderr,"[-] Required tracefs backend could not establish target filtering\n");return 1;
             }
+            if(cfg.fast_capture)std::fprintf(stderr,kernel_events.active()
+                ? "[*] Fast local capture armed: prefix=%u KiB/event, two passes/8ms, queue=32MiB, output<=256MiB; not atomic\n"
+                : "[!] Fast local capture unavailable without tracefs; polling cannot rescue vanished bytes (prefix=%u KiB)\n",
+                cfg.fast_max_kb);
             ProcessManager::LaunchHelper launch_helper;
             pid_t& launch_pid = launch_helper.pid;
             if (cfg.spawn) {
@@ -543,6 +569,7 @@ public:
             }
 
             while (!stop_numeric_continuous && !nhdd_stop_requested) {
+                if(cfg.fast_capture)fast_capture.publish(out_dir);
                 // Check duration limit
                 if (cfg.monitor_duration > 0) {
                     time_t elapsed = std::time(nullptr) - start_time;
@@ -626,6 +653,7 @@ public:
                 if(pid_count>0 || spawn_seen) {
                     std::vector<int> filter;
                     for(int p=0;p<pid_count;++p)filter.push_back(std::atoi(pids[p]));
+                    fast_capture.targets(filter);
                     kernel_events.filter_processes(filter);
                 }
                 if(event_backend_was_active && !kernel_events.active()) {
@@ -871,6 +899,8 @@ public:
                 }
             }
 
+            kernel_events.stop(); // Join acquisition before the final frozen-buffer drain.
+            if(cfg.fast_capture) {fast_capture.publish(out_dir);fast_capture.diagnostics();}
             std::fprintf(stderr, "[*] Continuous monitoring stopped after %d checks\n", check_count);
             std::fprintf(stderr, "[*] Event diagnostics: lost=%llu malformed=%llu\n",
                          static_cast<unsigned long long>(kernel_events.losses()),
@@ -1043,6 +1073,8 @@ private:
             "    --relaxed     DEX scan without magic (endian_tag based)\n"
             "    --art-dex auto|off|only  Verified-build ART DEX discovery (default auto); only skips header/container scan\n"
             "    --art-scan-mb N  Native-heap read budget per round, 1..512 MiB (default 64); resumes next round\n"
+            "    --fast-capture auto|off  Early tracefs local double-read capture (default auto); continuous only\n"
+            "    --fast-max-kb N  Per-event prefix 4..8192 KiB (default 1024), shared 8ms read budget\n"
             "    --anon        Only scan anonymous mappings\n"
             "    --region-delay MS  Pause between regions (ms)\n"
             "    --name NAME   Fake process name\n"

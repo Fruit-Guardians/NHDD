@@ -46,7 +46,7 @@
 - `--events auto`（continuous 默认）尝试在 tracefs 创建专用 `instances/nhdd_<writer_pid>`，订阅 `raw_syscalls` 的 mmap/mprotect/munmap/mremap；不修改全局 tracer 或其他实例。`--events tracefs` 要求内核后端成功，否则返回错误；`--events poll` 显式使用轮询。
 - 启动前尚无目标 PID 时会临时收集这些系统调用，再按目标进程身份筛选；发现目标后配置线程 PID 过滤，并使用 `event-fork` 继承新线程/后代。Android ARM64 支持原生及兼容 ARM32 syscall 编号；ARMv7 构建支持 ARM32，Linux x86_64 支持原生 syscall。
 - 成功 syscall 的 entry/exit 按 TID、TGID/starttime 和 boot 时间配对，失败返回值不产生成功事件。相邻范围合并成一次增量扫描；即使 maps 恢复原状且抽样哈希未变，也保留 syscall 触发范围。mmap 重用、munmap、mremap 旧地址会失效对应 DEX 合并缓存。
-- 专用读取线程在大对象扫描期间继续排空内核缓冲；用户态队列上限 16MiB、单批输出最多 8192 个事件。丢失/溢出会报告并执行全量补扫，不能补回已经消失的短暂明文窗口。
+- 专用读取线程在大对象扫描期间继续消费内核事件。默认快速路径在该线程独立配对并读取局部字节，再交给主线程落盘；原始事件文本仍送入 16MiB 队列、单批最多 8192 个事件用于原有扫描。快速字节队列另限 32MiB / 512 份，过载/预算丢弃独立计数。丢失后全量补扫不能补回已经消失的明文，详见[快速捕获设计](fast-capture.md)。
 - 时间线增加 `memory_syscall` 事件，记录 syscall、enter_best_effort/exit_success、boot 时间、地址、权限及旧映射范围。SIGINT/SIGTERM 正常退出时停止并移除本工具 tracing instance；SIGKILL/系统崩溃无法执行清理，可能留下本工具实例。
 
 ### 5. DEX 结构检查与 ART 格式识别

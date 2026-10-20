@@ -47,6 +47,7 @@
 | SO 重建 | 支持 ELF32/64，按 `PT_LOAD / load bias` 恢复文件布局；区分完整重建和缺页残件 |
 | 冷启动与多进程跟随 | 启动前布置事件源，跟随包名进程、子进程及已经发现的改名后代；隔离 PID 复用 |
 | 事件驱动增量捕获 | 结合 mmap / mprotect / munmap / mremap、映射与权限变化、内容采样触发扫描 |
+| 快速局部捕获 | tracefs 采集线程先抢救事件范围，再异步落盘；两遍读取记录匹配、变化、缺页与时延，不依赖先发现 DEX 头 |
 | JNI 绑定发现 | 无 Hook 扫描 `JNINativeMethod` 表，导出候选绑定和函数指针；支持按 SO 筛选 |
 | ART 格式识别 | 保留 CompactDex / VDEX / OAT 原生证据，包含 OAT 279 头部与偏移检查 |
 | 离线校验 | `--verify FILE` 输出 JSON，不启动或执行待检代码 |
@@ -146,6 +147,8 @@ adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_live
 
 `auto` 优先尝试 tracefs，失败时明确提示并退回轮询。必须使用内核事件时选 `--events tracefs`；主动关闭内核事件时选 `--events poll`。`--monitor-duration 0` 表示持续运行，可用 Ctrl+C 正常结束。
 
+快速路径默认随 continuous 的 tracefs 后端开启，在主扫描忙时也尝试立即保存事件范围。输出位于 `fast/`，包含两次读取的局部原始字节、逐页覆盖和一致性标记；只有完全包含在某一次读取中的标准 DEX 才另存 raw/fixed 副本。默认每事件取前 1MiB，可用 `--fast-max-kb 4..8192` 调整；用 `--fast-capture off` 做关闭对照。双读相同不等于原子快照，轮询回退不具备该能力。预算、输出说明及真机对照见[快速捕获说明](docs/fast-capture.md)。
+
 ### 查找 JNI 绑定
 
 先写目标与输出目录，再写可选的 JNI 模块筛选参数：
@@ -188,6 +191,8 @@ adb shell "/data/local/tmp/nhdd --verify /data/local/tmp/example.odex"
 | `--spawn / --spawn-restart` | 启动前布置事件；后者先强制停止应用；均自动开启 continuous |
 | `--spawn-timeout S` | 等待首次发现目标进程，默认 15 秒，范围 1–300 |
 | `--events auto\|tracefs\|poll` | 选择事件后端，自动开启 continuous |
+| `--fast-capture auto\|off` | 默认 auto；continuous + tracefs 的采集线程局部双读，不另行开启 continuous |
+| `--fast-max-kb N` | 每事件读取前缀上限，默认 1024 KiB，范围 4–8192；两遍共用 8ms 软预算 |
 | `--monitor-interval T` | continuous 周期检查间隔，默认 2 秒 |
 | `--monitor-duration S` | continuous 调度时长，默认 0，即不限时 |
 | `--monitor-verbose` | 输出详细监控日志 |
@@ -201,6 +206,8 @@ adb shell "/data/local/tmp/nhdd --verify /data/local/tmp/example.odex"
 | `--help` | 查看内置帮助 |
 
 默认复用输出目录会清理所选模式的旧产物；建议每次使用新目录。监控时长限制不是硬超时，正在进行的扫描会完成后退出。
+
+`fast/` 是按捕获会话与时刻命名的追加证据，不参与上述旧产物清理。快速路径每次运行最多发布约 256MiB，复用目录仍会累计，建议每次换新目录并及时归档。
 
 <details>
 <summary>更多扫描、JNI 与读取选项</summary>
@@ -239,6 +246,7 @@ nhdd_demo/
 │   ├── *.raw.bin                # 可用时附带的原始 load-layout
 │   └── *.json                   # segments、holes、load bias、manifest 等
 ├── maps/                       # 使用 --save-maps 等选项时生成
+├── fast/                       # 局部双读 .bin / .json，完全包含的 DEX 另存 raw/fixed
 ├── jnimap/                     # JNI 候选绑定及函数指针 JSONL
 └── timeline.jsonl              # continuous 的映射与系统调用时间线
 ```
@@ -251,6 +259,7 @@ nhdd_demo/
 - `oat-header.bin`：明确只有头部证据，不能作为完整 OAT 使用。
 - `manifest_<pid>_g<starttime>.json`：记录 SO 发布状态；continuous 同时记录会话累计和最近一次扫描。
 - `timeline.jsonl`：判断变化、捕获时机、事件丢失与采样状态；丢失后补扫不能补回已经消失的明文。
+- `fast/*.json`：`two_reads_match / changed_between_reads / partial_reads` 分别表达双读相同、变化与不完整；同时看 `truncated`、逐页长度与 DEX 子项的独立一致性。二进制中不可读部分补零，只能按页覆盖解释，不能视为有效原始字节。该路径不与多轮 DEX 缓存盲拼，计数见 `Fast capture`，不并入主扫描的唯一 DEX 数。
 
 ### 当前格式支持
 
@@ -288,7 +297,7 @@ $nhddNdk = "C:/Android/android-ndk-r27"
 make test
 ```
 
-八组测试覆盖 DEX 合并、ELF 重建、maps 变化、manifest、进程跟随、syscall、格式检查与 ART 对象发现反例。设备夹具和实现细节见[源码说明](src/README.md)与[技术设计](docs/design.md)。
+九组测试覆盖 DEX 合并、ELF 重建、maps 变化、manifest、进程跟随、syscall、格式检查、ART 对象发现与局部双读反例。设备夹具和实现细节见[源码说明](src/README.md)与[技术设计](docs/design.md)。
 
 ## 常见问题
 
@@ -316,6 +325,7 @@ OAT 只导出明确标记的头部证据；系统/APEX/vendor 的 runtime 格式
 
 - [技术设计与验证边界](docs/design.md)
 - [ART 辅助 DEX 发现与真机复现](docs/art-discovery.md)
+- [快速局部捕获、一致性与短窗口真机对照](docs/fast-capture.md)
 - [源码模块与维护约束](src/README.md)
 - [README 徽章制作方法](docs/badges.md)
 - [提交问题](https://github.com/Fruit-Guardians/NHDD/issues)：建议附设备 ABI、Android/ART 版本、命令、错误日志和脱敏 metadata，不要公开未授权 APK 或私有内存产物。
