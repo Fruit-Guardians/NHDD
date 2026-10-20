@@ -22,11 +22,22 @@ struct NhddConfig {
 
     // Continuous monitoring mode
     bool continuous = false;         // --continuous: persistent maps monitoring
+    bool spawn = false;
+    bool spawn_restart = false;
+    int spawn_timeout = 15;
+    // auto: isolated tracefs if available, otherwise explicit polling fallback.
+    // tracefs: fail if unavailable. poll: no kernel event source.
+    char event_backend[16] = "auto";
     int  monitor_interval = 2;      // --monitor-interval: seconds between maps checks (default 2s)
     int  monitor_duration = 0;      // --monitor-duration: total monitoring time in seconds (0=unlimited)
     bool monitor_verbose = false;    // --monitor-verbose: print every maps diff event
     bool dump_on_load = true;        // dump SO immediately when detected in maps
     bool timeline = true;            // record SO/DEX load timeline to timeline.jsonl
+    // Content monitoring deliberately hashes a few small windows instead of
+    // every byte.  This bounds the observer overhead while still catching the
+    // common decrypt-in-place transition.
+    int monitor_fingerprint_budget_kb = 256;
+    int monitor_fingerprint_sample_bytes = 64;
 
     // Dedup table sizing
     int dedup_dex_max = 1024;

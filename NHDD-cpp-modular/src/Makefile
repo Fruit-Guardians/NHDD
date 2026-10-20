@@ -8,7 +8,7 @@ NHDD_BIN ?= nhdd
 SRC := main.cpp
 CXX ?= aarch64-linux-android34-clang++
 CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra
-LDFLAGS ?= -static-libstdc++
+LDFLAGS ?= -static-libstdc++ -pthread
 
 .PHONY: all android host clean push test
 
@@ -18,7 +18,7 @@ android:
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(NHDD_BIN) $(LDFLAGS)
 
 host:
-	g++ -O2 -std=c++17 -Wall -Wextra $(SRC) -o $(NHDD_BIN)_host
+	g++ -O2 -std=c++17 -Wall -Wextra -pthread $(SRC) -o $(NHDD_BIN)_host
 
 push: android
 	adb push $(NHDD_BIN) /data/local/tmp/nhdd && adb shell chmod 755 /data/local/tmp/nhdd

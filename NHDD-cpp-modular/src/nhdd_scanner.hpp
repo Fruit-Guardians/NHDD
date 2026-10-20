@@ -5,6 +5,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <algorithm>
+#include <limits>
+#include <new>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
@@ -13,73 +20,68 @@
 #include <dirent.h>
 #include "common_types.hpp"
 #include "nhdd_config.hpp"
+#include "maps_parser.hpp"
 #include "dedup_table.hpp"
+#include "dex_capture.hpp"
 #include "dex_validator.hpp"
+#include "dex_semantics.hpp"
+#include "runtime_formats.hpp"
 #include "process_manager.hpp"
 #include "object_classifier.hpp"
 #include "jnimap_scanner.hpp"
+#include "elf_reconstructor.hpp"
+#include "artifact_transaction.hpp"
+#include "so_artifact_identity.hpp"
+#include "so_manifest.hpp"
+#include "process_generation_guard.hpp"
+
+static uint64_t read_process_start_time_inline(const char* pid);
+
+static uint64_t read_process_start_time_for_guard_inline(void*,
+                                                         const char* pid) {
+    return read_process_start_time_inline(pid);
+}
 
 // ---- Forward-declared helper: load /proc/pid/maps ----
 static int load_maps_inline(const char* pid,
                              MapsRegion** out_regs, size_t* out_count) {
-    char path[256];
-    std::snprintf(path, sizeof(path), "/proc/%s/maps", pid);
-    FILE* f = std::fopen(path, "r");
-    if (!f) return -1;
-
-    size_t cap = 512;
-    auto* regs = static_cast<MapsRegion*>(std::calloc(cap, sizeof(MapsRegion)));
-    if (!regs) { std::fclose(f); return -1; }
-    size_t count = 0;
-
-    char line[1024];
-    while (std::fgets(line, sizeof(line), f)) {
-        if (count == cap) {
-            cap *= 2;
-            auto* nr = static_cast<MapsRegion*>(std::realloc(regs, cap * sizeof(MapsRegion)));
-            if (!nr) break;
-            regs = nr;
-            std::memset(regs + count, 0, (cap - count) * sizeof(MapsRegion));
-        }
-        MapsRegion* r = &regs[count];
-        std::memset(r, 0, sizeof(*r));
-
-        unsigned long dmaj = 0, dmin = 0, off = 0, ino = 0;
-        int n = std::sscanf(line, "%lx-%lx %7s %lx %lx:%lx %lu",
-                            &r->start, &r->end, r->perms, &off, &dmaj, &dmin, &ino);
-        if (n < 7) {
-            if (std::sscanf(line, "%lx-%lx %7s", &r->start, &r->end, r->perms) < 3)
-                continue;
-            off = 0; dmaj = 0; dmin = 0; ino = 0;
-        }
-        r->offset = static_cast<uint64_t>(off);
-        r->inode = static_cast<uint64_t>(ino);
-        r->dev_major = static_cast<uint32_t>(dmaj);
-        r->dev_minor = static_cast<uint32_t>(dmin);
-
-        for (int i = 0; i < 4; i++) {
-            if (r->perms[i] == 'r') r->readable = true;
-            if (r->perms[i] == 'w') r->writable = true;
-            if (r->perms[i] == 'x') r->executable = true;
-        }
-        char* p = line;
-        int fields = 0;
-        while (fields < 5 && *p) {
-            while (*p == ' ') p++;
-            if (!*p) break;
-            while (*p && *p != ' ' && *p != '\n') p++;
-            fields++;
-        }
-        while (*p == ' ') p++;
-        if (*p && *p != '\n') {
-            size_t plen = std::strlen(p);
-            while (plen > 0 && (p[plen - 1] == '\n' || p[plen - 1] == '\r'))
-                plen--;
-            std::snprintf(r->path, sizeof(r->path), "%.*s", static_cast<int>(plen), p);
-        }
-        count++;
+    if (!out_regs || !out_count) {
+        errno = EINVAL;
+        return -1;
     }
-    std::fclose(f);
+    *out_regs = nullptr;
+    *out_count = 0;
+
+    int maps_error = 0;
+    MapsParser::RegionList* parsed =
+        MapsParser::load_maps(pid, &maps_error);
+    if (!parsed) {
+        errno = maps_error != 0 ? maps_error : EIO;
+        return -1;
+    }
+
+    MapsRegion* regs = nullptr;
+    if (parsed->count != 0) {
+        if (parsed->count >
+            std::numeric_limits<size_t>::max() / sizeof(MapsRegion)) {
+            delete parsed;
+            errno = EOVERFLOW;
+            return -1;
+        }
+        // Keep the allocation family identical to MapsParser::RegionList so
+        // the temporary JNIMAP owner remains exception-safe.
+        regs = new (std::nothrow) MapsRegion[parsed->count];
+        if (!regs) {
+            delete parsed;
+            errno = ENOMEM;
+            return -1;
+        }
+        std::memcpy(regs, parsed->regs,
+                    parsed->count * sizeof(MapsRegion));
+    }
+
+    const size_t count = parsed->count;
+    delete parsed;
     *out_regs = regs;
     *out_count = count;
     return 0;
@@ -110,12 +112,15 @@ static ssize_t read_remote_retry_inline(int mem_fd, pid_t target_pid, void* buf,
 
 
 static bool deep_so_region_candidate(const MapsRegion* r, const char* pkg) {
-    if (!r || !r->readable) return false;
+    if (!r) return false;
     size_t region_size = r->end - r->start;
     if (region_size < 0x40 || region_size > 0x40000000u) return false;
-    // Only scan executable regions — shellcode / decrypted ELF lives in X pages.
-    // Pure RW anonymous heap is huge and never contains valid ELFs.
-    if (!r->executable) return false;
+    // Packers also keep an embedded ELF header in RW staging buffers before
+    // copying/mprotecting PT_LOAD pages. Include RW and execute-only candidate
+    // regions; ordinary read-only carrier files are still handled by the
+    // map-start pass and are not byte-scanned here.
+    if ((!r->readable && !r->executable) ||
+        (!r->writable && !r->executable)) return false;
     // Runtime-unpacked SOs normally live in anonymous / memfd / app-private mappings.
     if (r->path[0] == '\0' || r->inode == 0) return true;
     if (std::strstr(r->path, "memfd") || std::strstr(r->path, "ashmem")) return true;
@@ -124,97 +129,261 @@ static bool deep_so_region_candidate(const MapsRegion* r, const char* pkg) {
     return false;
 }
 
-static uint64_t read_u32_le(const uint8_t* p) {
-    uint32_t v = 0; std::memcpy(&v, p, 4); return v;
+struct ElfInlineReaderContext {
+    int mem_fd = -1;
+    pid_t pid = 0;
+    bool use_vm_readv = false;
+};
+
+static std::ptrdiff_t elf_read_remote_inline(void* opaque, uint8_t* destination,
+                                             size_t size,
+                                             uintptr_t remote_address) {
+    auto* context = static_cast<ElfInlineReaderContext*>(opaque);
+    return static_cast<std::ptrdiff_t>(read_remote_retry_inline(
+        context->mem_fd, context->pid, destination, size, remote_address,
+        context->use_vm_readv));
 }
-static uint64_t read_u16_le(const uint8_t* p) {
-    uint16_t v = 0; std::memcpy(&v, p, 2); return v;
+
+static const MapsRegion* map_containing_inline(const MapsRegion* regs,
+                                               size_t reg_count,
+                                               uintptr_t address) {
+    for (size_t i = 0; i < reg_count; ++i) {
+        if (regs[i].start <= address && address < regs[i].end) return &regs[i];
+    }
+    return nullptr;
 }
-static uint64_t read_u64_le(const uint8_t* p) {
-    uint64_t v = 0; std::memcpy(&v, p, 8); return v;
+
+static uint64_t mapping_fingerprint_inline(const MapsRegion* region) {
+    if (!region) return 0;
+    uint64_t hash = 1469598103934665603ULL;
+    const auto mix_u64 = [&hash](uint64_t value) {
+        for (unsigned i = 0; i < 8; ++i) {
+            hash ^= static_cast<uint8_t>(value >> (i * 8));
+            hash *= 1099511628211ULL;
+        }
+    };
+    mix_u64(static_cast<uint64_t>(region->start));
+    mix_u64(static_cast<uint64_t>(region->end));
+    mix_u64(region->offset);
+    mix_u64(region->inode);
+    mix_u64(region->dev_major);
+    mix_u64(region->dev_minor);
+    for (const unsigned char* p =
+             reinterpret_cast<const unsigned char*>(region->path);
+         *p; ++p) {
+        hash ^= *p;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
 }
+
+static void safe_artifact_name_inline(const char* source, char* output,
+                                      size_t output_size) {
+    if (!output || output_size == 0) return;
+    const char* basename = source && *source ? std::strrchr(source, '/') : nullptr;
+    basename = basename ? basename + 1 : source;
+    if (!basename || !*basename) basename = "anonymous";
+    size_t written = 0;
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(basename);
+         *p && written + 1 < output_size; ++p) {
+        const bool allowed = (*p >= 'a' && *p <= 'z') ||
+                             (*p >= 'A' && *p <= 'Z') ||
+                             (*p >= '0' && *p <= '9') || *p == '.' ||
+                             *p == '_' || *p == '-';
+        output[written++] = allowed ? static_cast<char>(*p) : '_';
+    }
+    output[written] = '\0';
+}
+
+static uint64_t artifact_hash_inline(const uint8_t* data, size_t size) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static void artifact_hash_mix_u64_inline(uint64_t* hash, uint64_t value) {
+    if (!hash) return;
+    for (unsigned i = 0; i < 8; ++i) {
+        *hash ^= static_cast<uint8_t>(value >> (i * 8));
+        *hash *= 1099511628211ULL;
+    }
+}
+
+static bool scope_intersects_inline(const ScanScope* scope, uintptr_t start,
+                                    uintptr_t end) {
+    return !scope || !scope->incremental || scope->intersects(start, end);
+}
+
+// A changed PT_LOAD mapping usually does not contain the ELF header. Relate
+// file/APK/memfd mappings by their backing path so an incremental event in
+// .text can still locate the corresponding header mapping. Anonymous mappings
+// are only related when they are close enough to plausibly be adjacent loads.
+static bool scope_related_to_region_inline(const ScanScope* scope,
+                                           const MapsRegion* region) {
+    if (!scope || !scope->incremental) return true;
+    if (!region || region->start >= region->end) return false;
+    if (scope->intersects(region->start, region->end)) return true;
+
+    constexpr uintptr_t kAnonymousNeighbourLimit = 64u * 1024u * 1024u;
+    for (size_t i = 0; i < scope->count; ++i) {
+        const IncrementalScanRange& changed = scope->ranges[i];
+        if (region->path[0] != '\0' && changed.path[0] != '\0' &&
+            std::strcmp(region->path, changed.path) == 0) {
+            return true;
+        }
+        if (region->path[0] == '\0' && changed.path[0] == '\0') {
+            const uintptr_t gap = region->end <= changed.start
+                                      ? changed.start - region->end
+                                      : (changed.end <= region->start
+                                             ? region->start - changed.end
+                                             : 0);
+            if (gap <= kAnonymousNeighbourLimit) return true;
+        }
+    }
+    return false;
+}
+
+struct SoArtifactCountsInline {
+    int coverage_complete = 0;
+    int partial = 0;
+
+    void add(bool complete) {
+        if (complete) ++coverage_complete;
+        else ++partial;
+    }
+};
 
 static int dump_mem_elf_at_inline(int mem_fd, pid_t pid, uintptr_t elf_addr,
+                                  const MapsRegion* regs, size_t reg_count,
                                   const char* so_dir, const char* pid_s,
-                                  SoDedup& so_dedup, int* so_counter,
-                                  bool use_vm_readv) {
-    char key[128];
-    std::snprintf(key, sizeof(key), "memelf_%s_%lx", pid_s, (unsigned long)elf_addr);
+                                  uint64_t process_start_time,
+                                  SoDedup& so_dedup,
+                                  SoArtifactCountsInline* artifact_counts,
+                                  bool use_vm_readv,
+                                  ProcessGenerationGuardInline* generation) {
+    if (!generation || !generation->verify()) return 0;
+    ElfInlineReaderContext reader_context{mem_fd, pid, use_vm_readv};
+    ElfReconstructor::Result result;
+    if (!ElfReconstructor::reconstruct(elf_addr, regs, reg_count,
+                                       &elf_read_remote_inline, &reader_context,
+                                       &result)) {
+        std::fprintf(stderr, "  [!] ELF candidate 0x%lx rejected: %s\n",
+                     static_cast<unsigned long>(elf_addr), result.error.c_str());
+        return 0;
+    }
+    // In particular, process_vm_readv() resolves the numeric PID at syscall
+    // time rather than pinning the generation.  Reject the whole candidate if
+    // the PID disappeared or was recycled while its PT_LOAD bytes were read.
+    if (!generation->verify()) return 0;
+
+    const uint64_t reconstructed_hash = artifact_hash_inline(
+        result.image.data(), result.image.size());
+    const uint64_t raw_layout_hash = result.raw_image.empty()
+                                         ? reconstructed_hash
+                                         : artifact_hash_inline(
+                                               result.raw_image.data(),
+                                               result.raw_image.size());
+    uint64_t evidence_hash = so_combine_evidence_hash_inline(
+        reconstructed_hash, raw_layout_hash);
+    // Always retain pre-normalization header identity. raw_image is usually
+    // available, but this also protects unusual layouts where it is disabled
+    // or does not cover the ELF header/SHT references.
+    evidence_hash = so_mix_original_elf_identity_inline(
+        evidence_hash, result.original_elf_header_hash,
+        result.original_e_shoff, result.original_e_shnum,
+        result.original_e_shstrndx);
+    artifact_hash_mix_u64_inline(&evidence_hash, result.recovered_bytes);
+    for (const auto& hole : result.holes) {
+        artifact_hash_mix_u64_inline(&evidence_hash, hole.file_offset);
+        artifact_hash_mix_u64_inline(&evidence_hash, hole.size);
+        artifact_hash_mix_u64_inline(&evidence_hash, hole.remote_address);
+    }
+    SoArtifactIdentityInline identity;
+    identity.pid = static_cast<uint32_t>(pid);
+    identity.process_start_time = process_start_time;
+    identity.address = elf_addr;
+    identity.evidence_hash = evidence_hash;
+    char key[256];
+    if (!so_format_dedup_key_inline(key, sizeof(key), identity)) return 0;
     if (so_dedup.seen(key)) return 0;
 
-    uint8_t hdr[0x4000];
-    std::memset(hdr, 0, sizeof(hdr));
-    ssize_t hn = read_remote_retry_inline(mem_fd, pid, hdr, sizeof(hdr), elf_addr, use_vm_readv);
-    if (hn < 0x40 || std::memcmp(hdr, "\x7f""ELF", 4) != 0) return 0;
-    if (hdr[4] != 1 && hdr[4] != 2) return 0;
-    if (hdr[5] != 1) return 0; // Android is little-endian.
-
-    bool is64 = hdr[4] == 2;
-    uint64_t e_phoff = is64 ? read_u64_le(hdr + 32) : read_u32_le(hdr + 28);
-    uint16_t e_phentsize = static_cast<uint16_t>(is64 ? read_u16_le(hdr + 54) : read_u16_le(hdr + 42));
-    uint16_t e_phnum = static_cast<uint16_t>(is64 ? read_u16_le(hdr + 56) : read_u16_le(hdr + 44));
-    if (e_phoff == 0 || e_phentsize == 0 || e_phnum == 0 || e_phnum > 64) return 0;
-    if (e_phoff + static_cast<uint64_t>(e_phnum) * e_phentsize > static_cast<uint64_t>(hn)) return 0;
-
-    uint64_t needed = 0;
-    for (uint16_t i = 0; i < e_phnum; i++) {
-        uint64_t ph = e_phoff + static_cast<uint64_t>(i) * e_phentsize;
-        uint32_t p_type = static_cast<uint32_t>(read_u32_le(hdr + ph));
-        if (p_type != 1) continue; // PT_LOAD
-        uint64_t p_offset = 0, p_vaddr = 0, p_filesz = 0, p_memsz = 0;
-        if (is64) {
-            p_offset = read_u64_le(hdr + ph + 8);
-            p_vaddr  = read_u64_le(hdr + ph + 16);
-            p_filesz = read_u64_le(hdr + ph + 32);
-            p_memsz  = read_u64_le(hdr + ph + 40);
-        } else {
-            p_offset = read_u32_le(hdr + ph + 4);
-            p_vaddr  = read_u32_le(hdr + ph + 8);
-            p_filesz = read_u32_le(hdr + ph + 16);
-            p_memsz  = read_u32_le(hdr + ph + 20);
-        }
-        uint64_t end1 = p_offset + (p_filesz ? p_filesz : p_memsz);
-        uint64_t end2 = p_vaddr  + (p_memsz ? p_memsz : p_filesz);
-        if (end1 > needed) needed = end1;
-        if (end2 > needed) needed = end2;
+    const MapsRegion* source_map = map_containing_inline(regs, reg_count, elf_addr);
+    const char* source_path = source_map ? source_map->path : "";
+    char safe_name[192];
+    safe_artifact_name_inline(source_path, safe_name, sizeof(safe_name));
+    char stem[512];
+    if (!so_format_artifact_stem_inline(stem, sizeof(stem), safe_name,
+                                        identity)) {
+        return 0;
     }
-    if (needed < 0x1000 || needed > 64u * 1024u * 1024u) return 0;
 
-    auto* buf = static_cast<uint8_t*>(std::calloc(1, static_cast<size_t>(needed)));
-    if (!buf) return 0;
-    for (uint64_t off = 0; off < needed; off += 4096) {
-        size_t todo = static_cast<size_t>(needed - off);
-        if (todo > 4096) todo = 4096;
-        read_remote_retry_inline(mem_fd, pid, buf + off, todo, elf_addr + static_cast<uintptr_t>(off), use_vm_readv);
+    char raw_path[1024];
+    char reconstructed_path[1024];
+    char metadata_path[1024];
+    std::snprintf(raw_path, sizeof(raw_path), "%s/%s.raw.bin", so_dir,
+                  stem);
+    std::snprintf(reconstructed_path, sizeof(reconstructed_path),
+                  "%s/%s.%s.so", so_dir, stem,
+                  result.complete ? "reconstructed" : "partial");
+    std::snprintf(metadata_path, sizeof(metadata_path), "%s/%s.json", so_dir,
+                  stem);
+
+    ElfReconstructor::ArtifactMetadata metadata_identity;
+    metadata_identity.pid = identity.pid;
+    metadata_identity.process_start_time = process_start_time;
+    metadata_identity.reconstructed_hash = reconstructed_hash;
+    metadata_identity.raw_layout_hash = raw_layout_hash;
+    metadata_identity.evidence_hash = evidence_hash;
+
+    if (!ElfReconstructor::write_artifacts(
+            result, result.raw_layout_available ? raw_path : nullptr,
+            reconstructed_path, metadata_path, source_path,
+            &metadata_identity, &process_generation_publish_guard_inline,
+            generation)) {
+        std::fprintf(stderr, "  [-] Failed to publish ELF artifact 0x%lx\n",
+                     static_cast<unsigned long>(elf_addr));
+        return 0;
     }
-    if (std::memcmp(buf, "\x7f""ELF", 4) != 0) { std::free(buf); return 0; }
 
-    char out[768];
-    int idx = so_counter ? (*so_counter + 1) : 1;
-    std::snprintf(out, sizeof(out), "%s/memelf_%s_%lx.so", so_dir, pid_s, (unsigned long)elf_addr);
-    FILE* f = std::fopen(out, "wb");
-    if (!f) { std::free(buf); return 0; }
-    size_t wr = std::fwrite(buf, 1, static_cast<size_t>(needed), f);
-    std::fclose(f);
-    std::free(buf);
-    if (wr == 0) return 0;
-    so_dedup.remember(key);
-    if (so_counter) (*so_counter)++;
-    std::printf("[+] SO(memelf): %s (%llu bytes) pid=%s\n",
-                out, (unsigned long long)needed, pid_s);
-    (void)idx;
+    const bool evicted = so_dedup.remember(key);
+    if (evicted && (so_dedup.eviction_count() == 1 ||
+                    so_dedup.eviction_count() % 256 == 0)) {
+        std::fprintf(stderr,
+                     "[!] SO dedup LRU eviction: total=%llu capacity=%zu\n",
+                     static_cast<unsigned long long>(
+                         so_dedup.eviction_count()),
+                     so_dedup.capacity());
+    }
+    if (artifact_counts) artifact_counts->add(result.complete);
+    std::printf("[%c] SO(%s): %s (%llu bytes, %.2f%% coverage, holes=%zu, "
+                "bias=0x%lx) pid=%s\n",
+                result.complete ? '+' : '~',
+                result.complete ? "reconstructed" : "partial",
+                reconstructed_path,
+                static_cast<unsigned long long>(result.output_size),
+                result.completeness_percent(), result.holes.size(),
+                static_cast<unsigned long>(result.load_bias), pid_s);
     return 1;
 }
 
 static int deep_scan_mem_elf_inline(int mem_fd, pid_t pid, const char* pid_s,
+                                    uint64_t process_start_time,
                                     const char* pkg, MapsRegion* regs,
                                     size_t reg_count, const char* so_dir,
-                                    SoDedup& so_dedup, bool use_vm_readv) {
+                                    SoDedup& so_dedup, bool use_vm_readv,
+                                    const ScanScope* scope,
+                                    SoArtifactCountsInline* artifact_counts,
+                                    ProcessGenerationGuardInline* generation) {
     int found = 0;
     static const int kMaxMemElfPerProc = 12;
     uint8_t page[4096 + 16];
     for (size_t ri = 0; ri < reg_count && found < kMaxMemElfPerProc; ri++) {
+        if (!generation || !generation->verify()) break;
         MapsRegion* r = &regs[ri];
+        if (!scope_related_to_region_inline(scope, r)) continue;
         if (!deep_so_region_candidate(r, pkg)) continue;
         // Skip huge regions that are clearly heap/art, not shellcode
         if ((r->end - r->start) > 128u * 1024u * 1024u) continue;
@@ -224,178 +393,288 @@ static int deep_scan_mem_elf_inline(int mem_fd, pid_t pid, const char* pid_s,
             if (to_read < 0x40) continue;
             ssize_t n = read_remote_retry_inline(mem_fd, pid, page, to_read, addr, use_vm_readv);
             if (n < 0x40) continue;
-            for (int i = 0; i <= n - 4; i += 4) {
+            for (int i = 0; i <= n - 4; ++i) {
                 if (std::memcmp(page + i, "\x7f""ELF", 4) != 0) continue;
                 uintptr_t ea = addr + static_cast<uintptr_t>(i);
-                found += dump_mem_elf_at_inline(mem_fd, pid, ea, so_dir, pid_s,
-                                                so_dedup, nullptr, use_vm_readv);
+                found += dump_mem_elf_at_inline(mem_fd, pid, ea, regs,
+                                                reg_count, so_dir, pid_s,
+                                                process_start_time,
+                                                so_dedup, artifact_counts,
+                                                use_vm_readv, generation);
+                if (generation->invalid) return found;
             }
         }
     }
     return found;
 }
 
-// ---- SO dump helper (inline in scan_pid context, like original) ----
-static int dump_so_inline(int mem_fd, pid_t pid, MappedObject* obj,
-                           MapsRegion* regs, size_t reg_count,
-                           const char* out_path) {
-    auto& cfg = NhddConfig::instance();
-    if (obj->file_size > 64u * 1024u * 1024u) {
-        std::fprintf(stderr, "  [-] SO too large (%llu bytes), skip\n",
-                     static_cast<unsigned long long>(obj->file_size));
-        return -1;
+// ---- DEX capture helpers -------------------------------------------------
+
+static uint64_t read_process_start_time_inline(const char* pid) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%s/stat", pid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return 0;
+    char line[4096];
+    if (!std::fgets(line, sizeof(line), f)) {
+        std::fclose(f);
+        return 0;
     }
-    if (obj->file_size == 0) return -1;
+    std::fclose(f);
 
-    auto* buf = static_cast<uint8_t*>(
-        std::calloc(1, static_cast<size_t>(obj->file_size)));
-    if (!buf) {
-        std::fprintf(stderr, "  [-] OOM for SO %s (%llu bytes)\n",
-                     obj->name, static_cast<unsigned long long>(obj->file_size));
-        return -1;
-    }
-
-    for (size_t i = 0; i < reg_count; i++) {
-        const MapsRegion* r = &regs[i];
-        if (!ObjectClassifier::region_belongs_to_object(r, obj))
-            continue;
-        if (!r->readable) continue;
-
-        size_t seg_len = static_cast<size_t>(r->end - r->start);
-        if (static_cast<uint64_t>(obj->file_size) < r->offset + seg_len)
-            continue;
-
-        if (cfg.use_vm_readv) {
-            struct iovec local, remote;
-            size_t got = 0;
-            while (got < seg_len) {
-                local.iov_base = buf + r->offset + got;
-                local.iov_len = seg_len - got;
-                remote.iov_base = reinterpret_cast<void*>(r->start + got);
-                remote.iov_len = seg_len - got;
-                ssize_t rr = process_vm_readv(pid, &local, 1, &remote, 1, 0);
-                if (rr > 0) { got += static_cast<size_t>(rr); continue; }
-                if (rr < 0 && errno == EINTR) continue;
-                break;
-            }
-        } else if (mem_fd >= 0) {
-            size_t got = 0;
-            while (got < seg_len) {
-                ssize_t rr = ::pread(mem_fd, buf + r->offset + got,
-                                     seg_len - got,
-                                     static_cast<off_t>(r->start + got));
-                if (rr > 0) { got += static_cast<size_t>(rr); continue; }
-                if (rr < 0 && errno == EINTR) continue;
-                break;
-            }
+    // comm (field 2) is parenthesized and may itself contain spaces or ')'.
+    char* p = std::strrchr(line, ')');
+    if (!p) return 0;
+    ++p;
+    while (*p == ' ') ++p;
+    for (int field = 3; field <= 22; ++field) {
+        if (!*p) return 0;
+        char* end = p;
+        while (*end && *end != ' ') ++end;
+        if (field == 22) {
+            char saved = *end;
+            *end = '\0';
+            char* parse_end = nullptr;
+            unsigned long long value = std::strtoull(p, &parse_end, 10);
+            bool valid = parse_end && *parse_end == '\0';
+            *end = saved;
+            return valid ? static_cast<uint64_t>(value) : 0;
         }
+        p = end;
+        while (*p == ' ') ++p;
     }
-
-    // Extend dump to cover all PT_LOAD segments from ELF header
-    if (obj->file_size >= 0x40 &&
-        std::memcmp(buf, "\x7f""ELF", 4) == 0) {
-        int is64 = (buf[4] == 2);
-        uint64_t e_phoff = is64 ? *reinterpret_cast<uint64_t*>(buf + 32)
-                                : static_cast<uint64_t>(*reinterpret_cast<uint32_t*>(buf + 28));
-        uint16_t e_phentsize = is64 ? *reinterpret_cast<uint16_t*>(buf + 54)
-                                    : *reinterpret_cast<uint16_t*>(buf + 42);
-        uint16_t e_phnum = is64 ? *reinterpret_cast<uint16_t*>(buf + 56)
-                                : *reinterpret_cast<uint16_t*>(buf + 44);
-        if (e_phoff > 0 && e_phentsize > 0 && e_phnum < 64 &&
-            e_phoff + static_cast<uint64_t>(e_phnum) * e_phentsize <= obj->file_size) {
-            uint64_t needed = 0;
-            for (uint16_t i = 0; i < e_phnum; i++) {
-                uint64_t base = e_phoff + static_cast<uint64_t>(i) * e_phentsize;
-                uint32_t p_type;
-                std::memcpy(&p_type, buf + base, 4);
-                uint64_t p_vaddr, p_memsz;
-                if (is64) {
-                    std::memcpy(&p_vaddr, buf + base + 16, 8);
-                    std::memcpy(&p_memsz, buf + base + 40, 8);
-                } else {
-                    p_vaddr = static_cast<uint64_t>(*reinterpret_cast<uint32_t*>(buf + base + 8));
-                    p_memsz = static_cast<uint64_t>(*reinterpret_cast<uint32_t*>(buf + base + 20));
-                }
-                if (p_type == 1 && p_vaddr + p_memsz > needed)
-                    needed = p_vaddr + p_memsz;
-            }
-            if (needed > obj->file_size && needed <= 64u * 1024u * 1024u) {
-                auto* nbuf = static_cast<uint8_t*>(std::realloc(buf, static_cast<size_t>(needed)));
-                if (nbuf) {
-                    buf = nbuf;
-                    std::memset(buf + obj->file_size, 0,
-                                static_cast<size_t>(needed - obj->file_size));
-                    for (uint16_t i = 0; i < e_phnum; i++) {
-                        uint64_t base = e_phoff + static_cast<uint64_t>(i) * e_phentsize;
-                        uint32_t p_type;
-                        std::memcpy(&p_type, buf + base, 4);
-                        if (p_type != 1) continue;
-                        uint64_t p_offset, p_filesz;
-                        if (is64) {
-                            std::memcpy(&p_offset, buf + base + 8, 8);
-                            std::memcpy(&p_filesz, buf + base + 32, 8);
-                        } else {
-                            p_offset = static_cast<uint64_t>(*reinterpret_cast<uint32_t*>(buf + base + 4));
-                            p_filesz = static_cast<uint64_t>(*reinterpret_cast<uint32_t*>(buf + base + 16));
-                        }
-                        if (p_offset + p_filesz > obj->file_size && p_offset < needed) {
-                            size_t to_read = static_cast<size_t>(needed - p_offset);
-                            if (to_read > static_cast<size_t>(p_filesz))
-                                to_read = static_cast<size_t>(p_filesz);
-                            if (p_offset < obj->file_size)
-                                to_read -= static_cast<size_t>(obj->file_size - p_offset);
-                            uintptr_t remote_addr = static_cast<uintptr_t>(obj->base_addr + p_offset);
-                            if (cfg.use_vm_readv) {
-                                struct iovec local, remote;
-                                local.iov_base = buf + p_offset;
-                                local.iov_len = to_read;
-                                remote.iov_base = reinterpret_cast<void*>(remote_addr);
-                                remote.iov_len = to_read;
-                                process_vm_readv(pid, &local, 1, &remote, 1, 0);
-                            } else if (mem_fd >= 0) {
-                                ::pread(mem_fd, buf + p_offset, to_read,
-                                        static_cast<off_t>(remote_addr));
-                            }
-                        }
-                    }
-                    obj->file_size = needed;
-                }
-            }
-        }
-    }
-
-    FILE* out = std::fopen(out_path, "wb");
-    if (!out) { std::free(buf); return -1; }
-    size_t written = std::fwrite(buf, 1, static_cast<size_t>(obj->file_size), out);
-    std::fclose(out);
-    std::free(buf);
-
-    if (written != static_cast<size_t>(obj->file_size)) {
-        std::fprintf(stderr, "  [!] Partial write for %s (%zu/%llu)\n",
-                     obj->name, written,
-                     static_cast<unsigned long long>(obj->file_size));
-    }
-    return (written > 0) ? 0 : -1;
+    return 0;
 }
 
+static bool write_staged_bytes_inline(const char* temporary_path,
+                                      const uint8_t* data, size_t size) {
+    if (!temporary_path || (!data && size != 0)) return false;
+    (void)::unlink(temporary_path);
+    int fd = ::open(temporary_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd < 0) return false;
+
+    size_t written = 0;
+    while (written < size) {
+        ssize_t n = ::write(fd, data + written, size - written);
+        if (n > 0) {
+            written += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    bool ok = written == size && ::fsync(fd) == 0;
+    if (::close(fd) != 0) ok = false;
+    if (!ok) ::unlink(temporary_path);
+    return ok;
+}
+
+static bool write_atomic_bytes_inline(
+        const char* path, const uint8_t* data, size_t size,
+        ProcessGenerationGuardInline* generation = nullptr) {
+    if (!path) return false;
+    const std::string temporary = artifact_sidecar_path_inline(path, "tmp");
+    if (!write_staged_bytes_inline(temporary.c_str(), data, size)) return false;
+    std::vector<ArtifactTransactionEntryInline> publications;
+    publications.emplace_back(path, temporary.c_str());
+    return artifact_publish_transaction_inline(
+        &publications,
+        generation ? &process_generation_publish_guard_inline : nullptr,
+        generation);
+}
+
+static bool write_staged_dex_metadata_inline(
+        const char* temporary_path, const char* status,
+        const DexCapture& capture, uint64_t content_hash,
+        bool magic_synthesized, const char* partial_name,
+        const char* raw_name, const char* fixed_name) {
+    if (!temporary_path) return false;
+    (void)::unlink(temporary_path);
+    FILE* f = std::fopen(temporary_path, "w");
+    if (!f) return false;
+
+    const DexCandidateIdentity& id = capture.identity();
+    const DexPageCoverage pages = capture.page_coverage();
+    const std::vector<DexByteSpan> holes = capture.holes();
+    const double ratio = capture.size() == 0
+                             ? 0.0
+                             : static_cast<double>(capture.covered_bytes()) /
+                                   static_cast<double>(capture.size());
+
+    std::fprintf(f,
+        "{\n"
+        "  \"schema_version\": 2,\n"
+        "  \"status\": \"%s\",\n"
+        "  \"pid\": %u,\n"
+        "  \"process_start_time_ticks\": %llu,\n"
+        "  \"address\": \"0x%llx\",\n"
+        "  \"declared_size\": %u,\n"
+        "  \"mapping_fingerprint\": \"%016llx\",\n"
+        "  \"header_fingerprint\": \"%016llx\",\n"
+        "  \"content_hash\": \"%016llx\",\n"
+        "  \"content_revision\": %llu,\n"
+        "  \"relaxed_detection\": %s,\n"
+        "  \"magic_version_synthesized\": %s,\n"
+        "  \"observations\": %zu,\n"
+        "  \"completeness_basis\": \"byte_coverage\",\n"
+        "  \"coverage\": {\"read_bytes\": %zu, \"total_bytes\": %zu, "
+        "\"ratio\": %.8f, \"page_size\": %zu, \"pages_total\": %zu, "
+        "\"pages_complete\": %zu, \"pages_partial\": %zu, "
+        "\"pages_missing\": %zu},\n",
+        status, id.pid,
+        static_cast<unsigned long long>(id.process_start_time),
+        static_cast<unsigned long long>(id.address), id.dex_size,
+        static_cast<unsigned long long>(id.mapping_fingerprint),
+        static_cast<unsigned long long>(id.header_fingerprint),
+        static_cast<unsigned long long>(content_hash),
+        static_cast<unsigned long long>(capture.content_revision()),
+        capture.relaxed_detection() ? "true" : "false",
+        magic_synthesized ? "true" : "false",
+        capture.observations(),
+        capture.covered_bytes(), capture.size(), ratio, pages.page_size,
+        pages.total_pages, pages.complete_pages, pages.partial_pages,
+        pages.missing_pages);
+
+    std::fprintf(f, "  \"holes\": [");
+    for (size_t i = 0; i < holes.size(); ++i) {
+        if (i != 0) std::fprintf(f, ",");
+        std::fprintf(f, "%s{\"offset\":%zu,\"length\":%zu}",
+                     (i % 8 == 0) ? "\n    " : "", holes[i].offset,
+                     holes[i].length);
+    }
+    if (!holes.empty()) std::fprintf(f, "\n  ");
+    std::fputs("],\n  \"semantic\": ", f);
+    if (capture.complete()) {
+        auto raw = DexSemantics::validate(capture.data(), capture.size());
+        std::vector<uint8_t> normalized(capture.data(), capture.data()+capture.size());
+        if (magic_synthesized) std::memcpy(normalized.data(), "dex\n039\0", 8);
+        DexValidator::fix_header_and_checksums(normalized.data(), normalized.size());
+        auto repaired = DexSemantics::validate(normalized.data(), normalized.size());
+        std::fputs("{\"raw\":",f); raw.write_json(f);
+        std::fputs(",\"fixed\":",f); repaired.write_json(f);
+        std::fputc('}',f);
+    } else std::fputs("{\"status\":\"not_checked_partial_bytes\",\"art_accepted\":null}", f);
+    std::fprintf(f,
+        ",\n"
+        "  \"artifacts\": {\"partial\": %s%s%s, \"raw\": %s%s%s, "
+        "\"fixed\": %s%s%s}\n"
+        "}\n",
+        partial_name ? "\"" : "null", partial_name ? partial_name : "",
+        partial_name ? "\"" : "", raw_name ? "\"" : "null",
+        raw_name ? raw_name : "", raw_name ? "\"" : "",
+        fixed_name ? "\"" : "null", fixed_name ? fixed_name : "",
+        fixed_name ? "\"" : "");
+
+    bool ok = std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+    if (std::fclose(f) != 0) ok = false;
+    if (!ok) ::unlink(temporary_path);
+    return ok;
+}
+
+static bool write_dex_metadata_inline(
+        const char* path, const char* status, const DexCapture& capture,
+        uint64_t content_hash, bool magic_synthesized,
+        const char* partial_name, const char* raw_name,
+        const char* fixed_name,
+        ProcessGenerationGuardInline* generation = nullptr) {
+    if (!path) return false;
+    const std::string temporary = artifact_sidecar_path_inline(path, "tmp");
+    if (!write_staged_dex_metadata_inline(
+            temporary.c_str(), status, capture, content_hash,
+            magic_synthesized, partial_name, raw_name, fixed_name)) {
+        return false;
+    }
+    std::vector<ArtifactTransactionEntryInline> publications;
+    publications.emplace_back(path, temporary.c_str());
+    return artifact_publish_transaction_inline(
+        &publications,
+        generation ? &process_generation_publish_guard_inline : nullptr,
+        generation);
+}
 
 class NhddScanner {
 public:
     NhddScanner(DexDedup& dex_dedup, SoDedup& so_dedup, JniDedup& jni_dedup)
         : dex_dedup_(dex_dedup), so_dedup_(so_dedup), jni_dedup_(jni_dedup) {}
 
+    size_t invalidate_dex_range(uint32_t pid, uint64_t process_start_time,
+                                uintptr_t start, uintptr_t end) {
+        return dex_capture_cache_.discard_intersecting(
+            pid, process_start_time, start, end);
+    }
+
     // ---- scan_pid — 1:1 port of original nhdd.c scan_pid() ----
     bool scan_pid(const char* pid, const char* dex_dir, const char* so_dir,
-                  const char* jni_dir, ScanMode mode, ScanCounters& c) {
+                  const char* jni_dir, ScanMode mode, ScanCounters& c,
+                  const ScanScope* scope = nullptr,
+                  uint64_t expected_starttime = 0) {
         auto& cfg = NhddConfig::instance();
         char pkg[256] = "unknown";
         ProcessManager::read_cmdline(pid, pkg, sizeof(pkg));
+
+        errno = 0;
+        const uint64_t starttime_before = read_process_start_time_inline(pid);
+        if (starttime_before == 0) {
+            const int identity_errno = errno;
+            if (identity_errno == EACCES || identity_errno == EPERM) {
+                std::fprintf(
+                    stderr,
+                    "[-] PID %s (%s): permission denied reading process "
+                    "identity: %s (requires root, run-as for a debuggable "
+                    "app, or an in-process self mode)\n",
+                    pid, pkg, std::strerror(identity_errno));
+            } else if (identity_errno == ESRCH || identity_errno == ENOENT) {
+                std::fprintf(stderr,
+                             "[-] PID %s (%s): process disappeared before "
+                             "generation check: %s\n",
+                             pid, pkg, std::strerror(identity_errno));
+            } else {
+                std::fprintf(stderr,
+                             "[-] PID %s (%s): cannot establish process "
+                             "generation%s%s\n",
+                             pid, pkg, identity_errno != 0 ? ": " : "",
+                             identity_errno != 0
+                                 ? std::strerror(identity_errno)
+                                 : "");
+            }
+            return false;
+        }
+        if (expected_starttime != 0 &&
+            starttime_before != expected_starttime) {
+            std::fprintf(
+                stderr,
+                "[!] PID %s (%s): process generation changed before scan "
+                "(expected=%llu observed=%llu); skipping\n",
+                pid, pkg,
+                static_cast<unsigned long long>(expected_starttime),
+                static_cast<unsigned long long>(starttime_before));
+            return false;
+        }
 
         // Load maps
         MapsRegion* regs = nullptr;
         size_t reg_count = 0;
         if (load_maps_inline(pid, &regs, &reg_count) != 0) {
-            std::fprintf(stderr, "[-] PID %s (%s): process gone (cannot read maps)\n", pid, pkg);
+            const int maps_errno = errno != 0 ? errno : EIO;
+            if (maps_errno == EACCES || maps_errno == EPERM) {
+                std::fprintf(
+                    stderr,
+                    "[-] PID %s (%s): permission denied reading /proc/%s/maps: "
+                    "%s (requires root, run-as for a debuggable app, or an "
+                    "in-process self mode)\n",
+                    pid, pkg, pid, std::strerror(maps_errno));
+            } else if (maps_errno == ESRCH || maps_errno == ENOENT) {
+                std::fprintf(stderr,
+                             "[-] PID %s (%s): process disappeared while "
+                             "opening maps: %s\n",
+                             pid, pkg, std::strerror(maps_errno));
+            } else {
+                std::fprintf(stderr,
+                             "[-] PID %s (%s): cannot read /proc/%s/maps: "
+                             "%s (errno=%d)\n",
+                             pid, pkg, pid, std::strerror(maps_errno),
+                             maps_errno);
+            }
             return false;
         }
 
@@ -407,11 +686,51 @@ public:
             std::snprintf(path, sizeof(path), "/proc/%s/mem", pid);
             mem_fd = ::open(path, O_RDONLY);
             if (mem_fd < 0) {
-                std::fprintf(stderr, "[-] PID %s (%s): cannot open mem: %s\n",
-                             pid, pkg, std::strerror(errno));
-                std::free(regs);
+                const int mem_errno = errno != 0 ? errno : EIO;
+                if (mem_errno == EACCES || mem_errno == EPERM) {
+                    std::fprintf(
+                        stderr,
+                        "[-] PID %s (%s): permission denied opening "
+                        "/proc/%s/mem: %s (requires root, run-as for a "
+                        "debuggable app, or an in-process self mode)\n",
+                        pid, pkg, pid, std::strerror(mem_errno));
+                } else {
+                    std::fprintf(stderr,
+                                 "[-] PID %s (%s): cannot open mem: %s "
+                                 "(errno=%d)\n",
+                                 pid, pkg, std::strerror(mem_errno), mem_errno);
+                }
+                delete[] regs;
                 return false;
             }
+        }
+
+        const uint64_t starttime_after_open =
+            read_process_start_time_inline(pid);
+        if (starttime_after_open == 0 ||
+            starttime_after_open != starttime_before ||
+            (expected_starttime != 0 &&
+             starttime_after_open != expected_starttime)) {
+            std::fprintf(
+                stderr,
+                "[!] PID %s (%s): process generation changed while opening "
+                "maps/memory (before=%llu after=%llu expected=%llu); skipping\n",
+                pid, pkg,
+                static_cast<unsigned long long>(starttime_before),
+                static_cast<unsigned long long>(starttime_after_open),
+                static_cast<unsigned long long>(expected_starttime));
+            if (mem_fd >= 0) ::close(mem_fd);
+            delete[] regs;
+            return false;
+        }
+        const uint64_t process_start_time = starttime_after_open;
+        ProcessGenerationGuardInline generation{
+            pid, process_start_time, &read_process_start_time_for_guard_inline,
+            nullptr};
+        if (!generation.verify()) {
+            if (mem_fd >= 0) ::close(mem_fd);
+            delete[] regs;
+            return false;
         }
 
         // READ_REMOTE macro equivalent: retry-aware. The first C++ OOP
@@ -422,437 +741,626 @@ public:
                                      static_cast<uintptr_t>(addr), cfg.use_vm_readv)
 
 
+        const ScanCounters counters_before_scan = c;
         c.procs++;
-        std::fprintf(stderr, "[*] Scanning PID %s (%s): %zu regions%s\n",
-                     pid, pkg, reg_count,
-                     cfg.use_vm_readv ? " (stealth2: vm_readv)" : "");
+        if (scope && scope->incremental) {
+            std::fprintf(stderr,
+                         "[*] Scanning PID %s (%s): %zu regions%s, "
+                         "incremental ranges=%zu\n",
+                         pid, pkg, reg_count,
+                         cfg.use_vm_readv ? " (stealth2: vm_readv)" : "",
+                         scope->count);
+        } else {
+            std::fprintf(stderr, "[*] Scanning PID %s (%s): %zu regions%s\n",
+                         pid, pkg, reg_count,
+                         cfg.use_vm_readv ? " (stealth2: vm_readv)" : "");
+        }
 
         uint8_t buf[4096 + 0x70];
         int pid_dex_unique = 0, pid_dex_seen = 0;
+        dex_capture_cache_.discard_other_process_generations(
+            static_cast<uint32_t>(target_pid), process_start_time);
 
-        // ==== MAIN SCANNING LOOP (DEX magic + relaxed) ====
+        // Refresh the whole candidate on every relevant round. Besides filling
+        // holes, this detects pages decrypted in place after they were already
+        // readable. Complete revisions are content-addressed and remain on
+        // disk, so a later plaintext revision never destroys earlier evidence.
+        auto refresh_and_publish_dex = [&](DexCapture& capture,
+                                           const uint8_t* seed_header) {
+            if (!generation.verify()) return;
+            DexCapture observation(capture.identity(),
+                                   capture.relaxed_detection());
+            if (seed_header) observation.merge(0, seed_header, 0x70);
+            uint8_t page[4096];
+            for (size_t off = 0; off < capture.size(); off += sizeof(page)) {
+                if (off > static_cast<size_t>(
+                              std::numeric_limits<uintptr_t>::max() -
+                              capture.identity().address)) {
+                    break;
+                }
+                const size_t todo = std::min(sizeof(page), capture.size() - off);
+                const ssize_t rr = READ_REMOTE(
+                    page, todo, capture.identity().address + off);
+                if (rr <= 0) continue;
+                observation.merge(off, page, static_cast<size_t>(rr));
+            }
+            // Never merge bytes into the old generation's capture until every
+            // remote read has been bracketed by a matching starttime check.
+            if (!generation.verify()) return;
+            const DexRefreshResult update = capture.apply_observation(observation);
+            const size_t new_bytes = update.new_bytes;
+            const size_t changed_bytes = update.changed_bytes;
+            const size_t updates = new_bytes + changed_bytes;
+            if (updates != 0) c.dex_updates++;
+            if (capture.covered_bytes() == 0) return;
+
+            const DexCandidateIdentity& id = capture.identity();
+            char stem[256];
+            std::snprintf(stem, sizeof(stem),
+                          "dump_%u_%llx_%llx_%08x_%016llx_%016llx",
+                          id.pid,
+                          static_cast<unsigned long long>(id.process_start_time),
+                          static_cast<unsigned long long>(id.address),
+                          id.dex_size,
+                          static_cast<unsigned long long>(id.mapping_fingerprint),
+                          static_cast<unsigned long long>(id.header_fingerprint));
+            const uint64_t content_hash = artifact_hash_inline(
+                capture.data(), capture.size());
+            char partial_name[320], partial_path[896], partial_meta_path[896];
+            std::snprintf(partial_name, sizeof(partial_name), "%s.partial.dex", stem);
+            std::snprintf(partial_path, sizeof(partial_path), "%s/%s", dex_dir, partial_name);
+            std::snprintf(partial_meta_path, sizeof(partial_meta_path),
+                          "%s/%s.meta.json", dex_dir, stem);
+
+            if (!capture.complete()) {
+                if (updates == 0) return;
+                const std::string partial_temp =
+                    artifact_sidecar_path_inline(partial_path, "tmp");
+                const std::string metadata_temp =
+                    artifact_sidecar_path_inline(partial_meta_path, "tmp");
+                bool staged = write_staged_bytes_inline(
+                    partial_temp.c_str(), capture.data(), capture.size());
+                staged = staged && write_staged_dex_metadata_inline(
+                    metadata_temp.c_str(), "partial", capture, content_hash,
+                    false, partial_name, nullptr, nullptr);
+                bool published = false;
+                if (staged) {
+                    std::vector<ArtifactTransactionEntryInline> publications;
+                    publications.emplace_back(partial_path,
+                                              partial_temp.c_str());
+                    publications.emplace_back(partial_meta_path,
+                                              metadata_temp.c_str());
+                    published = artifact_publish_transaction_inline(
+                        &publications,
+                        &process_generation_publish_guard_inline,
+                        &generation);
+                } else {
+                    (void)::unlink(partial_temp.c_str());
+                    (void)::unlink(metadata_temp.c_str());
+                }
+                const DexPageCoverage pages = capture.page_coverage();
+                if (published) {
+                    std::printf(
+                        "[~] DEX partial: %s (%zu/%zu bytes, %.2f%%, "
+                        "changed=%zu, "
+                        "complete_pages=%zu, partial_pages=%zu, missing_pages=%zu) pid=%s\n",
+                        partial_path, capture.covered_bytes(), capture.size(),
+                        100.0 * static_cast<double>(capture.covered_bytes()) /
+                            static_cast<double>(capture.size()),
+                        changed_bytes,
+                        pages.complete_pages, pages.partial_pages,
+                        pages.missing_pages, pid);
+                } else {
+                    std::fprintf(stderr, "[-] Failed to publish partial DEX %s: %s\n",
+                                 partial_path, std::strerror(errno));
+                }
+                return;
+            }
+
+            std::vector<uint8_t> fixed(capture.data(),
+                                       capture.data() + capture.size());
+            const bool current_magic_valid = fixed.size() >= 8 &&
+                std::memcmp(fixed.data(), kDexMagic, 4) == 0 &&
+                fixed[4] >= '0' && fixed[4] <= '9' &&
+                fixed[5] >= '0' && fixed[5] <= '9' &&
+                fixed[6] >= '0' && fixed[6] <= '9' && fixed[7] == '\0';
+            const bool magic_synthesized = !current_magic_valid;
+            if (magic_synthesized) {
+                std::memcpy(fixed.data(), kDexMagic, 4);
+                // With an erased version there is no trustworthy value to
+                // recover.  Keep the exact bytes in .raw.dex and mark the
+                // synthesized analyzable copy by its .fixed.dex suffix.
+                fixed[4] = '0'; fixed[5] = '3'; fixed[6] = '9'; fixed[7] = '\0';
+            }
+            DexValidator::fix_header_and_checksums(fixed.data(), fixed.size());
+            const uint64_t fixed_hash = artifact_hash_inline(
+                fixed.data(), fixed.size());
+            const uint64_t processed_key = content_hash ^
+                (fixed_hash + 0x9e3779b97f4a7c15ULL +
+                 (content_hash << 6) + (content_hash >> 2));
+
+            // An unchanged raw+fixed revision has already been either
+            // published or recorded as a duplicate. Keep the capture live for
+            // future in-place changes, but do not rewrite artifacts every round.
+            if (capture.content_key_processed(processed_key)) return;
+
+            char revision_stem[320], raw_name[352], fixed_name[352];
+            char raw_path[896], fixed_path[896], meta_path[896];
+            std::snprintf(revision_stem, sizeof(revision_stem),
+                          "%s_%016llx", stem,
+                          static_cast<unsigned long long>(content_hash));
+            std::snprintf(raw_name, sizeof(raw_name), "%s.raw.dex", revision_stem);
+            std::snprintf(fixed_name, sizeof(fixed_name), "%s.fixed.dex", revision_stem);
+            std::snprintf(raw_path, sizeof(raw_path), "%s/%s", dex_dir, raw_name);
+            std::snprintf(fixed_path, sizeof(fixed_path), "%s/%s", dex_dir, fixed_name);
+            std::snprintf(meta_path, sizeof(meta_path), "%s/%s.meta.json",
+                          dex_dir, revision_stem);
+
+            const uint8_t* signature = fixed.data() + 0x0C;
+            if (dex_dedup_.seen(signature)) {
+                if (write_dex_metadata_inline(meta_path, "duplicate", capture,
+                                              content_hash, magic_synthesized,
+                                              nullptr, nullptr, nullptr,
+                                              &generation)) {
+                    capture.mark_content_key_processed(processed_key, false);
+                    c.dex_dedup++;
+                    ::unlink(partial_path);
+                    ::unlink(partial_meta_path);
+                    std::fprintf(stderr,
+                        "[=] PID %s: byte-complete DEX revision at 0x%llx "
+                        "duplicates an already published artifact\n", pid,
+                        static_cast<unsigned long long>(id.address));
+                }
+                return;
+            }
+
+            const std::string raw_temp =
+                artifact_sidecar_path_inline(raw_path, "tmp");
+            const std::string fixed_temp =
+                artifact_sidecar_path_inline(fixed_path, "tmp");
+            const std::string metadata_temp =
+                artifact_sidecar_path_inline(meta_path, "tmp");
+            bool staged = write_staged_bytes_inline(
+                raw_temp.c_str(), capture.data(), capture.size());
+            staged = staged && write_staged_bytes_inline(
+                fixed_temp.c_str(), fixed.data(), fixed.size());
+            staged = staged && write_staged_dex_metadata_inline(
+                metadata_temp.c_str(), "byte_complete", capture,
+                content_hash, magic_synthesized, nullptr, raw_name,
+                fixed_name);
+            bool published = false;
+            if (staged) {
+                std::vector<ArtifactTransactionEntryInline> publications;
+                publications.emplace_back(raw_path, raw_temp.c_str());
+                publications.emplace_back(fixed_path, fixed_temp.c_str());
+                publications.emplace_back(meta_path, metadata_temp.c_str());
+                published = artifact_publish_transaction_inline(
+                    &publications, &process_generation_publish_guard_inline,
+                    &generation);
+            } else {
+                (void)::unlink(raw_temp.c_str());
+                (void)::unlink(fixed_temp.c_str());
+                (void)::unlink(metadata_temp.c_str());
+            }
+            if (!published) {
+                std::fprintf(stderr, "[-] Failed to publish complete DEX %s: %s\n",
+                             fixed_path, std::strerror(errno));
+                return;
+            }
+
+            // Content dedup becomes authoritative only after raw, fixed and
+            // metadata artifacts have all been published successfully.
+            dex_dedup_.remember(signature);
+            capture.mark_content_key_processed(processed_key, true);
+            ::unlink(partial_path);
+            ::unlink(partial_meta_path);
+            c.dex_unique++;
+            pid_dex_unique++;
+            std::printf(
+                "[+] DEX byte-complete revision: raw=%s fixed=%s "
+                "(%zu bytes, changed=%zu, revision=%llu) pid=%s\n",
+                raw_path, fixed_path, capture.size(), changed_bytes,
+                static_cast<unsigned long long>(capture.content_revision()), pid);
+        };
+
+        auto observe_dex_candidate = [&](uintptr_t dex_addr, uint32_t dex_size,
+                                         const uint8_t header[0x70],
+                                         bool relaxed_detection,
+                                         const MapsRegion* source_mapping) {
+            if (!generation.verify()) return;
+            DexCandidateIdentity identity;
+            identity.pid = static_cast<uint32_t>(target_pid);
+            identity.process_start_time = process_start_time;
+            identity.address = dex_addr;
+            identity.dex_size = dex_size;
+            identity.mapping_fingerprint =
+                mapping_fingerprint_inline(source_mapping);
+            identity.header_fingerprint =
+                DexCaptureCache::stable_header_fingerprint(header, 0x70);
+
+            bool created = false;
+            DexCapture* capture = dex_capture_cache_.get_or_create(
+                identity, relaxed_detection, &created);
+            if (!capture) {
+                std::fprintf(stderr,
+                    "[-] DEX merge cache budget exhausted for PID %s at 0x%llx "
+                    "(%u bytes)\n", pid,
+                    static_cast<unsigned long long>(dex_addr), dex_size);
+                return;
+            }
+            if (created) {
+                c.dex_total++;
+                pid_dex_seen++;
+                std::fprintf(stderr,
+                    "[+] PID %s: new %sDEX candidate at 0x%llx size=%u "
+                    "header=%016llx\n",
+                    pid, relaxed_detection ? "relaxed " : "",
+                    static_cast<unsigned long long>(dex_addr), dex_size,
+                    static_cast<unsigned long long>(identity.header_fingerprint));
+            }
+            capture->observe(relaxed_detection);
+            if (!created) {
+                // Existing candidates were refreshed at the beginning of this
+                // scan. Avoid a second full read from overlapping magic hits.
+                return;
+            }
+            // The separately validated header is itself a real read span.  Seed
+            // it before retrying the remaining holes so a failed first page
+            // read does not discard useful coverage information.
+            refresh_and_publish_dex(*capture, header);
+        };
+
+        auto observe_runtime_format = [&](uintptr_t address, const MapsRegion& region) {
+            uint8_t header[512] = {};
+            const ssize_t header_read = READ_REMOTE(header, sizeof(header), address);
+            if (header_read < 8 || !generation.verify()) return;
+            if(header[7] || !std::isdigit(header[4]) || !std::isdigit(header[5]) || !std::isdigit(header[6])) return;
+            const std::string format = RuntimeFormats::identify(header, static_cast<size_t>(header_read));
+            uint64_t extent = RuntimeFormats::capture_extent(header, static_cast<size_t>(header_read));
+            const bool header_only = format == "oat" || !extent || extent > 64ull*1024*1024;
+            if (!extent || extent > 64ull*1024*1024) extent = static_cast<uint64_t>(header_read);
+            if (extent < 8 || extent > std::numeric_limits<uintptr_t>::max() - address) return;
+            DexCandidateIdentity id;
+            id.pid = static_cast<uint32_t>(target_pid);
+            id.process_start_time = process_start_time;
+            id.address = address; id.dex_size = static_cast<uint32_t>(extent);
+            id.mapping_fingerprint = mapping_fingerprint_inline(&region);
+            DexCapture capture(id, false);
+            for (size_t offset = 0; offset < extent; offset += 4096) {
+                if (!generation.verify()) return;
+                uint8_t page[4096];
+                const size_t length = std::min<size_t>(sizeof(page), static_cast<size_t>(extent)-offset);
+                const ssize_t got = READ_REMOTE(page, length, address + offset);
+                if (got > 0) capture.merge(offset, page, static_cast<size_t>(got));
+            }
+            if (!generation.verify()) return;
+            const uint64_t hash = artifact_hash_inline(capture.data(), capture.size());
+            const std::string key = std::to_string(target_pid)+":"+std::to_string(process_start_time)+":"+
+                std::to_string(address)+":"+std::to_string(hash)+":"+std::to_string(capture.covered_bytes());
+            if (runtime_processed_.count(key)) return;
+            auto report = RuntimeFormats::inspect(capture.data(), capture.size(), header_only);
+            if (!capture.complete()) {report.valid = false;report.errors.emplace_back("unread_memory_holes");}
+            const char* extension = format == "compact_dex" ? "cdex" : (format == "vdex" ? "vdex" : "oat-header.bin");
+            char name[256], path[896], metadata[928];
+            std::snprintf(name, sizeof(name), "runtime_%s_%s_g%llu_%llx_%016llx%s.%s", format.c_str(), pid,
+                static_cast<unsigned long long>(process_start_time),static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(hash),capture.complete()?"":".partial",extension);
+            std::snprintf(path,sizeof(path),"%s/%s",dex_dir,name);
+            std::snprintf(metadata,sizeof(metadata),"%s.json",path);
+            const std::string bytes_temp=artifact_sidecar_path_inline(path,"tmp");
+            const std::string meta_temp=artifact_sidecar_path_inline(metadata,"tmp");
+            bool staged=write_staged_bytes_inline(bytes_temp.c_str(),capture.data(),capture.size());
+            FILE* f=staged?std::fopen(meta_temp.c_str(),"w"):nullptr;
+            if(f) {
+                std::fprintf(f,"{\"schema\":\"nhdd-runtime-format-v1\",\"pid\":%u,\"process_starttime\":%llu,"
+                    "\"address\":\"0x%llx\",\"capture_scope\":\"%s\",\"read_bytes\":%zu,\"total_bytes\":%zu,"
+                    "\"byte_complete\":%s,\"validation\":",id.pid,static_cast<unsigned long long>(process_start_time),
+                    static_cast<unsigned long long>(address),header_only?"header_only":"declared_extent",
+                    capture.covered_bytes(),capture.size(),capture.complete()?"true":"false");
+                report.write_json(f);std::fputs("}\n",f);
+                staged=std::fflush(f)==0 && ::fsync(::fileno(f))==0;
+                if(std::fclose(f)!=0)staged=false;
+            } else staged=false;
+            std::vector<ArtifactTransactionEntryInline> entries;
+            entries.emplace_back(path,bytes_temp.c_str());entries.emplace_back(metadata,meta_temp.c_str());
+            if(staged && artifact_publish_transaction_inline(&entries,&process_generation_publish_guard_inline,&generation)) {
+                if(runtime_processed_.size()>=1024)runtime_processed_.clear();
+                runtime_processed_.insert(key);
+                std::fprintf(stderr,"[+] RUNTIME %s: %s (%s, %zu/%zu bytes)\n",format.c_str(),path,
+                    !report.supported?"unsupported version":(report.valid?"format checks passed":"invalid/incomplete"),
+                    capture.covered_bytes(),capture.size());
+            } else {
+                ::unlink(bytes_temp.c_str());::unlink(meta_temp.c_str());
+                std::fprintf(stderr,"[-] Runtime format publication failed at 0x%llx\n",static_cast<unsigned long long>(address));
+            }
+        };
+
+        // ==== MAIN SCANNING LOOP (DEX magic + ART container formats) ====
         bool do_descan = (mode & ScanMode::DEX);
         if (do_descan) {
-        for (size_t ri = 0; ri < reg_count; ri++) {
-            MapsRegion* r = &regs[ri];
-            if (r->perms[0] != 'r') continue;
+            // Refresh known candidates even if a later round no longer exposes
+            // the original magic/header. This fills holes and captures later
+            // decrypt-in-place revisions.
+            dex_capture_cache_.for_each_process(
+                static_cast<uint32_t>(target_pid), process_start_time,
+                [&](DexCapture& capture) {
+                    if (generation.invalid) return;
+                    const DexCandidateIdentity& id = capture.identity();
+                    uintptr_t end = id.address;
+                    if (id.dex_size <=
+                        static_cast<uint64_t>(
+                            std::numeric_limits<uintptr_t>::max() - id.address)) {
+                        end += static_cast<uintptr_t>(id.dex_size);
+                    } else {
+                        end = std::numeric_limits<uintptr_t>::max();
+                    }
+                    if (scope_intersects_inline(scope, id.address, end)) {
+                        // Revalidate the structural header before touching an
+                        // existing capture. Within one process an address can
+                        // be unmapped and reused; blindly refreshing would mix
+                        // the replacement mapping into the old DEX identity.
+                        // Magic/checksum/signature/file_size remain excluded,
+                        // so ordinary header wiping and restoration still work.
+                        uint8_t current_header[0x70];
+                        if (READ_REMOTE(current_header, sizeof(current_header),
+                                        id.address) !=
+                            static_cast<ssize_t>(sizeof(current_header))) {
+                            return;
+                        }
+                        if (DexCaptureCache::stable_header_fingerprint(
+                                current_header, sizeof(current_header)) !=
+                            id.header_fingerprint) {
+                            return;
+                        }
+                        const MapsRegion* current_mapping = map_containing_inline(
+                            regs, reg_count, id.address);
+                        if (!current_mapping ||
+                            mapping_fingerprint_inline(current_mapping) !=
+                                id.mapping_fingerprint) {
+                            return;
+                        }
+                        uint32_t declared_size = 0;
+                        std::memcpy(&declared_size, current_header + 0x20,
+                                    sizeof(declared_size));
+                        if (declared_size != 0 && declared_size != id.dex_size)
+                            return;
+                        dex_capture_cache_.touch(capture);
+                        capture.observe(capture.relaxed_detection());
+                        refresh_and_publish_dex(capture, current_header);
+                    }
+                });
 
-            size_t region_size = r->end - r->start;
-            if (region_size < 64 || region_size > 0x40000000) continue;
+            for (size_t ri = 0; ri < reg_count; ri++) {
+                if (generation.invalid || !generation.verify()) break;
+                MapsRegion* r = &regs[ri];
+                // Hardened loaders may transition pages to execute-only. Root
+                // /proc/<pid>/mem can often still read these pages, so attempt
+                // them and let the remote reader decide instead of filtering
+                // solely on the maps 'r' bit.
+                if (!r->readable && !r->executable) continue;
+                if (!scope_intersects_inline(scope, r->start, r->end)) continue;
 
-            if (cfg.anon_only && r->path[0] != '\0') continue;
-            if (cfg.region_delay_us > 0)
-                usleep(static_cast<useconds_t>(cfg.region_delay_us));
+                size_t region_size = r->end - r->start;
+                if (region_size < 64 || region_size > 0x40000000) continue;
 
-            for (uintptr_t addr = r->start; addr < r->end; addr += 4096) {
-                size_t to_read = sizeof(buf);
-                if (addr + to_read > r->end)
-                    to_read = static_cast<size_t>(r->end - addr);
-                ssize_t n = READ_REMOTE(buf, to_read, addr);
-                if (n < 64) continue;
+                if (cfg.anon_only && r->path[0] != '\0') continue;
+                if (cfg.region_delay_us > 0)
+                    usleep(static_cast<useconds_t>(cfg.region_delay_us));
 
-                for (int i = 0; i <= n - 4; i++) {
-                    // ---- Standard "dex\n" magic scan ----
-                    if ((mode & ScanMode::DEX) &&
-                        std::memcmp(buf + i, kDexMagic, 4) == 0) {
-                        uintptr_t dex_addr = addr + i;
-                        uint32_t dex_size = 0;
-                        if (!DexValidator::hit_valid(buf, static_cast<size_t>(n),
-                                                      static_cast<size_t>(i), &dex_size)) {
-                            uint8_t hdr[0x70];
-                            if (READ_REMOTE(hdr, 0x70, dex_addr) == 0x70) {
-                                if (DexValidator::hit_valid(hdr, 0x70, 0, &dex_size)) goto dex_accept;
-                            }
+                for (uintptr_t addr = r->start; addr < r->end; addr += 4096) {
+                    if (generation.invalid) break;
+                    size_t to_read = sizeof(buf);
+                    if (addr + to_read > r->end)
+                        to_read = static_cast<size_t>(r->end - addr);
+                    if(!scope_intersects_inline(scope,addr,addr+to_read))continue;
+                    ssize_t n = READ_REMOTE(buf, to_read, addr);
+                    if (n < 64) continue;
+
+                    for (int i = 0; i <= n - 4; i++) {
+                        if ((std::memcmp(buf+i,"cdex",4)==0 || std::memcmp(buf+i,"vdex",4)==0 ||
+                             std::memcmp(buf+i,"oat\n",4)==0) &&
+                            ObjectClassifier::classify_origin(r->path,pkg) != ORIGIN_SYSTEM &&
+                            ObjectClassifier::classify_origin(r->path,pkg) != ORIGIN_APEX &&
+                            ObjectClassifier::classify_origin(r->path,pkg) != ORIGIN_VENDOR) {
+                            observe_runtime_format(addr+static_cast<uintptr_t>(i),*r);
                             continue;
                         }
-                    dex_accept:;
-                        if (dex_size == 0) {
-                            uint8_t hdr[0x70];
-                            if (READ_REMOTE(hdr, 0x70, dex_addr) != 0x70) continue;
-                            uint32_t map_off = 0;
-                            std::memcpy(&map_off, hdr + 0x34, 4);
-                            uint32_t prov = DexValidator::recover_size_provisional(hdr);
-                            if (prov < 0x70) prov = 0x100000;
-                            auto* img = static_cast<uint8_t*>(std::calloc(1, prov));
-                            if (!img) continue;
-                            size_t got = 0;
-                            while (got < prov) {
-                                ssize_t rr = READ_REMOTE(img + got, prov - got, dex_addr + got);
-                                if (rr <= 0) break;
-                                got += static_cast<size_t>(rr);
-                            }
-                            uint32_t recovered = DexValidator::recover_size_from_map_buf(img, got, map_off);
-                            uint32_t string_ids_off = 0;
-                            std::memcpy(&string_ids_off, hdr + 0x3C, 4);
-                            int confirmed = DexValidator::confirm_by_map_list(img, got, map_off, string_ids_off);
-                            std::free(img);
-                            if (recovered == 0 || !confirmed) continue;
-                            dex_size = recovered;
-                        }
-                        if (dex_size < 0x70 || dex_size > 0x10000000) continue;
-
-                        {
-                            uint8_t hdr_check[0x70];
-                            if (READ_REMOTE(hdr_check, 0x70, dex_addr) == 0x70) {
-                                if (!DexValidator::header_strong_valid(hdr_check, dex_size))
+                        // ---- Standard "dex\n" magic scan ----
+                        if (std::memcmp(buf + i, kDexMagic, 4) == 0) {
+                            uintptr_t dex_addr = addr + static_cast<uintptr_t>(i);
+                            uint32_t dex_size = 0;
+                            if (!DexValidator::hit_valid(
+                                    buf, static_cast<size_t>(n),
+                                    static_cast<size_t>(i), &dex_size)) {
+                                uint8_t header_retry[0x70];
+                                if (READ_REMOTE(header_retry, sizeof(header_retry),
+                                                dex_addr) !=
+                                        static_cast<ssize_t>(sizeof(header_retry)) ||
+                                    !DexValidator::hit_valid(
+                                        header_retry, sizeof(header_retry), 0,
+                                        &dex_size))
                                     continue;
                             }
+
+                            uint8_t header[0x70];
+                            if (READ_REMOTE(header, sizeof(header), dex_addr) !=
+                                static_cast<ssize_t>(sizeof(header)))
+                                continue;
+                            if (dex_size == 0) {
+                                uint32_t map_off = 0;
+                                std::memcpy(&map_off, header + 0x34, 4);
+                                const uint32_t header_extent =
+                                    DexValidator::recover_size_provisional(header);
+                                uint32_t read_cap = header_extent;
+                                if (read_cap < 0x70) read_cap = 0x100000;
+                                auto* image = static_cast<uint8_t*>(
+                                    std::calloc(1, read_cap));
+                                if (!image) continue;
+                                ssize_t got = READ_REMOTE(image, read_cap, dex_addr);
+                                uint32_t string_ids_off = 0;
+                                std::memcpy(&string_ids_off, header + 0x3C, 4);
+                                uint32_t recovered = got > 0
+                                    ? DexValidator::recover_size_from_map_buf(
+                                          image, static_cast<size_t>(got), map_off)
+                                    : 0;
+                                bool confirmed = got > 0 &&
+                                    DexValidator::confirm_by_map_list(
+                                        image, static_cast<size_t>(got), map_off,
+                                        string_ids_off);
+                                std::free(image);
+                                if (!confirmed) continue;
+                                dex_size = std::max(header_extent, recovered);
+                                if (dex_size == 0) continue;
+                            }
+                            if (dex_size < 0x70 || dex_size > 0x10000000 ||
+                                !DexValidator::header_strong_valid(header, dex_size))
+                                continue;
+
+                            observe_dex_candidate(dex_addr, dex_size, header, false,
+                                                  r);
+                            i += dex_size > 4096 ? 4096
+                                                 : static_cast<int>(dex_size);
+                            continue;
                         }
 
-                        c.dex_total++;
-                        pid_dex_seen++;
-                        std::fprintf(stderr, "[+] PID %s: DEX hit at 0x%lx size=%u\n",
-                                     pid, static_cast<unsigned long>(dex_addr), dex_size);
+                        // ---- Relaxed DEX scan (endian_tag based) ----
+                        if (cfg.relaxed && i >= 0x28) {
+                            uint32_t value = 0;
+                            std::memcpy(&value, buf + i, 4);
+                            if (value != kDexEndianTag) continue;
 
-                        auto* dex_data = static_cast<uint8_t*>(std::calloc(1, dex_size));
-                        if (!dex_data) { std::fprintf(stderr, "[-] calloc failed\n"); goto dex_skip; }
+                            uintptr_t dex_addr = addr +
+                                static_cast<uintptr_t>(i - 0x28);
+                            uint8_t header[0x70];
+                            if (READ_REMOTE(header, sizeof(header), dex_addr) !=
+                                static_cast<ssize_t>(sizeof(header)))
+                                continue;
+                            if (std::memcmp(header, kDexMagic, 4) == 0) continue;
 
-                        {
-                            size_t readable_total = 0;
-                            int missing_pages = 0;
-                            for (size_t off = 0; off < dex_size; off += 4096) {
-                                size_t todo = dex_size - off;
-                                if (todo > 4096) todo = 4096;
-                                ssize_t rr = READ_REMOTE(dex_data + off, todo, dex_addr + off);
-                                if (rr > 0) {
-                                    readable_total += static_cast<size_t>(rr);
-                                    if (static_cast<size_t>(rr) < todo) missing_pages++;
-                                } else {
-                                    missing_pages++;
-                                }
+                            uint32_t dex_size = 0;
+                            if (!DexValidator::header_relaxed_valid(
+                                    header, sizeof(header), &dex_size))
+                                continue;
+                            uint32_t map_off = 0, string_ids_off = 0;
+                            std::memcpy(&map_off, header + 0x34, 4);
+                            std::memcpy(&string_ids_off, header + 0x3C, 4);
+                            const uint32_t header_extent =
+                                DexValidator::recover_size_provisional(header);
+                            uint32_t read_cap = std::max(dex_size, header_extent);
+                            if (read_cap < 0x70) read_cap = 0x100000;
+                            auto* image = static_cast<uint8_t*>(
+                                std::calloc(1, read_cap));
+                            if (!image) continue;
+                            ssize_t got = READ_REMOTE(image, read_cap, dex_addr);
+                            bool confirmed = got > 0 &&
+                                DexValidator::confirm_by_map_list(
+                                    image, static_cast<size_t>(got), map_off,
+                                    string_ids_off);
+                            if (confirmed) {
+                                const uint32_t recovered =
+                                    DexValidator::recover_size_from_map_buf(
+                                        image, static_cast<size_t>(got), map_off);
+                                dex_size = std::max(
+                                    dex_size, std::max(header_extent, recovered));
+                                if (dex_size == 0) confirmed = false;
                             }
-                            if (readable_total == 0) { std::free(dex_data); goto dex_skip; }
+                            std::free(image);
+                            if (!confirmed || dex_size < 0x70 ||
+                                dex_size > 0x10000000)
+                                continue;
 
-                            DexValidator::fix_header_and_checksums(dex_data, dex_size);
-
-                            const uint8_t* sig = dex_data + 0x0C;
-                            if (dex_dedup_.seen(sig)) {
-                                c.dex_dedup++;
-                                std::fprintf(stderr, "[=] PID %s: DEX at 0x%lx is a duplicate, skipped\n",
-                                             pid, static_cast<unsigned long>(dex_addr));
-                                std::free(dex_data);
-                                goto dex_skip;
-                            }
-                            dex_dedup_.remember(sig);
-                            pid_dex_unique++;
-
-                            char outfile[768];
-                            std::snprintf(outfile, sizeof(outfile),
-                                          "%s/dump_%s_%d.dex", dex_dir, pid, pid_dex_seen);
-
-                            int fd = ::open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-                            if (fd >= 0) {
-                                size_t written_total = 0;
-                                while (written_total < dex_size) {
-                                    ssize_t w = ::write(fd, dex_data + written_total,
-                                                        dex_size - written_total);
-                                    if (w <= 0) break;
-                                    written_total += static_cast<size_t>(w);
-                                }
-                                ::close(fd);
-                                if (written_total == dex_size) {
-                                    c.dex_unique++;
-                                    std::printf("[+] DEX: %s (%u bytes, readable=%zu, zero_pages=%d) pid=%s\n",
-                                                outfile, dex_size, readable_total, missing_pages, pid);
-                                } else {
-                                    std::fprintf(stderr, "[-] write failed for %s: %s\n",
-                                                 outfile, std::strerror(errno));
-                                }
-                            }
-                            std::free(dex_data);
-                        }
-                    dex_skip:
-                        i += (dex_size > 4096 ? 4096 : static_cast<int>(dex_size));
-                    }
-
-                    // ---- Relaxed DEX scan (endian_tag based) ----
-                    if (cfg.relaxed && (mode & ScanMode::DEX) && i + 4 <= n) {
-                        uint32_t val = 0;
-                        std::memcpy(&val, buf + i, 4);
-                        if (val == kDexEndianTag && i >= 0x28) {
-                            size_t dex_start_in_buf = static_cast<size_t>(i - 0x28);
-                            uintptr_t dex_addr = addr + dex_start_in_buf;
-
-                            uint8_t hdr[0x70];
-                            if (READ_REMOTE(hdr, 0x70, dex_addr) == 0x70) {
-                                uint32_t dex_size = 0;
-                                if (DexValidator::header_relaxed_valid(hdr, 0x70, &dex_size)) {
-                                    if (std::memcmp(hdr, kDexMagic, 4) == 0) {
-                                        i += 4;
-                                        continue;
-                                    }
-
-                                    uint32_t map_off = 0, string_ids_off = 0;
-                                    std::memcpy(&map_off, hdr + 0x34, 4);
-                                    std::memcpy(&string_ids_off, hdr + 0x3C, 4);
-                                    uint32_t prov = DexValidator::recover_size_provisional(hdr);
-                                    if (prov < 0x70) prov = 0x100000;
-                                    auto* img = static_cast<uint8_t*>(std::calloc(1, prov));
-                                    if (img) {
-                                        size_t got = 0;
-                                        while (got < prov) {
-                                            ssize_t rr = READ_REMOTE(img + got, prov - got, dex_addr + got);
-                                            if (rr <= 0) break;
-                                            got += static_cast<size_t>(rr);
-                                        }
-                                        int confirmed = DexValidator::confirm_by_map_list(
-                                            img, got, map_off, string_ids_off);
-                                        if (confirmed && dex_size == 0) {
-                                            uint32_t recovered = DexValidator::recover_size_from_map_buf(
-                                                img, got, map_off);
-                                            if (recovered) dex_size = recovered;
-                                            else confirmed = 0;
-                                        }
-                                        std::free(img);
-                                        if (!confirmed) { i += 4; continue; }
-                                    } else { i += 4; continue; }
-
-                                    c.dex_total++;
-                                    pid_dex_seen++;
-                                    std::fprintf(stderr,
-                                        "[+] PID %s: DEX (relaxed, magic erased) at 0x%lx size=%u\n",
-                                        pid, static_cast<unsigned long>(dex_addr), dex_size);
-
-                                    auto* dex_data = static_cast<uint8_t*>(std::calloc(1, dex_size));
-                                    if (!dex_data) { i += 4; continue; }
-
-                                    size_t readable_total = 0;
-                                    int missing_pages = 0;
-                                    for (size_t off = 0; off < dex_size; off += 4096) {
-                                        size_t todo = dex_size - off;
-                                        if (todo > 4096) todo = 4096;
-                                        ssize_t rr = READ_REMOTE(dex_data + off, todo, dex_addr + off);
-                                        if (rr > 0) {
-                                            readable_total += static_cast<size_t>(rr);
-                                            if (static_cast<size_t>(rr) < todo) missing_pages++;
-                                        } else {
-                                            missing_pages++;
-                                        }
-                                    }
-
-                                    if (readable_total == 0) { std::free(dex_data); i += 4; continue; }
-
-                                    std::memcpy(dex_data, kDexMagic, 4);
-                                    dex_data[4] = '0'; dex_data[5] = '3';
-                                    dex_data[6] = '9'; dex_data[7] = '\0';
-
-                                    DexValidator::fix_header_and_checksums(dex_data, dex_size);
-
-                                    const uint8_t* sig = dex_data + 0x0C;
-                                    if (dex_dedup_.seen(sig)) {
-                                        c.dex_dedup++;
-                                        std::fprintf(stderr,
-                                            "[=] PID %s: DEX (relaxed) at 0x%lx is a duplicate\n",
-                                            pid, static_cast<unsigned long>(dex_addr));
-                                        std::free(dex_data);
-                                        i += (dex_size > 4096 ? 4096 : static_cast<int>(dex_size));
-                                        continue;
-                                    }
-                                    dex_dedup_.remember(sig);
-                                    pid_dex_unique++;
-
-                                    char outfile[768];
-                                    std::snprintf(outfile, sizeof(outfile),
-                                                  "%s/dump_%s_%d.dex", dex_dir, pid, pid_dex_seen);
-
-                                    int fd = ::open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-                                    if (fd >= 0) {
-                                        size_t written_total = 0;
-                                        while (written_total < dex_size) {
-                                            ssize_t w = ::write(fd, dex_data + written_total,
-                                                                dex_size - written_total);
-                                            if (w <= 0) break;
-                                            written_total += static_cast<size_t>(w);
-                                        }
-                                        ::close(fd);
-                                        if (written_total == dex_size) {
-                                            c.dex_unique++;
-                                            std::printf(
-                                                "[+] DEX(relaxed): %s (%u bytes, readable=%zu, zero_pages=%d) pid=%s\n",
-                                                outfile, dex_size, readable_total, missing_pages, pid);
-                                        }
-                                    }
-                                    std::free(dex_data);
-                                    i += (dex_size > 4096 ? 4096 : static_cast<int>(dex_size));
-                                }
-                            }
-                            i += 3; // +1 from for loop => +4 total
+                            observe_dex_candidate(dex_addr, dex_size, header, true,
+                                                  r);
+                            i += dex_size > 4096 ? 4096
+                                                 : static_cast<int>(dex_size);
                         }
                     }
                 }
             }
-        }
         } // if (do_descan)
         // ==== END MAIN SCANNING LOOP ====
 
-        // ---- SO classification-driven dump (maps-based) ----
+        bool have_so_manifest = false;
+        SoScanManifestStatsInline pending_manifest_scan;
+
+        // ---- SO reconstruction: each ELF header is an independent object ----
+        // Do not group by path+inode: Android can mmap several uncompressed
+        // libraries directly from the same base.apk, all sharing both fields.
         if (mode & ScanMode::SO) {
-            MappedObject objs[4096];
-            int obj_count = ObjectClassifier::group_by_path_inline(regs, reg_count, objs, 4096);
-            int so_dumped = 0, so_skipped_sys = 0, so_skipped_other = 0;
+            int map_start_candidates = 0;
+            int so_dumped = 0;
+            int so_skipped_system = 0;
+            SoArtifactCountsInline so_artifacts;
+            uint8_t elf_ident[16];
 
-            for (int i = 0; i < obj_count; i++) {
-                MappedObject* o = &objs[i];
-
-                uint8_t head[64] = {};
-                int have_head = 0;
-
-                // First pass: offset==0 && readable
-                for (size_t j = 0; j < reg_count && !have_head; j++) {
-                    const MapsRegion* rg = &regs[j];
-                    if (!ObjectClassifier::region_belongs_to_object(rg, o)) continue;
-                    if (rg->offset != 0) continue;
-                    if (!rg->readable) continue;
-                    ssize_t n;
-                    if (cfg.use_vm_readv) {
-                        struct iovec loc = {head, sizeof(head)};
-                        struct iovec rem = {reinterpret_cast<void*>(rg->start), sizeof(head)};
-                        n = process_vm_readv(target_pid, &loc, 1, &rem, 1, 0);
-                    } else if (mem_fd >= 0) {
-                        n = ::pread(mem_fd, head, sizeof(head), static_cast<off_t>(rg->start));
-                    } else { n = -1; }
-                    if (n > 0) { have_head = 1; break; }
-                }
-                // Second pass: any readable region
-                if (!have_head) {
-                    for (size_t j = 0; j < reg_count; j++) {
-                        const MapsRegion* rg = &regs[j];
-                        if (!ObjectClassifier::region_belongs_to_object(rg, o)) continue;
-                        if (!rg->readable) continue;
-                        ssize_t n;
-                        if (cfg.use_vm_readv) {
-                            struct iovec loc2 = {head, sizeof(head)};
-                            struct iovec rem2 = {reinterpret_cast<void*>(rg->start), sizeof(head)};
-                            n = process_vm_readv(target_pid, &loc2, 1, &rem2, 1, 0);
-                        } else if (mem_fd >= 0) {
-                            n = ::pread(mem_fd, head, sizeof(head), static_cast<off_t>(rg->start));
-                        } else { n = -1; }
-                        if (n > 0) { have_head = 1; break; }
-                    }
-                }
-
-                o->kind = have_head ?
-                    ObjectClassifier::classify_kind(o->path, head, sizeof(head))
-                    : OBJ_UNKNOWN;
-                o->origin = ObjectClassifier::classify_origin(o->path, pkg);
-                o->policy = ObjectClassifier::decide_policy(o);
-
-                if (o->policy == POLICY_SKIP) {
-                    if (o->origin == ORIGIN_SYSTEM || o->origin == ORIGIN_APEX ||
-                        o->origin == ORIGIN_VENDOR)
-                        so_skipped_sys++;
-                    else
-                        so_skipped_other++;
-                    std::snprintf(o->reason, sizeof(o->reason),
-                                  "skipped: kind=%d origin=%d",
-                                  static_cast<int>(o->kind), static_cast<int>(o->origin));
+            for (size_t i = 0; i < reg_count; ++i) {
+                if (generation.invalid || !generation.verify()) break;
+                const MapsRegion* region = &regs[i];
+                if (!scope_related_to_region_inline(scope, region)) continue;
+                if (region->end <= region->start ||
+                    region->end - region->start < sizeof(elf_ident)) {
                     continue;
                 }
 
-                if (so_dedup_.seen(o->path)) {
-                    so_skipped_other++;
-                    std::snprintf(o->reason, sizeof(o->reason), "skipped: cross-process duplicate");
+                const ObjectOrigin origin =
+                    ObjectClassifier::classify_origin(region->path, pkg);
+                if (origin == ORIGIN_SYSTEM || origin == ORIGIN_APEX ||
+                    origin == ORIGIN_VENDOR || origin == ORIGIN_RUNTIME ||
+                    origin == ORIGIN_WEBVIEW ||
+                    (region->path[0] == '[' &&
+                     std::strstr(region->path, "vdso"))) {
+                    ++so_skipped_system;
                     continue;
                 }
 
-                char outfile[768];
-                if (o->path[0] != '\0') {
-                    std::snprintf(outfile, sizeof(outfile), "%s/%s", so_dir, o->name);
-                } else {
-                    std::snprintf(outfile, sizeof(outfile), "%s/so_%s_%d.so",
-                                  so_dir, pid, c.so_count + 1);
-                }
-                {
-                    struct stat st;
-                    if (::stat(outfile, &st) == 0) {
-                        char alt[768];
-                        for (int k = 2; k < 100; k++) {
-                            if (o->name[0] != '\0')
-                                std::snprintf(alt, sizeof(alt), "%s/%s_%d.so",
-                                              so_dir, o->name, k);
-                            else
-                                std::snprintf(alt, sizeof(alt), "%s/so_%s_%d_%d.so",
-                                              so_dir, pid, c.so_count + 1, k);
-                            if (::stat(alt, &st) != 0) {
-                                std::snprintf(outfile, sizeof(outfile), "%s", alt);
-                                break;
-                            }
-                        }
-                    }
+                const ssize_t got = READ_REMOTE(elf_ident, sizeof(elf_ident),
+                                                region->start);
+                if (got != static_cast<ssize_t>(sizeof(elf_ident)) ||
+                    std::memcmp(elf_ident, "\x7f" "ELF", 4) != 0) {
+                    continue;
                 }
 
-                int rc = dump_so_inline(mem_fd, target_pid, o, regs, reg_count, outfile);
-                if (rc == 0) {
-                    so_dedup_.remember(o->path);
-                    c.so_count++;
-                    so_dumped++;
-                    std::printf("[+] SO: %s (%llu bytes, %d segs) origin=%d kind=%d pid=%s\n",
-                                outfile, static_cast<unsigned long long>(o->file_size),
-                                o->region_count, static_cast<int>(o->origin),
-                                static_cast<int>(o->kind), pid);
-                    std::snprintf(o->reason, sizeof(o->reason),
-                                  "dumped: %llu bytes, %d regions",
-                                  static_cast<unsigned long long>(o->file_size),
-                                  o->region_count);
-                } else {
-                    so_skipped_other++;
-                    std::snprintf(o->reason, sizeof(o->reason), "dump failed");
-                }
+                ++map_start_candidates;
+                const int dumped = dump_mem_elf_at_inline(
+                    mem_fd, target_pid, region->start, regs, reg_count, so_dir,
+                    pid, process_start_time, so_dedup_, &so_artifacts,
+                    cfg.use_vm_readv, &generation);
+                so_dumped += dumped;
+                c.so_count += dumped;
             }
 
-            // Write manifest
-            {
-                char mpath[512];
-                std::snprintf(mpath, sizeof(mpath), "%s/manifest.json", so_dir);
-                FILE* mf = std::fopen(mpath, "w");
-                if (mf) {
-                    std::fprintf(mf, "{\n  \"total_objects\": %d,\n  \"so_dumped\": %d,\n",
-                                 obj_count, so_dumped);
-                    std::fprintf(mf, "  \"skipped_system\": %d,\n  \"skipped_other\": %d,\n",
-                                 so_skipped_sys, so_skipped_other);
-                    std::fprintf(mf, "  \"objects\": [\n");
-                    int first = 1;
-                    for (int j = 0; j < obj_count; j++) {
-                        const MappedObject* io = &objs[j];
-                        const char* kind_str = "unknown";
-                        switch (io->kind) {
-                            case OBJ_ELF_SO: kind_str = "elf_so"; break;
-                            case OBJ_ELF_EXEC: kind_str = "elf_exec"; break;
-                            case OBJ_DEX: kind_str = "dex"; break;
-                            case OBJ_OAT: kind_str = "oat"; break;
-                            case OBJ_ODEX: kind_str = "odex"; break;
-                            case OBJ_APK_ZIP: kind_str = "apk_zip"; break;
-                            case OBJ_VDSO: kind_str = "vdso"; break;
-                            case OBJ_MEMFD: kind_str = "memfd"; break;
-                        }
-                        if (!first) std::fprintf(mf, ",\n");
-                        std::fprintf(mf,
-                            "    {\"path\":\"%s\",\"name\":\"%s\",\"kind\":\"%s\","
-                            "\"origin\":%d,\"policy\":%d,\"size\":%llu}",
-                            io->path, io->name, kind_str, static_cast<int>(io->origin),
-                            static_cast<int>(io->policy),
-                            static_cast<unsigned long long>(io->file_size));
-                        first = 0;
-                    }
-                    std::fprintf(mf, "\n  ]\n}\n");
-                    std::fclose(mf);
-                }
-            }
-
+            int deep_dumped = 0;
             if (cfg.deep_so_scan) {
-                int memelf = deep_scan_mem_elf_inline(mem_fd, target_pid, pid, pkg,
-                                                      regs, reg_count, so_dir,
-                                                      so_dedup_, cfg.use_vm_readv);
-                if (memelf > 0) {
-                    c.so_count += memelf;
-                    so_dumped += memelf;
-                    std::fprintf(stderr, "[*] SO deep memory ELF scan: +%d dumped\n", memelf);
-                }
+                deep_dumped = deep_scan_mem_elf_inline(
+                    mem_fd, target_pid, pid, process_start_time, pkg, regs,
+                    reg_count, so_dir, so_dedup_, cfg.use_vm_readv, scope,
+                    &so_artifacts, &generation);
+                so_dumped += deep_dumped;
+                c.so_count += deep_dumped;
             }
 
-            std::fprintf(stderr,
-                "[*] SO classification: %d total, %d dumped, %d skipped (sys), %d skipped (other)\n",
-                obj_count, so_dumped, so_skipped_sys, so_skipped_other);
+            SoScanManifestStatsInline manifest_scan;
+            manifest_scan.maps = reg_count;
+            manifest_scan.incremental = scope && scope->incremental;
+            manifest_scan.scope_ranges = manifest_scan.incremental
+                                             ? scope->count
+                                             : 0;
+            manifest_scan.map_start_elf_candidates = map_start_candidates;
+            manifest_scan.deep_scan_artifacts_published = deep_dumped;
+            manifest_scan.artifacts_published = so_dumped;
+            manifest_scan.coverage_complete_artifacts =
+                so_artifacts.coverage_complete;
+            manifest_scan.partial_artifacts = so_artifacts.partial;
+            manifest_scan.skipped_system_maps = so_skipped_system;
+            pending_manifest_scan = manifest_scan;
+            have_so_manifest = true;
+
+            std::fprintf(
+                stderr,
+                "[*] SO reconstruction: %d map-start candidates, %d artifacts published "
+                "(%d deep), %d system maps skipped\n",
+                map_start_candidates, so_dumped, deep_dumped,
+                so_skipped_system);
         }
 
         // ---- JNIMAP ----
@@ -864,7 +1372,8 @@ public:
             ml_jni.regs = regs;
             ml_jni.count = reg_count;
             int nj = JniMapScanner::scan(target_pid, pid, pkg, pm_jni, &ml_jni,
-                                          jni_dir, jni_dedup_);
+                                          jni_dir, jni_dedup_, scope,
+                                          &generation, process_start_time);
             c.jni_count += nj;
             ml_jni.regs = nullptr;
         }
@@ -872,31 +1381,104 @@ public:
         // ---- Analysis mode: save maps + dump target SO ----
         if (cfg.save_maps || cfg.dump_target_so) {
             save_maps_and_dump_target(pid, pkg, regs, reg_count,
-                                       target_pid, so_dir, mem_fd);
+                                       target_pid, process_start_time, so_dir,
+                                       mem_fd, scope, &generation);
+        }
+
+        bool generation_stable = generation.verify();
+        uint64_t starttime_after_scan = generation.last_observed_start_time;
+
+        // A failed generation is never recorded as a completed manifest scan.
+        // Build a copy first; guard failure discards it, while a pure manifest
+        // I/O failure retains it in memory so a later round can retry totals.
+        if (generation_stable && have_so_manifest) {
+            const SoProcessGenerationKeyInline generation_key{
+                static_cast<uint32_t>(target_pid), process_start_time};
+            SoManifestSessionInline manifest_session;
+            (void)so_manifest_sessions_.get(generation_key,
+                                             &manifest_session);
+            manifest_session.record(process_start_time, cfg.continuous,
+                                    pending_manifest_scan);
+
+            char manifest_path[768];
+            std::snprintf(
+                manifest_path, sizeof(manifest_path),
+                "%s/manifest_%s_g%llu.json", so_dir, pid,
+                static_cast<unsigned long long>(process_start_time));
+            const bool manifest_written = write_so_manifest_inline(
+                manifest_path, target_pid, manifest_session,
+                &process_generation_publish_guard_inline, &generation);
+            if (manifest_written) {
+                (void)so_manifest_retain_session_inline(
+                    &so_manifest_sessions_, generation_key, manifest_session,
+                    false);
+            } else {
+                if (generation.invalid) {
+                    generation_stable = false;
+                    starttime_after_scan =
+                        generation.last_observed_start_time;
+                } else {
+                    // Disk/rename failure only: retain the accumulated session
+                    // so the next stable continuous round retries these totals
+                    // instead of permanently dropping this scan.
+                    (void)so_manifest_retain_session_inline(
+                        &so_manifest_sessions_, generation_key,
+                        manifest_session, false);
+                }
+                std::fprintf(stderr, "[-] Failed to write SO manifest: %s\n",
+                             manifest_path);
+            }
+        }
+        if (!generation_stable) {
+            // Individual artifact transactions commit only after a matching
+            // generation check. They remain valid evidence for the generation
+            // opened above even if that process exits later in this scan. Only
+            // the unfinished round-level counters and manifest are rolled back;
+            // retaining their content dedup keys prevents rewriting that valid
+            // evidence on a later package scan.
+            std::fprintf(
+                stderr,
+                "[!] PID %s (%s): process generation changed during scan "
+                "(opened=%llu finished=%llu expected=%llu); scan marked failed "
+                "and this round's counters/manifest were discarded; already "
+                "committed artifacts remain attributed to opened generation\n",
+                pid, pkg,
+                static_cast<unsigned long long>(process_start_time),
+                static_cast<unsigned long long>(starttime_after_scan),
+                static_cast<unsigned long long>(expected_starttime));
+            c = counters_before_scan;
         }
 
         if (mem_fd >= 0) ::close(mem_fd);
         #undef READ_REMOTE
-        std::free(regs);
+        delete[] regs;
 
         std::fprintf(stderr, "[*] PID %s (%s): %d DEX hits (%d new), running totals: unique=%d dedup=%d\n",
                      pid, pkg, pid_dex_seen, pid_dex_unique, c.dex_unique, c.dex_dedup);
-        return true;
+        return generation_stable;
     }
 
 private:
     void save_maps_and_dump_target(const char* pid, const char* pkg,
                                     MapsRegion* regs, size_t reg_count,
-                                    pid_t target_pid, const char* so_dir,
-                                    int mem_fd) {
+                                    pid_t target_pid,
+                                    uint64_t process_start_time,
+                                    const char* so_dir, int mem_fd,
+                                    const ScanScope* scope,
+                                    ProcessGenerationGuardInline* generation) {
         auto& cfg = NhddConfig::instance();
 
         // Save /proc/pid/maps snapshot
-        if (cfg.save_maps) {
+        if (cfg.save_maps && generation && generation->verify()) {
             char maps_path[512];
-            std::snprintf(maps_path, sizeof(maps_path), "%s/../maps/maps_%s.txt",
-                          so_dir, pid);
-            FILE* mf = std::fopen(maps_path, "w");
+            std::snprintf(
+                maps_path, sizeof(maps_path),
+                "%s/../maps/maps_%s_g%llu.txt", so_dir, pid,
+                static_cast<unsigned long long>(process_start_time));
+            const std::string maps_temp =
+                artifact_sidecar_path_inline(maps_path, "tmp");
+            (void)::unlink(maps_temp.c_str());
+            FILE* mf = std::fopen(maps_temp.c_str(), "w");
             if (mf) {
                 std::fprintf(mf, "# /proc/%s/maps snapshot for %s\n", pid, pkg);
                 std::fprintf(mf, "# scan_time=%lld\n",
@@ -915,9 +1497,23 @@ private:
                         std::fprintf(mf, "   %s", r->path);
                     std::fprintf(mf, "\n");
                 }
-                std::fclose(mf);
-                std::printf("[+] MAPS: %s (%zu regions) pid=%s\n",
-                            maps_path, reg_count, pid);
+                bool maps_ok = std::fflush(mf) == 0 &&
+                               ::fsync(::fileno(mf)) == 0;
+                if (std::fclose(mf) != 0) maps_ok = false;
+                if (maps_ok) {
+                    std::vector<ArtifactTransactionEntryInline> publications;
+                    publications.emplace_back(maps_path, maps_temp.c_str());
+                    maps_ok = artifact_publish_transaction_inline(
+                        &publications,
+                        &process_generation_publish_guard_inline,
+                        generation);
+                }
+                if (maps_ok) {
+                    std::printf("[+] MAPS: %s (%zu regions) pid=%s\n",
+                                maps_path, reg_count, pid);
+                } else {
+                    ::unlink(maps_temp.c_str());
+                }
             }
         }
 
@@ -929,78 +1525,44 @@ private:
             char* dot = std::strrchr(target_prefix, '.');
             if (dot) *dot = '\0'; // "libjiagu.so" -> "libjiagu"
 
-            // Find the mapping for target SO
-            MapsRegion* target_reg = nullptr;
-            uintptr_t target_base = 0;
+            // A pathname may have several load instances; reconstruct every
+            // matching ELF header independently instead of merging by path.
+            int target_dumped = 0;
             for (size_t i = 0; i < reg_count; i++) {
+                if (!generation || generation->invalid ||
+                    !generation->verify()) break;
+                if (!scope_related_to_region_inline(scope, &regs[i])) continue;
                 if (!regs[i].path[0]) continue;
                 const char* bn = std::strrchr(regs[i].path, '/');
                 const char* name = bn ? bn + 1 : regs[i].path;
                 // Match: filename starts with target prefix (handles libjiagu_vip_64.so vs libjiagu.so)
-                if (std::strstr(name, target_prefix) ||
-                    std::strstr(regs[i].path, target_prefix)) {
-                    if (!target_reg || regs[i].offset < target_reg->offset) {
-                        target_reg = &regs[i];
-                        target_base = regs[i].start - regs[i].offset;
-                    }
-                }
-            }
-            if (target_reg && target_base > 0) {
-                // Calculate total SO size from all regions with same path
-                uint64_t total_size = 0;
-                for (size_t i = 0; i < reg_count; i++) {
-                    if (std::strcmp(regs[i].path, target_reg->path) == 0) {
-                        uint64_t end = regs[i].offset +
-                                       (regs[i].end - regs[i].start);
-                        if (end > total_size) total_size = end;
-                    }
-                }
-                if (total_size > 0 && total_size < 64u * 1024u * 1024u) {
-                    char so_path[768];
-                    const char* bn2 = std::strrchr(target_reg->path, '/');
-                    std::snprintf(so_path, sizeof(so_path), "%s/%s_%s_%lx.so",
-                                  so_dir,
-                                  bn2 ? bn2 + 1 : cfg.target_so,
-                                  pid, static_cast<unsigned long>(target_base));
+                if (!std::strstr(name, target_prefix) &&
+                    !std::strstr(regs[i].path, target_prefix))
+                    continue;
 
-                    auto* so_buf = static_cast<uint8_t*>(
-                        std::calloc(1, static_cast<size_t>(total_size)));
-                    if (so_buf) {
-                        for (size_t i = 0; i < reg_count; i++) {
-                            if (std::strcmp(regs[i].path, target_reg->path) != 0)
-                                continue;
-                            if (!regs[i].readable) continue;
-                            size_t seg_len = static_cast<size_t>(
-                                regs[i].end - regs[i].start);
-                            if (regs[i].offset + seg_len > total_size) continue;
-
-                            if (cfg.use_vm_readv) {
-                                struct iovec loc = {so_buf + regs[i].offset, seg_len};
-                                struct iovec rem = {reinterpret_cast<void*>(regs[i].start), seg_len};
-                                process_vm_readv(target_pid, &loc, 1, &rem, 1, 0);
-                            } else if (mem_fd >= 0) {
-                                ::pread(mem_fd, so_buf + regs[i].offset,
-                                        seg_len, static_cast<off_t>(regs[i].start));
-                            }
-                        }
-                        FILE* so_out = std::fopen(so_path, "wb");
-                        if (so_out) {
-                            std::fwrite(so_buf, 1,
-                                        static_cast<size_t>(total_size), so_out);
-                            std::fclose(so_out);
-                            std::printf("[+] TARGET-SO: %s (%llu bytes, base=0x%lx) pid=%s\n",
-                                        so_path,
-                                        static_cast<unsigned long long>(total_size),
-                                        static_cast<unsigned long>(target_base), pid);
-                        }
-                        std::free(so_buf);
-                    }
-                }
+                uint8_t magic[4] = {};
+                if (read_remote_retry_inline(mem_fd, target_pid, magic,
+                                             sizeof(magic), regs[i].start,
+                                             cfg.use_vm_readv) !=
+                        static_cast<ssize_t>(sizeof(magic)) ||
+                    std::memcmp(magic, "\x7f" "ELF", 4) != 0)
+                    continue;
+                target_dumped += dump_mem_elf_at_inline(
+                    mem_fd, target_pid, regs[i].start, regs, reg_count, so_dir,
+                    pid, process_start_time, so_dedup_, nullptr,
+                    cfg.use_vm_readv, generation);
             }
+            if (target_dumped > 0)
+                std::fprintf(stderr, "[*] TARGET-SO: %d artifact(s) published\n",
+                             target_dumped);
 
             // Also dump large anonymous RWX segments (unpacked shellcode)
             int anon_dumped = 0;
             for (size_t i = 0; i < reg_count && anon_dumped < 8; i++) {
+                if (!generation || generation->invalid ||
+                    !generation->verify()) break;
+                if (!scope_intersects_inline(scope, regs[i].start,
+                                             regs[i].end)) continue;
                 if (regs[i].path[0] != '\0') continue;
                 if (!regs[i].readable || !regs[i].executable) continue;
                 uint64_t blob_size = regs[i].end - regs[i].start;
@@ -1009,30 +1571,26 @@ private:
 
                 char blob_path[768];
                 std::snprintf(blob_path, sizeof(blob_path),
-                              "%s/anon_%s_%lx.bin",
+                              "%s/anon_%s_g%llu_%lx.bin",
                               so_dir, pid,
+                              static_cast<unsigned long long>(
+                                  process_start_time),
                               static_cast<unsigned long>(regs[i].start));
 
                 auto* blob_buf = static_cast<uint8_t*>(
                     std::calloc(1, static_cast<size_t>(blob_size)));
                 if (!blob_buf) continue;
 
-                if (cfg.use_vm_readv) {
-                    struct iovec loc = {blob_buf, static_cast<size_t>(blob_size)};
-                    struct iovec rem = {
-                        reinterpret_cast<void*>(regs[i].start),
-                        static_cast<size_t>(blob_size)};
-                    process_vm_readv(target_pid, &loc, 1, &rem, 1, 0);
-                } else if (mem_fd >= 0) {
-                    ::pread(mem_fd, blob_buf, static_cast<size_t>(blob_size),
-                            static_cast<off_t>(regs[i].start));
-                }
+                const ssize_t blob_read = read_remote_retry_inline(
+                    mem_fd, target_pid, blob_buf,
+                    static_cast<size_t>(blob_size), regs[i].start,
+                    cfg.use_vm_readv);
 
-                FILE* blob_out = std::fopen(blob_path, "wb");
-                if (blob_out) {
-                    std::fwrite(blob_buf, 1, static_cast<size_t>(blob_size),
-                                blob_out);
-                    std::fclose(blob_out);
+                if (blob_read == static_cast<ssize_t>(blob_size) &&
+                    generation->verify() &&
+                    write_atomic_bytes_inline(
+                        blob_path, blob_buf, static_cast<size_t>(blob_size),
+                        generation)) {
                     std::printf("[+] ANON-BLOB: %s (%llu bytes, %s) pid=%s\n",
                                 blob_path,
                                 static_cast<unsigned long long>(blob_size),
@@ -1047,4 +1605,7 @@ private:
     DexDedup& dex_dedup_;
     SoDedup& so_dedup_;
     JniDedup& jni_dedup_;
+    DexCaptureCache dex_capture_cache_;
+    SoManifestSessionCacheInline so_manifest_sessions_{128};
+    std::unordered_set<std::string> runtime_processed_;
 };
