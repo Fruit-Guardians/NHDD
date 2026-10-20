@@ -10,6 +10,7 @@
 #include "common_types.hpp"
 
 struct ArtRefillBudget {std::atomic<size_t> bytes{0};};
+class ArtMethodMerge;
 struct ArtRefillBaseline {
     DexCandidateIdentity identity;
     uintptr_t object=0,vtable=0;
@@ -22,6 +23,8 @@ struct ArtRefillBaseline {
     std::vector<DexMethodCode> methods;
     std::vector<MapsRegion> mappings;
     std::atomic<bool> active{true};
+    // Only the publication thread accesses this; lifetime follows the baseline.
+    std::shared_ptr<ArtMethodMerge> merge;
     std::shared_ptr<ArtRefillBudget> budget;
     size_t charge=0;
     ~ArtRefillBaseline() {if(budget)budget->bytes.fetch_sub(charge);}

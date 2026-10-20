@@ -152,6 +152,8 @@ adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_live
 
 已适配 ART 构建上，`--art-refill auto` 默认把快速片段与已发现、字节完整的 ART 候选关联：即使事件页面没有 DEX 头，也可恢复边界已知的方法指令区。恢复前后复核对象/头部锚点及映射 backing，未替换区域须与固定基线双遍相同；另存 `*.refilled.raw.dex / *.refilled.fixed.dex / *.refill.json`，不覆盖主扫描、不向目标写入。此结果是**跨时刻重建副本，不是完整明文保证或原子快照**。可用 `--art-refill off` 单独关闭；限制和真机复现见 [ART 关联回填](docs/art-refill.md)。
 
+`--art-merge auto` 默认进一步积累**同一基线代际**中已通过独立校验、已落盘的完整方法片段，适合多个方法分别短暂解密的场景。合并前双遍复核固定结构及已知方法版本，另存 `*.merged.raw.dex / *.merged.fixed.dex / *.merge.json`，逐方法记录来源、捕获时间和内容摘要。重复内容去重；同一方法出现不同版本就保存 `*.merge-conflict.json`、冻结整个代际的合并，不自动选择赢家。冲突文件会否定该 session 的先前合并推断，旧产物只保留作证据。`--art-merge off` 保留原有单事件回填，不做跨窗口合并。
+
 ### 查找 JNI 绑定
 
 先写目标与输出目录，再写可选的 JNI 模块筛选参数：
@@ -197,6 +199,7 @@ adb shell "/data/local/tmp/nhdd --verify /data/local/tmp/example.odex"
 | `--fast-capture auto\|off` | 默认 auto；continuous + tracefs 的采集线程局部双读，不另行开启 continuous |
 | `--fast-max-kb N` | 每事件读取前缀上限，默认 1024 KiB，范围 4–8192；两遍共用 8ms 软预算 |
 | `--art-refill auto\|off` | 默认 auto；须同时启用 ART 发现、快速捕获与 tracefs，保守重建已知完整方法指令区 |
+| `--art-merge auto\|off` | 默认 auto；同一 ART 基线跨窗口积累完整方法，版本冲突时冻结合并；依赖 art-refill |
 | `--monitor-interval T` | continuous 周期检查间隔，默认 2 秒 |
 | `--monitor-duration S` | continuous 调度时长，默认 0，即不限时 |
 | `--monitor-verbose` | 输出详细监控日志 |

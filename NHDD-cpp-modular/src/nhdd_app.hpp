@@ -208,6 +208,13 @@ public:
                 }
                 cfg.fast_capture=std::strcmp(value,"off")!=0;continue;
             }
+            if (std::strcmp(argv[i], "--art-merge") == 0 && i+1<argc) {
+                const char* value=argv[++i];
+                if(std::strcmp(value,"auto") && std::strcmp(value,"off")) {
+                    std::fprintf(stderr,"[-] --art-merge requires auto or off\n");return 1;
+                }
+                cfg.art_merge=std::strcmp(value,"off")!=0;continue;
+            }
             if (std::strcmp(argv[i], "--art-refill") == 0 && i+1<argc) {
                 const char* value=argv[++i];
                 if(std::strcmp(value,"auto") && std::strcmp(value,"off")) {
@@ -460,7 +467,7 @@ public:
             // package subprocess ordering changes between polls.
             std::unordered_map<std::string, MapsMonitor> monitors;
             bool stop_numeric_continuous = false;
-            FastCaptureService fast_capture(target,is_numeric,size_t(cfg.fast_max_kb)*1024,mode & ScanMode::DEX,cfg.art_refill);
+            FastCaptureService fast_capture(target,is_numeric,size_t(cfg.fast_max_kb)*1024,mode & ScanMode::DEX,cfg.art_refill,cfg.art_merge);
             {
                 std::vector<int> filter;
                 for(int p=0;p<pid_count;++p)filter.push_back(std::atoi(pids[p]));
@@ -1088,6 +1095,7 @@ private:
             "    --art-scan-mb N  Native-heap read budget per round, 1..512 MiB (default 64); resumes next round\n"
             "    --fast-capture auto|off  Early tracefs local double-read capture (default auto); continuous only\n"
             "    --art-refill auto|off  Associate ART candidates; method-only validated temporal composites (default auto)\n"
+            "    --art-merge auto|off   Merge verified methods across windows; freeze on conflicts (default auto)\n"
             "    --fast-max-kb N  Per-event prefix 4..8192 KiB (default 1024), shared 8ms read budget\n"
             "    --anon        Only scan anonymous mappings\n"
             "    --region-delay MS  Pause between regions (ms)\n"

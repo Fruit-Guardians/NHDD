@@ -13,8 +13,8 @@
 
 class FastCaptureService {
 public:
-    FastCaptureService(std::string target,bool numeric,size_t cap,bool dex,bool art_refill=true)
-        :target_(std::move(target)),numeric_(numeric),cap_(cap),dex_(dex),refill_(art_refill && dex) { decoder_.early_entries(true); }
+    FastCaptureService(std::string target,bool numeric,size_t cap,bool dex,bool art_refill=true,bool art_merge=true)
+        :target_(std::move(target)),numeric_(numeric),cap_(cap),dex_(dex),refill_(art_refill && dex,art_merge) { decoder_.early_entries(true); }
     void arm_art(const DexCapture& capture,const MapsRegion* maps,size_t count,const ArtRefillService::Read& read) {
         refill_.arm(capture,maps,count,read);
     }

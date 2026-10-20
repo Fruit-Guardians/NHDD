@@ -5,6 +5,7 @@
 #include "art_refill.hpp"
 #include "syscall_events.hpp"
 #include "nhdd_scanner.hpp"
+#include "art_merge_publication.hpp"
 
 class ArtRefillService {
 public:
@@ -13,7 +14,7 @@ public:
         bool before=false,after=false;
     };
     using Read=std::function<bool(uintptr_t,void*,size_t)>;
-    explicit ArtRefillService(bool enabled=true):enabled_(enabled),budget_(std::make_shared<ArtRefillBudget>()) {}
+    explicit ArtRefillService(bool enabled=true,bool merge=true):enabled_(enabled),merge_enabled_(enabled && merge),budget_(std::make_shared<ArtRefillBudget>()) {}
     void arm(const DexCapture& capture,const MapsRegion* maps,size_t count,const Read& read) {
         if(!enabled_ || !capture.art_object() || !capture.complete())return;
         if(capture.size()>16u*1024*1024) {++arm_rejected_;return;}
@@ -35,7 +36,9 @@ public:
                 anchors(*existing,read))return;
             existing->active=false;
         }
-        const size_t charge=capture.size()+4096*sizeof(DexMethodCode)+128*sizeof(MapsRegion)+sizeof(ArtRefillBaseline);
+        // Reserve two instruction variants plus bounded per-method provenance.
+        const size_t charge=capture.size()+4096*sizeof(DexMethodCode)+128*sizeof(MapsRegion)+sizeof(ArtRefillBaseline)+
+            (merge_enabled_?2*capture.size()+4096*1536+1024*1024:0);
         auto b=std::make_shared<ArtRefillBaseline>();
         size_t used=budget_->bytes.load();
         do {if(charge>64u*1024*1024-used) {++arm_rejected_;return;}}
@@ -192,6 +195,26 @@ public:
                 written+=bytes;++published_;
                 std::fprintf(stderr,"[ART-REFILL] published %s methods=%zu changed=%zu (temporal composite, not atomic)\n",
                     meta.c_str(),plan.patches.size(),plan.changed_bytes);
+                if(merge_enabled_) {
+                    auto& state=link.baseline->merge;
+                    if(!state) {state=std::make_shared<ArtMethodMerge>(b);state->session=ArtMergePublication::name(stem);}
+                    const auto result=state->accept(b,o,plan,{ArtMergePublication::name(meta),o.begin,o.end,boot()});
+                    if(result==ArtMethodMerge::Result::Duplicate)++merge_duplicates_;
+                    if(result==ArtMethodMerge::Result::Conflict)++merge_conflicts_;
+                    if(result==ArtMethodMerge::Result::Blocked)++merge_blocked_;
+                    auto merged=ArtMergePublication::publish(b,*state,stem,read,guard,
+                        output_budget-std::min(written,output_budget),verification_budget_,boot());
+                    written+=merged.bytes;
+                    switch(merged.status) {
+                    case ArtMergePublication::Status::Published:++merge_published_;break;
+                    case ArtMergePublication::Status::Conflict:++merge_conflict_records_;break;
+                    case ArtMergePublication::Status::Incompatible:++merge_incompatible_;break;
+                    case ArtMergePublication::Status::Budget:++merge_budget_drops_;break;
+                    case ArtMergePublication::Status::Invalid:++merge_invalid_;break;
+                    case ArtMergePublication::Status::WriteFailed:++write_failures_;break;
+                    default:break;
+                    }
+                }
             } else {
                 artifact_cleanup_temporaries_inline(files);
                 if(!guard()) {++rejected_;written+=record_rejection(stem,b,o,"publication_identity_changed");}
@@ -206,6 +229,10 @@ public:
             "output_drops=%llu write_failures=%llu retained_baseline_bytes=%zu\n",ull(armed_),ull(arm_rejected_),
             ull(published_),ull(rejected_),ull(mapping_invalidations_),ull(trace_invalidations_),ull(link_limit_),
             ull(verification_drops_),ull(output_drops_),ull(write_failures_),budget_->bytes.load());
+        std::fprintf(stderr,"[*] ART merge: enabled=%u published=%llu duplicates=%llu conflicts=%llu conflict_records=%llu "
+            "blocked=%llu incompatible=%llu budget_drops=%llu invalid=%llu\n",merge_enabled_?1u:0u,ull(merge_published_),
+            ull(merge_duplicates_),ull(merge_conflicts_),ull(merge_conflict_records_),ull(merge_blocked_),ull(merge_incompatible_),
+            ull(merge_budget_drops_),ull(merge_invalid_));
     }
 private:
     static unsigned long long ull(uint64_t n){return static_cast<unsigned long long>(n);}
@@ -241,8 +268,10 @@ private:
         }
         return static_cast<size_t>(n);
     }
-    bool enabled_;std::shared_ptr<ArtRefillBudget> budget_;
+    bool enabled_,merge_enabled_;std::shared_ptr<ArtRefillBudget> budget_;
     std::mutex mutex_;std::vector<std::shared_ptr<ArtRefillBaseline>> baselines_;uint64_t revision_=0;
     uint64_t armed_=0,arm_rejected_=0,published_=0,rejected_=0,verification_budget_=0,verification_drops_=0,output_drops_=0,write_failures_=0;
     std::atomic<uint64_t> mapping_invalidations_{0},trace_invalidations_{0},link_limit_{0};
+    uint64_t merge_published_=0,merge_duplicates_=0,merge_conflicts_=0,merge_conflict_records_=0,merge_blocked_=0;
+    uint64_t merge_incompatible_=0,merge_budget_drops_=0,merge_invalid_=0;
 };
