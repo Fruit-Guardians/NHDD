@@ -1,4 +1,39 @@
-# NHDD — No-Hook DEX/SO Dumper
+<p align="center">
+  <img src="./NHDD-cpp-modular/assets/nhdd-mark.svg" alt="NHDD" width="104" height="104">
+</p>
+
+<h1 align="center">NHDD</h1>
+
+<p align="center"><strong>No-Hook DEX / SO Dumper</strong></p>
+
+<h3 align="center">运行时提取，不向进程注入。</h3>
+
+<p align="center">
+  面向 Android Root 的 DEX / SO 提取工具。<br>
+  多轮捕获 DEX，按段重建 SO，持续跟随运行时变化。
+</p>
+
+<p align="center">
+  <img alt="Android · Root" src="./NHDD-cpp-modular/assets/badges/nhdd-root.svg">
+  <img alt="ABI · ARM64 / ARMv7" src="./NHDD-cpp-modular/assets/badges/nhdd-abi.svg">
+  <img alt="Capture · No Hook" src="./NHDD-cpp-modular/assets/badges/nhdd-no-hook.svg">
+  <img alt="C++ · 17" src="./NHDD-cpp-modular/assets/badges/nhdd-cpp.svg">
+</p>
+
+<p align="center">
+  <a href="./NHDD-cpp-modular/README.md#快速上手">快速上手</a> &nbsp;·&nbsp;
+  <a href="./NHDD-cpp-modular/README.md#功能介绍">功能介绍</a> &nbsp;·&nbsp;
+  <a href="./NHDD-cpp-modular/README.md#常用命令">使用说明</a> &nbsp;·&nbsp;
+  <a href="./NHDD-cpp-modular/README.md#输出说明">产物说明</a> &nbsp;·&nbsp;
+  <a href="./NHDD-cpp-modular/docs/design.md">技术设计</a> &nbsp;·&nbsp;
+  <a href="https://github.com/Fruit-Guardians/NHDD/issues">问题反馈</a>
+</p>
+
+<p align="center"><sub>一个二进制，无需注入 Agent。仅用于自有或已获授权的应用。</sub></p>
+
+---
+
+> 当前 Root CLI 的功能、安装、冷启动捕获、参数与输出说明，请优先阅读 [C++ 工具使用指南](./NHDD-cpp-modular/README.md)。该指南覆盖多轮 DEX 合并、PT_LOAD SO 重建、事件驱动捕获及 OAT 279 检查；下文旧版与控制端工作流不代表所有组件功能一致。[技术设计](./NHDD-cpp-modular/docs/design.md) · [README 徽章制作](./NHDD-cpp-modular/docs/badges.md)。
 
 NHDD 是一个面向 Android 逆向分析与授权安全研究的 **外部内存 DEX/SO Dump 工具**。它的核心程序 `nhdd` 以独立 root 进程运行，通过读取目标进程的 `/proc/<pid>/maps` 和 `/proc/<pid>/mem`（或使用 `process_vm_readv` 的 stealth2 模式），在内存中扫描 DEX/ELF magic，并将已加载到内存中的 DEX 或 SO 导出到文件。
 

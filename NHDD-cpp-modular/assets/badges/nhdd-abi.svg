@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="20" viewBox="0 0 128 20" role="img" aria-labelledby="title desc">
+  <title id="title">ABI: ARM64 / ARMv7</title>
+  <desc id="desc">NHDD · ARM64 为主要真机验证环境，ARMv7 通过交叉编译。静态产品信息，不是 CI 测试状态。</desc>
+  <defs><clipPath id="rounded"><rect width="128" height="20" rx="3"/></clipPath></defs>
+  <g clip-path="url(#rounded)">
+    <path fill="#50565e" d="M0 0h30v20H0z"/>
+    <path fill="#48586b" d="M30 0h98v20H30z"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11">
+    <text x="15" y="14">ABI</text>
+    <text x="79" y="14">ARM64 / ARMv7</text>
+  </g>
+</svg>

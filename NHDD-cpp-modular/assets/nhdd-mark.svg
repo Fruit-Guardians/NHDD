@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">NHDD</title>
+  <desc id="desc">NHDD 产品标识：浅色圆角底板上的几何 N，独立的小方块代表从内存中提取的字节。</desc>
+  <rect x="7.5" y="7.5" width="113" height="113" rx="28" fill="#f5f6f7" stroke="#d9dee3"/>
+  <path d="M34 89V42h14l32 29V42h14v47H80L48 60v29Z" fill="#171d24"/>
+  <rect x="84" y="27" width="10" height="10" rx="2" fill="#388b75"/>
+</svg>
