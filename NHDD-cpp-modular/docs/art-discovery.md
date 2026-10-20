@@ -40,6 +40,8 @@ ART 候选首次接入时记录对象、虚表与 Build ID。已由 header 扫�
 
 continuous + tracefs 下可将已发现的完整 ART 候选用于[快速片段关联回填](art-refill.md)，默认 `--art-refill auto`。此路径另存方法级 temporal composite，不将其冒充原始整份内存观测；只验证发现能力时使用 snapshot，或额外 `--fast-capture off`。
 
+默认 `--art-merge auto` 在同一不可变 ART 基线上继续积累多个窗口的完整方法证据，并记录来源/冲突；对象、映射或进程代际失效后不得沿用旧片段。它不会扩大支持的 ART Build ID 或恢复已破坏的方法布局。
+
 ## Root 真机验证
 
 2026-10-20，当前 Root Pixel 6：

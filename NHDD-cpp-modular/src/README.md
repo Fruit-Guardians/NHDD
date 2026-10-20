@@ -19,6 +19,8 @@
 | `fast_capture_service.hpp` | 采集线程读取、独立目标身份校验、有界队列与主线程证据发布 |
 | `art_refill.hpp` | 保守 code_item/指令布局、方法片段规划、双遍补集核对与映射 backing 对比 |
 | `art_refill_service.hpp` | 不可变 ART 基线注册、捕获锚点、映射/丢失失效、带来源的跨时刻重建发布 |
+| `art_method_merge.hpp` | 代际绑定的多窗口方法证据、内容去重、版本冲突冻结、已知版本补集核对 |
+| `art_merge_publication.hpp` | 跨窗口副本/冲突清单的预算与回滚式发布，保留逐方法来源 |
 | `elf_reconstructor.hpp` | ELF32/64 program header 校验、load bias、PT_LOAD 重建与 metadata |
 | `so_artifact_identity.hpp` | SO 的 PID/starttime 世代身份、raw/header evidence hash 与产物命名 |
 | `so_manifest.hpp` | 与 Android 内存 API 解耦的 SO manifest 会话累计和跨平台原子发布 |
@@ -44,7 +46,7 @@
 9. tracefs 使用专用实例，不修改 root tracer；失败/溢出显式报告。未成功的系统调用不发布成功事件，事件丢失后补扫无法恢复已消失的明文。
 10. 字节完整、静态结构检查、ART 运行时验证分别表达。未知格式版本不猜测；CDEX/VDEX 不冒充已转换/反 quickening 的标准 DEX，OAT header 不冒充完整 OAT。
 11. 快速路径先保存两次独立观测，不跨事件拼接。双读一致不是原子快照，缺页补零不算有效字节；单次读到的完整 DEX 可留证，但必须保留它自己的双读一致性和 raw/fixed 检查结果。该路径不改变主扫描去重计数。
-12. ART 关联回填是独立的 temporal composite：同一对象/结构世代固定首次基线，普通正文刷新不换基线；只采用单个事件中双读匹配的完整 insns 区域，补集双遍重验。映射事件或观测到 trace 丢失会使相关基线失效；不累计多个事件的补丁，不反写主缓存或目标。全零替换拒绝，其他字节也不自动认作明文。
+12. ART 关联回填是独立的 temporal composite：同一对象/结构世代固定首次基线，普通正文刷新不换基线；每个片段须来自单个事件中双读匹配的完整 insns，补集双遍重验。跨窗口合并仅接纳已落盘的独立回填证据；相同内容去重，不同版本冻结整个代际，保留两种来源且不选赢家。合并发布另作两遍结构/已知方法版本检查；映射事件或已观测 trace 丢失使旧基线和所附合并状态一起失效。原始片段和单事件副本不被覆盖，不反写主缓存或目标。全零替换拒绝，其他字节也不自动认作明文。
 
 ## 验证
 

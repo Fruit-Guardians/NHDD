@@ -49,6 +49,8 @@ adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_fast
 
 原始读取不依赖 DEX 头部，所以擦头/方法页也能作为 `.bin` 留证。独立 DEX 提取仍需标准头和结构；另有默认开启的 [ART 关联方法回填](art-refill.md)，使用事先建立的 ART 基线和方法布局，不在无头页面上猜测 CodeItem。它另存带来源的 temporal composite，不改变原始片段的 `cross_event_merge:false`。`--art-dex only` 控制主扫描，独立快速路径仍可识别标准 DEX；纯 ART 发现对照请同时 `--fast-capture off`，只关闭关联回填则用 `--art-refill off`。
 
+ART 回填之上默认启用 `--art-merge auto`：将同一代际的已验证完整方法积累为跨窗口副本，来源指向已经提交的单事件证据。双遍检查外部结构与已知方法版本；同一方法不同内容冻结该代际并输出冲突清单，不做最后写入覆盖。用 `--art-merge off` 只关闭这一层；原始双读和单事件回填不变。
+
 `DEX-observations` 是事件里的 DEX 观测数，不是去重 DEX 数，不并入主扫描的 `DEX=` 汇总。fast 证据按会话/时刻追加，不随常规旧产物清理；256MiB 是每次运行的发布上限，复用目录会累计。
 
 ## 受控真机复现
