@@ -137,6 +137,10 @@ public:
     uint64_t losses() const { return losses_; }
     uint64_t malformed() const { return malformed_; }
     const std::string& error() const { return error_; }
+    // Configure before start(). Called on the collector, not the scan thread.
+    void early_lines(std::function<void(const std::string&)> handler) { early_line_ = std::move(handler); }
+    void early_entries(bool enabled) { early_entries_ = enabled; }
+    void stop() { close(); }
     std::vector<MemorySyscallEvent> ingest(const std::string& line,const Resolver& resolve) {
         std::vector<MemorySyscallEvent> result;
         consume(line,resolve,result);
@@ -165,6 +169,10 @@ public:
             control("options/context-info", "1") &&
             control("options/record-tgid", "0") &&
             control("options/event-fork", "1");
+        // Only our isolated instance: do not wait for half a ring buffer before
+        // waking the observer. Older kernels retain a short nonblocking retry.
+        if(early_line_ && !control("buffer_percent","0"))
+            std::fprintf(stderr,"[!] Low-watermark trace wakeup unavailable; using 2ms nonblocking retries\n");
         std::string ids;
 #if defined(__aarch64__)
         ids = "id == 222 || id == 226 || id == 215 || id == 216 || id == 192 || id == 125 || id == 91 || id == 163";
@@ -309,7 +317,8 @@ private:
             pending_[r.tid] = p;
             // Capture before munmap as soon as the entry record is consumed.
             // Target is not stopped: this is explicitly best effort.
-            if (p.op == "munmap") emit(p, r, true, out);
+            if (p.op == "munmap" || (early_entries_ && (p.op == "mprotect" || p.op == "mremap")))
+                emit(p, r, true, out);
         } else {
             auto it = pending_.find(r.tid);
             if (it == pending_.end()) return;
@@ -333,22 +342,37 @@ private:
         if (p.op == "mprotect") e.protection = a[2];
         if (p.op == "mremap") {
             SyscallEventDecoder::range(a[0], a[1], &e.old_address, &e.old_end);
-            address = static_cast<uint64_t>(r.result); size = a[2];
+            if (!before) { address = static_cast<uint64_t>(r.result); size = a[2]; }
         }
         if (SyscallEventDecoder::range(address, size, &e.address, &e.end)) out.push_back(std::move(e));
     }
 #if defined(__linux__)
     void collect() {
         char bytes[65536];
+        std::string early_buffer;
         while(!stopping_) {
             pollfd pfd{fd_,POLLIN,0};
-            int r=::poll(&pfd,1,100);
+            int r=::poll(&pfd,1,early_line_?2:100);
             if(r<0 && errno==EINTR)continue;
             if(r<0 || (pfd.revents&(POLLERR|POLLHUP|POLLNVAL))) {reader_failed_=true;queue_ready_.notify_one();break;}
-            if(!r)continue;
+            if(!r && !early_line_)continue;
             ssize_t n=::read(fd_,bytes,sizeof(bytes));
             if(n<0 && (errno==EAGAIN || errno==EINTR))continue;
             if(n<=0){reader_failed_=true;queue_ready_.notify_one();break;}
+            if (early_line_) {
+                early_buffer.append(bytes, static_cast<size_t>(n));
+                size_t cursor=0, end=0;
+                while ((end=early_buffer.find('\n',cursor))!=std::string::npos) {
+                    try {early_line_(early_buffer.substr(cursor,end-cursor));}
+                    catch(const std::exception& e) {
+                        std::fprintf(stderr,"[!] Early capture failed: %s\n",e.what());
+                        reader_failed_=true;queue_ready_.notify_one();return;
+                    }
+                    cursor=end+1;
+                }
+                early_buffer.erase(0,cursor);
+                if(early_buffer.size()>65536) { early_line_("LOST oversized early trace record");early_buffer.clear(); }
+            }
             {
                 std::lock_guard<std::mutex> lock(queue_mutex_);
                 if(queued_.size()+static_cast<size_t>(n)>16*1024*1024) {
@@ -394,4 +418,6 @@ private:
     std::string queued_;
     std::atomic<bool> stopping_{false},reader_failed_{false};
     uint64_t queue_drops_=0;
+    std::function<void(const std::string&)> early_line_;
+    bool early_entries_=false;
 };
