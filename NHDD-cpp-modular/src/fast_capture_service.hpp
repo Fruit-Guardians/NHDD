@@ -9,11 +9,16 @@
 #include "process_manager.hpp"
 #include "maps_monitor.hpp"
 #include "nhdd_scanner.hpp"
+#include "art_refill_service.hpp"
 
 class FastCaptureService {
 public:
-    FastCaptureService(std::string target,bool numeric,size_t cap,bool dex)
-        :target_(std::move(target)),numeric_(numeric),cap_(cap),dex_(dex) { decoder_.early_entries(true); }
+    FastCaptureService(std::string target,bool numeric,size_t cap,bool dex,bool art_refill=true)
+        :target_(std::move(target)),numeric_(numeric),cap_(cap),dex_(dex),refill_(art_refill && dex) { decoder_.early_entries(true); }
+    void arm_art(const DexCapture& capture,const MapsRegion* maps,size_t count,const ArtRefillService::Read& read) {
+        refill_.arm(capture,maps,count,read);
+    }
+    void invalidate_art() {refill_.invalidate_all();}
     void targets(const std::vector<int>& pids) {
         std::unordered_map<int,uint64_t> next;
         for(int pid:pids) {
@@ -27,13 +32,15 @@ public:
         auto events=decoder_.ingest(text,[this](int tid,int* pid,uint64_t* ticks,bool* compat) {
             return resolve(tid,pid,ticks,compat);
         });
-        for(const auto& event:events)acquire(event);
+        if(decoder_.losses()!=early_losses_)refill_.invalidate_all();
+        for(const auto& event:events) {refill_.event(event);acquire(event);}
         early_losses_=decoder_.losses();
     }
     void publish(const char* out_dir) {
         std::deque<Snapshot> ready;
         {std::lock_guard<std::mutex> lock(mutex_);ready.swap(queue_);queued_bytes_=0;}
         if(ready.empty())return;
+        refill_.begin_batch();
         const uint64_t previous=published_,previous_dex=dex_observations_;
         const std::string dir=std::string(out_dir)+"/fast";
         if(::mkdir(dir.c_str(),0700)!=0 && errno!=EEXIST) {write_failures_+=ready.size();return;}
@@ -54,10 +61,12 @@ public:
             "early_trace_losses=%llu disk_drops=%llu write_failures=%llu (two reads, not atomic)\n",
             ull(observed_),ull(published_),ull(dex_observations_),ull(queue_drops_),ull(budget_drops_),
             ull(rejected_),ull(unreadable_),ull(early_losses_),ull(disk_drops_),ull(write_failures_));
+        refill_.diagnostics();
     }
 private:
     struct Snapshot {
         MemorySyscallEvent event;FastObservation observation;uint64_t sequence=0;
+        std::vector<ArtRefillService::Link> links;
         size_t bytes() const {return observation.first.size()+observation.second.size();}
     };
     static unsigned long long ull(uint64_t n) {return static_cast<unsigned long long>(n);}
@@ -121,11 +130,17 @@ private:
             if(n<=0 && memory_fd.value>=0)n=::pread(memory_fd.value,bytes,count,static_cast<off_t>(address));
             return n>0?static_cast<size_t>(n):0;
         };
+        ArtRefillService::Read linked_read=[&](uintptr_t address,void* bytes,size_t count) {
+            return generation(event.pid,event.starttime) &&
+                read(address,static_cast<uint8_t*>(bytes),count)==count;
+        };
+        auto links=refill_.prepare(event,linked_read);
         auto observation=FastObservation::capture(event.address,event.end-event.address,cap_,read,
             [&]{return generation(event.pid,event.starttime);},[]{return now();});
+        refill_.finish(links,linked_read);
         if(!observation.generation_valid) {++rejected_;return;}
         if(!observation.read_bytes(0) && !observation.read_bytes(1)) {++unreadable_;return;}
-        Snapshot s{event,std::move(observation),++sequence_};
+        Snapshot s{event,std::move(observation),++sequence_,std::move(links)};
         std::lock_guard<std::mutex> lock(mutex_);queued_bytes_+=s.bytes();queue_.push_back(std::move(s));
     }
     bool publish_one(const std::string& dir,const Snapshot& s) {
@@ -184,6 +199,15 @@ private:
                 std::fputc('}',f);++candidates;off+=length-1;
             }
         }
+        std::fputs("],\"art_associations\":[",f);
+        for(size_t i=0;i<s.links.size();++i) {
+            const auto& link=s.links[i];const auto& b=*link.baseline;
+            const auto plan=ArtRefill::plan(b,o,static_cast<uint32_t>(e.pid),e.starttime,link.before && link.after);
+            std::fprintf(f,"%s{\"baseline_revision\":%llu,\"dex_address\":\"0x%llx\",\"art_object\":\"0x%llx\","
+                "\"capture_anchor_before\":%s,\"capture_anchor_after\":%s,\"planning_status\":\"%s\"}",i?",":"",
+                ull(b.revision),ull(b.identity.address),ull(b.object),link.before?"true":"false",
+                link.after?"true":"false",plan.reason.c_str());
+        }
         std::fputs("]}\n",f);
         const long meta_bytes=std::ftell(f);if(meta_bytes>0)last_written_+=static_cast<size_t>(meta_bytes);
         ok=(std::fflush(f)==0 && ::fsync(::fileno(f))==0) && ok;
@@ -192,6 +216,8 @@ private:
         if(!ok) {cleanup();return false;}
         if(!artifact_publish_transaction_inline(&entries))return false;
         dex_observations_+=candidates;
+        const size_t available=256u*1024*1024-std::min(size_t(256u*1024*1024),size_t(published_bytes_)+last_written_);
+        last_written_+=refill_.publish(stem,e,o,s.links,available);
         return true;
     }
     std::string target_;bool numeric_;size_t cap_;bool dex_;
@@ -200,5 +226,6 @@ private:
     std::deque<Snapshot> queue_;size_t queued_bytes_=0,budget_bytes_=0;double budget_epoch_=0;
     uint64_t sequence_=0,published_=0,published_bytes_=0,dex_observations_=0,disk_drops_=0,write_failures_=0;
     size_t last_written_=0;
+    ArtRefillService refill_;
     std::atomic<uint64_t> observed_{0},queue_drops_{0},budget_drops_{0},rejected_{0},unreadable_{0},early_losses_{0};
 };

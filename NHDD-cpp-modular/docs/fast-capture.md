@@ -47,7 +47,7 @@ adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_fast
 
 `truncated` 和 `deadline_hit` 是独立状态；“截取前缀双读相同”不等于“整个事件范围完整”。任何情况都标 `atomic_snapshot:false`、`cross_event_merge:false`。即便两遍相同，也不能排除每遍内部撕裂、映射 ABA 或两遍之间改变又恢复。
 
-原始读取不依赖 DEX 头部，所以擦头/方法页也能作为 `.bin` 留证；**自动 DEX 提取仍需足够的标准头和结构，未接入 ART 候选局部回填或 CodeItem 语义重组**。`--art-dex only` 控制主扫描；独立快速路径仍可从冻结字节识别标准 DEX，纯 ART 对照请同时 `--fast-capture off`。
+原始读取不依赖 DEX 头部，所以擦头/方法页也能作为 `.bin` 留证。独立 DEX 提取仍需标准头和结构；另有默认开启的 [ART 关联方法回填](art-refill.md)，使用事先建立的 ART 基线和方法布局，不在无头页面上猜测 CodeItem。它另存带来源的 temporal composite，不改变原始片段的 `cross_event_merge:false`。`--art-dex only` 控制主扫描，独立快速路径仍可识别标准 DEX；纯 ART 发现对照请同时 `--fast-capture off`，只关闭关联回填则用 `--art-refill off`。
 
 `DEX-observations` 是事件里的 DEX 观测数，不是去重 DEX 数，不并入主扫描的 `DEX=` 汇总。fast 证据按会话/时刻追加，不随常规旧产物清理；256MiB 是每次运行的发布上限，复用目录会累计。
 
@@ -71,7 +71,7 @@ adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_fast
 
 ## 2026-10-20 Root Pixel 6 对照结果
 
-Android 16 / SDK 36、KernelSU Root，SELinux 始终 Enforcing。最终 ARM64 二进制 SHA-256：`d5e861761f7c4a478be9848008480f14f395ad32f71dabcf34e4caf9e59ecbe0`，已部署 `/data/local/tmp/nhdd_root_next`。未向第三方 App 注入或改写内存。
+Android 16 / SDK 36、KernelSU Root，SELinux 始终 Enforcing。该阶段验证的 ARM64 二进制 SHA-256：`d5e861761f7c4a478be9848008480f14f395ad32f71dabcf34e4caf9e59ecbe0`，验证时部署 `/data/local/tmp/nhdd_root_next`；后续 ART 回填版本的结果另记于关联回填文档。未向第三方 App 注入或改写内存。
 
 每列是一轮独立运行、每档 10 次；“命中”要求地址与该轮 golden SHA-256 同时相符，不是数导出文件：
 

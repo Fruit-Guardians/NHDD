@@ -43,6 +43,7 @@
 |---|---|
 | DEX 提取与修复 | 标准扫描或 `--relaxed` 弱化 magic 依赖；跨轮补齐缺页，保留不同内容 revision，导出 raw / fixed 副本 |
 | ART 辅助 DEX 发现 | 对已适配的 libdexfile Build ID 扫描 StandardDexFile 对象特征，通过运行时长度、缓存表与 map_list 交叉发现擦头 DEX；不注入、不调用目标方法 |
+| ART 关联方法回填 | 把无头快速片段关联到已发现候选，仅回填双读一致的完整方法指令区，并双遍复核其余字节；另存有来源的跨时刻重建副本 |
 | 完整度与结构检查 | 记录字节覆盖率、缺失区间；检查 DEX 表、索引、class_data、code/debug 边界以及 SHA-1 / Adler32 |
 | SO 重建 | 支持 ELF32/64，按 `PT_LOAD / load bias` 恢复文件布局；区分完整重建和缺页残件 |
 | 冷启动与多进程跟随 | 启动前布置事件源，跟随包名进程、子进程及已经发现的改名后代；隔离 PID 复用 |
@@ -149,6 +150,8 @@ adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_live
 
 快速路径默认随 continuous 的 tracefs 后端开启，在主扫描忙时也尝试立即保存事件范围。输出位于 `fast/`，包含两次读取的局部原始字节、逐页覆盖和一致性标记；只有完全包含在某一次读取中的标准 DEX 才另存 raw/fixed 副本。默认每事件取前 1MiB，可用 `--fast-max-kb 4..8192` 调整；用 `--fast-capture off` 做关闭对照。双读相同不等于原子快照，轮询回退不具备该能力。预算、输出说明及真机对照见[快速捕获说明](docs/fast-capture.md)。
 
+已适配 ART 构建上，`--art-refill auto` 默认把快速片段与已发现、字节完整的 ART 候选关联：即使事件页面没有 DEX 头，也可恢复边界已知的方法指令区。恢复前后复核对象/头部锚点及映射 backing，未替换区域须与固定基线双遍相同；另存 `*.refilled.raw.dex / *.refilled.fixed.dex / *.refill.json`，不覆盖主扫描、不向目标写入。此结果是**跨时刻重建副本，不是完整明文保证或原子快照**。可用 `--art-refill off` 单独关闭；限制和真机复现见 [ART 关联回填](docs/art-refill.md)。
+
 ### 查找 JNI 绑定
 
 先写目标与输出目录，再写可选的 JNI 模块筛选参数：
@@ -193,6 +196,7 @@ adb shell "/data/local/tmp/nhdd --verify /data/local/tmp/example.odex"
 | `--events auto\|tracefs\|poll` | 选择事件后端，自动开启 continuous |
 | `--fast-capture auto\|off` | 默认 auto；continuous + tracefs 的采集线程局部双读，不另行开启 continuous |
 | `--fast-max-kb N` | 每事件读取前缀上限，默认 1024 KiB，范围 4–8192；两遍共用 8ms 软预算 |
+| `--art-refill auto\|off` | 默认 auto；须同时启用 ART 发现、快速捕获与 tracefs，保守重建已知完整方法指令区 |
 | `--monitor-interval T` | continuous 周期检查间隔，默认 2 秒 |
 | `--monitor-duration S` | continuous 调度时长，默认 0，即不限时 |
 | `--monitor-verbose` | 输出详细监控日志 |
@@ -246,7 +250,7 @@ nhdd_demo/
 │   ├── *.raw.bin                # 可用时附带的原始 load-layout
 │   └── *.json                   # segments、holes、load bias、manifest 等
 ├── maps/                       # 使用 --save-maps 等选项时生成
-├── fast/                       # 局部双读 .bin / .json，完全包含的 DEX 另存 raw/fixed
+├── fast/                       # 局部双读 .bin / .json、独立完整 DEX、ART 关联回填及其基线/来源
 ├── jnimap/                     # JNI 候选绑定及函数指针 JSONL
 └── timeline.jsonl              # continuous 的映射与系统调用时间线
 ```
@@ -260,6 +264,7 @@ nhdd_demo/
 - `manifest_<pid>_g<starttime>.json`：记录 SO 发布状态；continuous 同时记录会话累计和最近一次扫描。
 - `timeline.jsonl`：判断变化、捕获时机、事件丢失与采样状态；丢失后补扫不能补回已经消失的明文。
 - `fast/*.json`：`two_reads_match / changed_between_reads / partial_reads` 分别表达双读相同、变化与不完整；同时看 `truncated`、逐页长度与 DEX 子项的独立一致性。二进制中不可读部分补零，只能按页覆盖解释，不能视为有效原始字节。该路径不与多轮 DEX 缓存盲拼，计数见 `Fast capture`，不并入主扫描的唯一 DEX 数。
+- `*.refill.json`：ART 关联的 `reconstructed_method_composite`，保留基线、源片段、方法索引与字节偏移、校验时刻；`plaintext_proven:false` 不表示算法已证明解密。它与完整的单次/多轮观测有区别，独立计入 `ART refill`。拒绝原因在源片段的 `art_associations` 或 `*.rejected.json`。
 
 ### 当前格式支持
 
@@ -297,7 +302,7 @@ $nhddNdk = "C:/Android/android-ndk-r27"
 make test
 ```
 
-九组测试覆盖 DEX 合并、ELF 重建、maps 变化、manifest、进程跟随、syscall、格式检查、ART 对象发现与局部双读反例。设备夹具和实现细节见[源码说明](src/README.md)与[技术设计](docs/design.md)。
+十组测试覆盖 DEX 合并、ELF 重建、maps 变化、manifest、进程跟随、syscall、格式检查、ART 对象发现、局部双读与关联回填反例。设备夹具和实现细节见[源码说明](src/README.md)与[技术设计](docs/design.md)。
 
 ## 常见问题
 
@@ -326,6 +331,7 @@ OAT 只导出明确标记的头部证据；系统/APEX/vendor 的 runtime 格式
 - [技术设计与验证边界](docs/design.md)
 - [ART 辅助 DEX 发现与真机复现](docs/art-discovery.md)
 - [快速局部捕获、一致性与短窗口真机对照](docs/fast-capture.md)
+- [ART 候选关联、方法回填与安全边界](docs/art-refill.md)
 - [源码模块与维护约束](src/README.md)
 - [README 徽章制作方法](docs/badges.md)
 - [提交问题](https://github.com/Fruit-Guardians/NHDD/issues)：建议附设备 ABI、Android/ART 版本、命令、错误日志和脱敏 metadata，不要公开未授权 APK 或私有内存产物。

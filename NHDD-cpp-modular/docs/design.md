@@ -51,6 +51,8 @@
 
 ### 5. DEX 结构检查与 ART 格式识别
 
+ART 候选与快速捕获的可选关联见 [ART 关联回填](art-refill.md)：只从完整的已验证候选建立固定基线，在对象/头部锚点和 backing 复核后，以单个事件中完整、双读相同的 insns 区域生成 temporal composite；不修改主 DEX 合并缓存的世代规则，不把不同方法窗口盲拼成“全明文 DEX”。
+
 - 完整 DEX 的 metadata schema 为 2，同时记录原始和 fixed 副本的 `semantic`。验证标准 DEX 035/037/038/039/040 的 header/map_list、表范围/重叠、索引、MUTF-8 字符串、type_list、class_data/成员归属、code_item/try/catch 和 debug_info 引用边界，并分别核对 SHA-1/Adler32。
 - 结构检查有独立工作预算，耗尽时明确失败。`structural_checks_passed` 仅表示这些静态检查通过，不包含完整指令/类型验证、完整 annotation/encoded-value 图验证或 ART 装载验证；`art_accepted` 始终为 null，`bytecode_type_verified` 为 false。DEX 041 container 暂标 unsupported，不猜测解释为旧格式。
 - DEX 扫描同时识别并保留应用/匿名内存中的 CompactDex、VDEX 和 OAT 证据。CompactDex 001 检查扩展头、ID 表与共享数据范围；不转换为标准 DEX。VDEX 006/010/019/021/027 检查版本对应的 section 布局，并列出内嵌 DEX/CDEX 偏移和检查结果；普通 DEX 扫描也会提取其中的 DEX。
