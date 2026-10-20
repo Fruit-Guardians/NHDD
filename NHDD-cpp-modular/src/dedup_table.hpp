@@ -1,7 +1,11 @@
 // dedup_table.hpp — cross-process/snapshot deduplication tables
 #pragma once
 
+#include <cstdint>
 #include <cstring>
+#include <list>
+#include <string>
+#include <unordered_map>
 #include "common_types.hpp"
 
 // DEX dedup by 20-byte SHA-1 signature
@@ -38,41 +42,62 @@ private:
     int count_ = 0;
 };
 
-// SO dedup by maps path
+// SO evidence-key dedup with bounded LRU retention. A hit becomes MRU so a
+// long-running continuous session does not immediately forget hot artifacts.
 class SoDedup {
 public:
-    explicit SoDedup(int max_entries = kDedupSoMax) : max_(max_entries) {
-        paths_ = new char[max_ * 512];
-    }
-    ~SoDedup() { delete[] paths_; }
+    explicit SoDedup(int max_entries = kDedupSoMax)
+        : max_(max_entries > 0 ? static_cast<size_t>(max_entries) : 0) {}
 
-    bool seen(const char* path) const {
-        if (!path || !*path) return false;
-        for (int i = 0; i < count_; i++)
-            if (std::strcmp(paths_ + i * 512, path) == 0)
-                return true;
-        return false;
+    bool seen(const char* key) {
+        if (!key || !*key) return false;
+        auto found = entries_.find(key);
+        if (found == entries_.end()) return false;
+        lru_.splice(lru_.end(), lru_, found->second);
+        return true;
     }
 
-    void remember(const char* path) {
-        if (!path || !*path) return;
-        if (count_ < max_) {
-            std::strncpy(paths_ + count_ * 512, path, 511);
-            (paths_ + count_ * 512)[511] = '\0';
-            count_++;
+    // Returns true when the oldest entry had to be evicted.
+    bool remember(const char* key) {
+        if (!key || !*key || max_ == 0) return false;
+        auto found = entries_.find(key);
+        if (found != entries_.end()) {
+            lru_.splice(lru_.end(), lru_, found->second);
+            return false;
         }
+
+        bool evicted = false;
+        if (entries_.size() >= max_) {
+            entries_.erase(lru_.front());
+            lru_.pop_front();
+            ++eviction_count_;
+            evicted = true;
+        }
+        lru_.emplace_back(key);
+        auto inserted = lru_.end();
+        --inserted;
+        entries_.emplace(*inserted, inserted);
+        return evicted;
     }
 
-    int count() const { return count_; }
-    void reset() { count_ = 0; }
+    int count() const { return static_cast<int>(entries_.size()); }
+    size_t capacity() const { return max_; }
+    uint64_t eviction_count() const { return eviction_count_; }
+    void reset() {
+        entries_.clear();
+        lru_.clear();
+        eviction_count_ = 0;
+    }
 
     SoDedup(const SoDedup&) = delete;
     SoDedup& operator=(const SoDedup&) = delete;
 
 private:
-    char* paths_;
-    int max_;
-    int count_ = 0;
+    using LruList = std::list<std::string>;
+    size_t max_ = 0;
+    LruList lru_;
+    std::unordered_map<std::string, LruList::iterator> entries_;
+    uint64_t eviction_count_ = 0;
 };
 
 // JNI key dedup

@@ -10,12 +10,17 @@
 #include <string>
 #include <unordered_map>
 #include <algorithm>
+#include <limits>
+#include <unistd.h>
 #include "common_types.hpp"
 #include "maps_parser.hpp"
 #include "process_memory.hpp"
 #include "object_classifier.hpp"
 #include "dedup_table.hpp"
 #include "nhdd_config.hpp"
+#include "artifact_transaction.hpp"
+#include "jni_artifact_identity.hpp"
+#include "process_generation_guard.hpp"
 
 class JniMapScanner {
 public:
@@ -40,13 +45,16 @@ public:
     //   4) cache name/signature cstring reads.
     static int scan(pid_t target_pid, const char* pid_str, const char* pkg,
                      ProcessMemory& pm, const MapsParser::RegionList* ml,
-                     const char* jni_dir, JniDedup& dedup) {
-        (void)target_pid; // pid is accessed via pm.get_pid()
+                     const char* jni_dir, JniDedup& dedup,
+                     const ScanScope* scope = nullptr,
+                     ProcessGenerationGuardInline* generation = nullptr,
+                     uint64_t process_start_time = 0) {
         if (sizeof(uintptr_t) != 8) {
             std::fprintf(stderr, "[-] JNIMAP expects 64-bit process pointers\n");
             return 0;
         }
         if (!ml || !ml->regs || ml->count == 0) return 0;
+        if (generation && !generation->verify()) return 0;
 
         auto& cfg = NhddConfig::instance();
         const bool has_lib_filter = cfg.jnimap_module[0] != '\0';
@@ -65,8 +73,20 @@ public:
         std::vector<const MapsRegion*> scan_regions;
         scan_regions.reserve(ml->count);
         size_t scan_bytes = 0;
+        bool executable_dependency_changed = false;
+        if (scope && scope->incremental) {
+            for (size_t i = 0; i < scope->count; ++i) {
+                if (scope->ranges[i].executable) {
+                    executable_dependency_changed = true;
+                    break;
+                }
+            }
+        }
         for (size_t i = 0; i < ml->count; i++) {
             const MapsRegion* r = &ml->regs[i];
+            if (scope && scope->incremental &&
+                !scope->intersects(r->start, r->end) &&
+                !executable_dependency_changed) continue;
             if (!table_region_candidate(r, pkg, has_lib_filter)) continue;
             scan_regions.push_back(r);
             scan_bytes += static_cast<size_t>(r->end - r->start);
@@ -103,8 +123,10 @@ public:
         size_t str_hits = 0;
 
         for (const MapsRegion* r : scan_regions) {
+            if (generation && !generation->verify()) break;
             const size_t region_size = static_cast<size_t>(r->end - r->start);
             for (uintptr_t addr = r->start; addr < r->end; addr += kChunk) {
+                if (generation && generation->invalid) break;
                 size_t to_read = kChunk + 24;
                 if (addr + to_read > r->end)
                     to_read = static_cast<size_t>(r->end - addr);
@@ -116,10 +138,18 @@ public:
 
                 const size_t got = static_cast<size_t>(n);
                 for (size_t off = 0; off + 24 <= got; off += 8) {
-                    uintptr_t name_ptr = 0, sig_ptr = 0, fn_ptr = 0;
-                    std::memcpy(&name_ptr, buf + off, 8);
-                    std::memcpy(&sig_ptr,  buf + off + 8, 8);
-                    std::memcpy(&fn_ptr,   buf + off + 16, 8);
+                    uint64_t raw_name_ptr = 0, raw_sig_ptr = 0, raw_fn_ptr = 0;
+                    std::memcpy(&raw_name_ptr, buf + off, 8);
+                    std::memcpy(&raw_sig_ptr,  buf + off + 8, 8);
+                    std::memcpy(&raw_fn_ptr,   buf + off + 16, 8);
+                    if (raw_name_ptr > std::numeric_limits<uintptr_t>::max() ||
+                        raw_sig_ptr > std::numeric_limits<uintptr_t>::max() ||
+                        raw_fn_ptr > std::numeric_limits<uintptr_t>::max()) {
+                        continue;
+                    }
+                    const uintptr_t name_ptr = static_cast<uintptr_t>(raw_name_ptr);
+                    const uintptr_t sig_ptr = static_cast<uintptr_t>(raw_sig_ptr);
+                    const uintptr_t fn_ptr = static_cast<uintptr_t>(raw_fn_ptr);
 
                     // arm64 function pointers are 4-byte aligned. Reject obvious junk fast.
                     if ((fn_ptr & 3) != 0) continue;
@@ -167,6 +197,7 @@ public:
                     std::snprintf(c->module, sizeof(c->module), "%s",
                                   basename(er->region->path));
                 }
+                if (generation && !generation->verify()) break;
                 bytes_done += to_read;
 
                 time_t now = std::time(nullptr);
@@ -191,12 +222,18 @@ public:
             pid_str, count, fn_hits, str_hits, str_cache.size());
         std::fflush(stderr);
 
+        if (generation && !generation->verify()) {
+            std::free(arr);
+            return 0;
+        }
+
         if (count == 0) {
             // No standard JNINativeMethod found, but fnPtr hits exist.
             // Dump raw fnPtr addresses for manual IDA analysis.
             if (fn_hits > 0) {
                 write_fnptr_dump(jni_dir, pid_str, scan_regions, exec_ranges,
-                                 pm, dedup, target_pid);
+                                 pm, dedup, target_pid, generation,
+                                 process_start_time);
             }
             std::free(arr);
             return 0;
@@ -213,13 +250,29 @@ public:
         });
 
         char outpath[768];
-        std::snprintf(outpath, sizeof(outpath), "%s/jnimap_%s.jsonl",
-                      jni_dir, pid_str);
-        FILE* out = std::fopen(outpath, "a");
-        if (!out) { std::free(arr); return 0; }
+        std::snprintf(outpath, sizeof(outpath),
+                      "%s/jnimap_%s_g%llu.jsonl", jni_dir, pid_str,
+                      static_cast<unsigned long long>(process_start_time));
+        const std::string temporary_path =
+            artifact_sidecar_path_inline(outpath, "tmp");
+        (void)std::remove(temporary_path.c_str());
+        const bool output_existed = artifact_file_exists_inline(outpath);
+        if (output_existed &&
+            !artifact_copy_file_inline(outpath, temporary_path.c_str())) {
+            std::free(arr);
+            return 0;
+        }
+        FILE* out = std::fopen(temporary_path.c_str(),
+                               output_existed ? "ab" : "wb");
+        if (!out) {
+            (void)std::remove(temporary_path.c_str());
+            std::free(arr);
+            return 0;
+        }
 
         int written = 0;
         int groups = 0;
+        std::vector<std::string> pending_keys;
         for (int i = 0; i < count; ) {
             int j = i + 1;
             while (j < count &&
@@ -231,18 +284,26 @@ public:
                 for (int k = i; k < j; k++) {
                     Candidate* c = &arr[k];
                     char key[384];
-                    std::snprintf(key, sizeof(key), "%s|%s|%s|%lx",
-                                  c->name, c->sig, c->module,
-                                  static_cast<unsigned long>(c->offset));
+                    if (!jni_format_dedup_key_inline(
+                            key, sizeof(key),
+                            static_cast<uint32_t>(target_pid),
+                            process_start_time, c->name, c->sig, c->module,
+                            c->offset)) {
+                        continue;
+                    }
                     if (dedup.seen(key)) continue;
-                    dedup.remember(key);
+                    if (std::find(pending_keys.begin(), pending_keys.end(), key) !=
+                        pending_keys.end()) continue;
+                    pending_keys.emplace_back(key);
 
                     std::fprintf(out,
                         "{\"pid\":\"%s\",\"table\":\"0x%lx\","
+                        "\"process_start_time_ticks\":%llu,"
                         "\"group_start\":\"0x%lx\",\"group_len\":%d,"
                         "\"index\":%d,\"name\":\"",
                         pid_str,
                         static_cast<unsigned long>(c->table_addr),
+                        static_cast<unsigned long long>(process_start_time),
                         static_cast<unsigned long>(arr[i].table_addr),
                         group_len, k - i);
                     json_escape(out, c->name);
@@ -264,7 +325,25 @@ public:
             }
             i = j;
         }
-        std::fclose(out);
+        bool output_ok = std::fflush(out) == 0 && ::fsync(::fileno(out)) == 0;
+        if (generation && !generation->verify()) output_ok = false;
+        if (std::fclose(out) != 0) output_ok = false;
+        if (output_ok) {
+            std::vector<ArtifactTransactionEntryInline> publications;
+            publications.emplace_back(outpath, temporary_path.c_str());
+            output_ok = artifact_publish_transaction_inline(
+                &publications,
+                generation ? &process_generation_publish_guard_inline
+                           : nullptr,
+                generation);
+        }
+        if (output_ok) {
+            for (const std::string& key : pending_keys)
+                dedup.remember(key.c_str());
+        } else {
+            (void)std::remove(temporary_path.c_str());
+            written = 0;
+        }
 
         if (written > 0) {
             std::printf("[+] JNIMAP: %s (%d entries, %d groups) pid=%s%s%s\n",
@@ -511,7 +590,10 @@ private:
     static int write_fnptr_dump(const char* jni_dir, const char* pid_str,
                                 const std::vector<const MapsRegion*>& scan_regions,
                                 const std::vector<ExecRange>& exec_ranges,
-                                ProcessMemory& pm, JniDedup& /*dedup*/, pid_t /*target_pid*/) {
+                                ProcessMemory& pm, JniDedup& /*dedup*/,
+                                pid_t /*target_pid*/,
+                                ProcessGenerationGuardInline* generation,
+                                uint64_t process_start_time) {
         struct FnPtrHit {
             uintptr_t table_addr;
             uintptr_t fn_ptr;
@@ -535,7 +617,9 @@ private:
         if (!hits) { std::free(buf); return -1; }
 
         for (const MapsRegion* r : scan_regions) {
+            if (generation && !generation->verify()) break;
             for (uintptr_t addr = r->start; addr < r->end; addr += kChunk) {
+                if (generation && generation->invalid) break;
                 size_t to_read = kChunk + 24;
                 if (addr + to_read > r->end)
                     to_read = static_cast<size_t>(r->end - addr);
@@ -543,20 +627,18 @@ private:
                 if (n < 24) continue;
                 const size_t got = static_cast<size_t>(n);
                 for (size_t off = 0; off + 24 <= got; off += 8) {
-                    uintptr_t fn_ptr = 0;
-                    std::memcpy(&fn_ptr, buf + off + 16, 8);
+                    uint64_t raw_fn_ptr = 0;
+                    std::memcpy(&raw_fn_ptr, buf + off + 16, 8);
+                    if (raw_fn_ptr > std::numeric_limits<uintptr_t>::max())
+                        continue;
+                    const uintptr_t fn_ptr = static_cast<uintptr_t>(raw_fn_ptr);
                     if ((fn_ptr & 3) != 0) continue;
                     const ExecRange* er = find_exec_range(exec_ranges, fn_ptr);
                     if (!er) continue;
 
                     if (count >= cap) {
-                        cap *= 2;
-                        auto* nh = static_cast<FnPtrHit*>(
-                            std::realloc(hits, static_cast<size_t>(cap) * sizeof(FnPtrHit)));
-                        if (!nh) goto done;
-                        hits = nh;
-                        std::memset(hits + count / 2, 0,
-                                    static_cast<size_t>(cap - count) * sizeof(FnPtrHit));
+                        if (!jni_grow_zeroed_buffer_inline(&hits, &cap))
+                            goto done;
                     }
 
                     FnPtrHit* h = &hits[count++];
@@ -574,11 +656,16 @@ private:
                     std::snprintf(h->module, sizeof(h->module), "%s",
                                   basename(er->region->path));
                 }
+                if (generation && !generation->verify()) break;
             }
         }
 
     done:
         std::free(buf);
+        if (generation && !generation->verify()) {
+            std::free(hits);
+            return 0;
+        }
         if (count == 0) { std::free(hits); return 0; }
 
         // Sort by table_addr
@@ -592,8 +679,13 @@ private:
         });
 
         char outpath[768];
-        std::snprintf(outpath, sizeof(outpath), "%s/fnptrs_%s.jsonl", jni_dir, pid_str);
-        FILE* out = std::fopen(outpath, "w");
+        std::snprintf(outpath, sizeof(outpath),
+                      "%s/fnptrs_%s_g%llu.jsonl", jni_dir, pid_str,
+                      static_cast<unsigned long long>(process_start_time));
+        const std::string temporary_path =
+            artifact_sidecar_path_inline(outpath, "tmp");
+        (void)std::remove(temporary_path.c_str());
+        FILE* out = std::fopen(temporary_path.c_str(), "w");
         if (!out) { std::free(hits); return -1; }
 
         int written = 0;
@@ -609,12 +701,14 @@ private:
                     FnPtrHit* h = &hits[k];
                     std::fprintf(out,
                         "{\"pid\":\"%s\","
+                        "\"process_start_time_ticks\":%llu,"
                         "\"target_so\":\"%s\","
                         "\"group_id\":%d,\"group_len\":%d,\"group_index\":%d,"
                         "\"table_addr\":\"0x%lx\",\"entry_addr\":\"0x%lx\","
                         "\"fn\":\"0x%lx\",\"offset\":\"0x%lx\","
                         "\"module\":\"",
                         pid_str,
+                        static_cast<unsigned long long>(process_start_time),
                         NhddConfig::instance().target_so[0]
                             ? NhddConfig::instance().target_so : "unknown",
                         group_id, group_len, k - i,
@@ -640,11 +734,26 @@ private:
             }
             i = j;
         }
-        std::fclose(out);
+        bool output_ok = std::fflush(out) == 0 && ::fsync(::fileno(out)) == 0;
+        if (generation && !generation->verify()) output_ok = false;
+        if (std::fclose(out) != 0) output_ok = false;
+        if (output_ok) {
+            std::vector<ArtifactTransactionEntryInline> publications;
+            publications.emplace_back(outpath, temporary_path.c_str());
+            output_ok = artifact_publish_transaction_inline(
+                &publications,
+                generation ? &process_generation_publish_guard_inline
+                           : nullptr,
+                generation);
+        }
+        if (!output_ok) {
+            (void)std::remove(temporary_path.c_str());
+            written = 0;
+        }
 
         if (written > 0) {
             std::printf("[+] FNPTRS: %s (%d entries, %d groups) pid=%s\n",
-                        outpath, count, written, pid_str);
+                        outpath, written, group_id, pid_str);
             std::fprintf(stderr,
                 "[*] FNPTRS pid=%s: wrote %d fnPtr-only entries (no name/sig found). "
                 "Match offsets in IDA manually.\n",

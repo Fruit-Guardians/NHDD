@@ -42,12 +42,14 @@ public:
     // Recover real DEX file_size by walking map_list in memory buffer
     static uint32_t recover_size_from_map_buf(const uint8_t* img, size_t cap,
                                                uint32_t map_off) {
-        if (map_off < 0x70 || map_off + 4 > cap) return 0;
+        if (!img || map_off < 0x70 || static_cast<size_t>(map_off) > cap ||
+            cap - static_cast<size_t>(map_off) < 4) return 0;
         uint32_t count = 0;
         std::memcpy(&count, img + map_off, 4);
         if (count == 0 || count > 50) return 0;
-        uint32_t map_end = map_off + 4 + count * 12;
-        if (map_end > cap) return 0;
+        const size_t table_start = static_cast<size_t>(map_off) + 4;
+        if (static_cast<size_t>(count) > (cap - table_start) / 12) return 0;
+        const size_t map_end = table_start + static_cast<size_t>(count) * 12;
 
         uint32_t extent = 0;
         for (uint32_t i = 0; i < count; i++) {
@@ -63,7 +65,10 @@ public:
             uint64_t end = static_cast<uint64_t>(eoff) + static_cast<uint64_t>(ecount) * isz;
             if (end > extent && end <= 0x10000000) extent = static_cast<uint32_t>(end);
         }
-        if (map_end > extent) extent = map_end;
+        if (map_end > extent) {
+            if (map_end > 0x10000000u) return 0;
+            extent = static_cast<uint32_t>(map_end);
+        }
         if (extent < 0x70 || extent > 0x10000000) return 0;
         return extent;
     }
@@ -72,11 +77,14 @@ public:
     static bool confirm_by_map_list(const uint8_t* img, size_t cap,
                                      uint32_t map_off, uint32_t string_ids_off) {
         if (string_ids_off != 0x70) return false;
-        if (map_off < 0x70 || map_off + 4 > cap) return false;
+        if (!img || map_off < 0x70 || static_cast<size_t>(map_off) > cap ||
+            cap - static_cast<size_t>(map_off) < 4) return false;
         uint32_t count = 0;
         std::memcpy(&count, img + map_off, 4);
         if (count == 0 || count > 50) return false;
-        if (map_off + 4 + static_cast<size_t>(count) * 12 > cap) return false;
+        const size_t table_start = static_cast<size_t>(map_off) + 4;
+        if (static_cast<size_t>(count) > (cap - table_start) / 12)
+            return false;
         for (uint32_t i = 0; i < count; i++) {
             const uint8_t* ent = img + map_off + 4 + i * 12;
             uint16_t type = 0;
@@ -92,17 +100,20 @@ public:
     // Returns true if looks valid, sets out_size (0 = deferred recovery needed)
     static bool hit_valid(const uint8_t* buf, size_t n, size_t magic_off,
                            uint32_t* out_size) {
+        if (!buf || !out_size || magic_off > n || n - magic_off < 5)
+            return false;
         size_t v = magic_off + 4;
-        if (v >= n) return false;
         if (!std::isdigit(static_cast<unsigned char>(buf[v]))) return false;
 
         uint32_t dex_size = 0;
-        if (magic_off + 0x24 <= n) {
-            std::memcpy(&dex_size, buf + magic_off + 0x20, 4);
-        } else {
+        // The fields used below extend through class_defs_off at +0x64.
+        // A magic hit near the end of a scan page must be re-read by the
+        // caller instead of letting these memcpy calls cross the buffer.
+        if (magic_off > n || n - magic_off < 0x68) {
             *out_size = 0;
             return true;  // header crosses page, caller re-reads
         }
+        std::memcpy(&dex_size, buf + magic_off + 0x20, 4);
 
         uint32_t header_size = 0, string_ids_off = 0, class_defs_off = 0;
         std::memcpy(&header_size, buf + magic_off + 0x24, 4);
