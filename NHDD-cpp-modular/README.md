@@ -1,174 +1,304 @@
-# NHDD C++ Modular
+<p align="center">
+  <img src="assets/nhdd-mark.svg" alt="NHDD" width="104" height="104">
+</p>
 
-NHDD 是一个面向 Android 进程内存的无注入 DEX / SO / JNI 提取工具。当前版本仍然保持单二进制、命令行工作流；本轮重点提升提取结果本身，不引入平台化组件。
+<h1 align="center">NHDD</h1>
 
-## 本轮核心能力
+<p align="center"><strong>No-Hook DEX / SO Dumper</strong></p>
 
-### 1. DEX 多轮合并与完整度标记
+<h3 align="center">运行时提取，不向进程注入。</h3>
 
-- 以 `PID + 进程启动时间 + 地址 + maps backing/range 指纹 + DEX 大小 + 稳定头指纹` 标识候选，避免 PID 或虚拟地址复用串数据。
-- 跨轮补齐缺失字节，并复查已覆盖页面；若壳在原地址继续解密，会生成新的内容寻址 revision，已落盘的旧 revision 不被覆盖。
-- DEX magic/version、checksum、signature 与 file_size（`0x00..0x23`）的擦除或恢复只刷新这些易变头字节，不丢弃已捕获的正文覆盖；`0x24` 之后结构字段或正文的重叠变化仍会启动新字节世代，防止跨代拼接。
-- 未完整时发布 `*.partial.dex` 和 `*.meta.json`；metadata 包含精确 hole 范围、字节覆盖率和页面完整度。
-- 只有全部字节捕获完成后，才发布带内容哈希的 `*.raw.dex`、修复 checksum/header 的 `*.fixed.dex`，并参与内容去重；metadata 明确说明“完整”指字节覆盖完整。
-- 候选缓存默认限制为 256 项、512 MiB，采用“完整且已处理候选优先、其余按 LRU”的分层淘汰；每个候选的 revision 去重历史同样有界，防止长时间扫描无界增长。
+<p align="center">
+  面向 Android Root 的 DEX / SO 提取工具。<br>
+  多轮捕获 DEX，按段重建 SO，持续跟随运行时变化。
+</p>
 
-### 2. 基于 PT_LOAD / load bias 的 SO 重建
+<p align="center">
+  <img alt="Android · Root" src="assets/badges/nhdd-root.svg">
+  <img alt="ABI · ARM64 / ARMv7" src="assets/badges/nhdd-abi.svg">
+  <img alt="Capture · No Hook" src="assets/badges/nhdd-no-hook.svg">
+  <img alt="C++ · 17" src="assets/badges/nhdd-cpp.svg">
+</p>
 
-- 同时支持 little-endian ELF32 和 ELF64。
-- 从内存 ELF header 和最低 `PT_LOAD` 推导 load bias。
-- 按 `load_bias + p_vaddr` 读取远端内存，按 `p_offset` 写入重建文件。
-- 输出大小取 `max(p_offset + p_filesz)`；不会把 BSS 的 `p_memsz - p_filesz` 错写入文件。
-- 可跨多个 maps 恢复 segment，不再依赖 path/inode 聚合，因此能区分同一 APK 中的多个 SO 和同路径多实例。
-- 每个对象输出重建 SO 和 JSON metadata，并在 PT_LOAD 远端跨度不超过 256 MiB 时附带原始 load-layout；稀疏地址布局超过该上限时只省略可选 raw 文件，不影响按受控 `p_offset + p_filesz` 范围生成重建结果。完整覆盖才命名为 `*.reconstructed.so`，存在缺页时只发布 `*.partial.so`，不会把残件伪装成完整结果。
-- ELF header 和 program header table 本身属于强制恢复范围；metadata 以 `coverage_complete` 标记字节覆盖，并明确记录 live 读取的一致性模型。
-- Section table 只有在 section 0、所有条目范围、非 `SHT_NOBITS` 数据、`shstrtab` 及名称都可验证时才保留；否则将 `e_shoff/e_shnum/e_shstrndx` 归零，同时在 metadata 保留归一化前的 header 哈希和原始三字段作为证据身份。
-- SO 产物身份和文件名包含 `PID + process_starttime + ELF 地址 + evidence hash`；即使数字 PID、地址和内容被新进程复用，也不会误命中旧世代。raw layout 可用时，evidence hash 会混入其哈希；稀疏布局降级时则以 reconstructed hash 作为该分量的 fallback。两种情况都会继续混入归一化前的 ELF header/SHT 身份、恢复字节数与 holes，避免 section 字段被规范化后发生证据碰撞。
-- SO 发布去重采用有界 LRU；命中会提升为 MRU，容量淘汰会计数并输出节流日志，长期 continuous 运行不会因表满后停止记忆而反复发布同一产物。
+<p align="center">
+  <a href="#快速上手">快速上手</a> &nbsp;·&nbsp;
+  <a href="#功能介绍">功能介绍</a> &nbsp;·&nbsp;
+  <a href="#常用命令">使用说明</a> &nbsp;·&nbsp;
+  <a href="#输出说明">产物说明</a> &nbsp;·&nbsp;
+  <a href="docs/design.md">技术设计</a> &nbsp;·&nbsp;
+  <a href="https://github.com/Fruit-Guardians/NHDD/issues">问题反馈</a>
+</p>
 
-### 3. Continuous 增量扫描
+<p align="center"><sub>一个二进制，无需注入 Agent。仅用于自有或已获授权的应用。</sub></p>
 
-- 结构与权限快照覆盖所有 maps，包括匿名、named-anon、memfd、APK-backed 和普通文件映射。
-- 检测映射新增/删除、backing identity、权限变化、W→X，以及有预算的内容采样指纹变化。
-- 进程身份使用 `PID + /proc/<pid>/stat starttime`；maps 快照在采集前后复核，扫描器在打开 maps/mem 后及扫描结束时再次校验，避免 PID 重用把不同进程世代混入同一轮。
-- 包名目标可以跟随该包新启动的进程世代；直接指定数字 PID 时则固定在基线世代，目标退出或 PID 被复用后立即停止 continuous，绝不自动接管新进程。
-- 同一轮中每个 PID 最多触发一次扫描，DEX / SO / JNI 共用合并后的变化范围。
-- maps 差分中的删除事件不启动读取；tracefs 的 `munmap` entry 可额外尝试一次解除映射前读取，但目标不停顿，因此不保证地址在读取时仍存在。
-- 内容变化检测优先采样匿名/memfd/APK、`[heap]`、ashmem、`/data/` 和可执行/XOM 映射，预算有剩余时再覆盖普通可读映射；默认每次快照总预算 256 KiB、每个位置 64 B，并显式标记为 sampled，不会被误报成全映射哈希。
-- 每次快照和变化集记录内容采样是否请求/尝试、后端是否打开、是否实际可读、尝试与成功字节数、读取失败数和最后 errno。后端不可用或全部读取失败时会明确告警，但 maps 结构与权限监控仍继续运行。
-- `timeline.jsonl` 为每个事件同时记录 before/after backing identity（range、权限、path、inode、device、offset）及本轮采样状态；写入会检查 `fflush`、`ferror` 和 `fclose`，失败会在控制台报告。新 continuous 会话默认先截断旧时间线，只有 `--keep` 才追加。
+---
 
-### 4. Root 冷启动、多进程与系统调用事件
+本页介绍 `NHDD-cpp-modular` 中的 C++17 CLI。默认在目标进程外读取内存，不修改方法入口，不依赖 Frida、Xposed 或 ART Hook。旧版 C 程序及 TUI / GUI 不保证支持本页全部参数。
 
-- `--spawn` 为已停止的包解析 launcher activity，先启用事件源再执行 ActivityManager 启动；如果包已运行会报错。需要主动重启时使用 `--spawn-restart`，它会 force-stop 指定包。
-- 两者自动启用 continuous；等待首个进程默认 15 秒，可用 `--spawn-timeout 1..300` 调整。没有 launcher activity 的包会明确失败。
-- 包名按完整名称或 `package:subprocess` 边界匹配，每次调度最多间隔 100ms 重新发现进程；已经观测到的后代即使改名或被 reparent 也继续跟踪。世代由 PID/starttime 固定；从未观测到就已经退出的进程、在首次观测前改名且失去亲缘链的进程仍可能漏掉。
-- `--events auto`（continuous 默认）尝试在 tracefs 创建专用 `instances/nhdd_<writer_pid>`，订阅 `raw_syscalls` 的 mmap/mprotect/munmap/mremap；不修改全局 tracer 或其他实例。`--events tracefs` 要求内核后端成功，否则返回错误；`--events poll` 显式使用轮询。
-- 启动前尚无目标 PID 时会临时收集这些系统调用，再按目标进程身份筛选；发现目标后配置线程 PID 过滤，并使用 `event-fork` 继承新线程/后代。Android ARM64 支持原生及兼容 ARM32 syscall 编号；ARMv7 构建支持 ARM32，Linux x86_64 支持原生 syscall。
-- 成功 syscall 的 entry/exit 按 TID、TGID/starttime 和 boot 时间配对，失败返回值不产生成功事件。相邻范围合并成一次增量扫描；即使 maps 恢复原状且抽样哈希未变，也保留 syscall 触发范围。mmap 重用、munmap、mremap 旧地址会失效对应 DEX 合并缓存。
-- 专用读取线程在大对象扫描期间继续排空内核缓冲；用户态队列上限 16MiB、单批输出最多 8192 个事件。丢失/溢出会报告并执行全量补扫，不能补回已经消失的短暂明文窗口。
-- 时间线增加 `memory_syscall` 事件，记录 syscall、enter_best_effort/exit_success、boot 时间、地址、权限及旧映射范围。SIGINT/SIGTERM 正常退出时停止并移除本工具 tracing instance；SIGKILL/系统崩溃无法执行清理，可能留下本工具实例。
+> 无注入不等于不可检测；字节完整也不等于方法已经解密。使用前请阅读[能力边界](#常见问题)。
 
-### 5. DEX 结构检查与 ART 格式识别
+## 功能介绍
 
-- 完整 DEX 的 metadata schema 为 2，同时记录原始和 fixed 副本的 `semantic`。验证标准 DEX 035/037/038/039/040 的 header/map_list、表范围/重叠、索引、MUTF-8 字符串、type_list、class_data/成员归属、code_item/try/catch 和 debug_info 引用边界，并分别核对 SHA-1/Adler32。
-- 结构检查有独立工作预算，耗尽时明确失败。`structural_checks_passed` 仅表示这些静态检查通过，不包含完整指令/类型验证、完整 annotation/encoded-value 图验证或 ART 装载验证；`art_accepted` 始终为 null，`bytecode_type_verified` 为 false。DEX 041 container 暂标 unsupported，不猜测解释为旧格式。
-- DEX 扫描同时识别并保留应用/匿名内存中的 CompactDex、VDEX 和 OAT 证据。CompactDex 001 检查扩展头、ID 表与共享数据范围；不转换为标准 DEX。VDEX 006/010/019/021/027 检查版本对应的 section 布局，并列出内嵌 DEX/CDEX 偏移和检查结果；普通 DEX 扫描也会提取其中的 DEX。
-- OAT 170/195/230/259/262/265/275/279 检查版本对应的 header、key/value 和可验证的偏移；运行时只保存明确命名的 `*.oat-header.bin`，不将 header 片段冒充完整 OAT。OAT 编译代码通常还需要配套 VDEX/DEX，当前不做反编译还原或反 quickening。
-- OAT 279 按实机确认的 72 字节固定头解析；处理 `apex-versions`（1024 B）、`dex2oat-cmdline`（2048 B）的值预留区，检查终止符、长度及零填充。检查 ISA、DEX 目录最小范围、代码区/BCP/trampoline 偏移；完整 ELF 输入还核对 `base_file_offset` 与实际 payload 位置。JSON 的 `oat_header` 输出头长、KV 长度/实际键值对数、目录和代码偏移；偏移基准为 OAT header，换算 ELF 文件偏移需加 `base_file_offset`。这些检查不验证完整 OatDexFile 目录、编译指令或重定位语义。
-- 未知版本保留有限 header 证据并标记 unsupported；单个 runtime-format 声明范围超过 64MiB 时降级 header-only。内存缺页会标记 invalid/incomplete，不能成为格式验证成功。系统/APEX/vendor runtime 格式默认不额外导出；普通 DEX/SO 行为沿用原策略。
-- `--verify FILE` 不需要设备或 root，输出 JSON：退出码 0 为所声明检查通过、2 为无效/不完整、3 为未知格式/版本、1 为 I/O 错误。标准 DEX 的退出码还要求 SHA-1 和 Adler32 均通过；metadata 的结构状态和这两个完整性标志独立表达，便于识别运行时合法修改。支持 ELF 文件中的 OAT payload 定位，报告其 payload_offset；不执行待检代码。
+| 功能 | 可以做什么 |
+|---|---|
+| DEX 提取与修复 | 标准扫描或 `--relaxed` 弱化 magic 依赖；跨轮补齐缺页，保留不同内容 revision，导出 raw / fixed 副本 |
+| 完整度与结构检查 | 记录字节覆盖率、缺失区间；检查 DEX 表、索引、class_data、code/debug 边界以及 SHA-1 / Adler32 |
+| SO 重建 | 支持 ELF32/64，按 `PT_LOAD / load bias` 恢复文件布局；区分完整重建和缺页残件 |
+| 冷启动与多进程跟随 | 启动前布置事件源，跟随包名进程、子进程及已经发现的改名后代；隔离 PID 复用 |
+| 事件驱动增量捕获 | 结合 mmap / mprotect / munmap / mremap、映射与权限变化、内容采样触发扫描 |
+| JNI 绑定发现 | 无 Hook 扫描 `JNINativeMethod` 表，导出候选绑定和函数指针；支持按 SO 筛选 |
+| ART 格式识别 | 保留 CompactDex / VDEX / OAT 原生证据，包含 OAT 279 头部与偏移检查 |
+| 离线校验 | `--verify FILE` 输出 JSON，不启动或执行待检代码 |
 
-对应布局依据：[AOSP DEX 格式](https://source.android.com/docs/core/runtime/dex-format)、[CompactDex](https://android.googlesource.com/platform/art/+/refs/heads/main/libdexfile/dex/compact_dex_file.h)、[VDEX](https://android.googlesource.com/platform/art/+/refs/heads/main/runtime/vdex_file.h)、[OAT](https://android.googlesource.com/platform/art/+/refs/heads/main/runtime/oat/oat.h)、[Linux tracefs](https://docs.kernel.org/trace/ftrace.html)。
+“字节完整”“静态结构检查通过”“ART 可装载”“业务方法已解密”不是同一件事。NHDD 会分别表达已知状态，不把格式识别当作完整脱壳。
 
-## 构建与测试
+## 快速上手
 
-Android ARM64：
+### 1. 准备环境与二进制
+
+- 主机安装 Android Platform Tools，能通过 `adb devices` 看到设备。
+- 设备已 Root，且授权 `adb shell` 使用 `su`；系统策略允许访问目标进程内存。
+- 准备与设备 ABI 匹配的 **C++ CLI** 二进制 `nhdd`；没有二进制时见[从源码构建](#从源码构建)。
+- ARM64 是主要真机验证环境；ARMv7 已通过交叉编译检查，JNI 扫描主要面向 ARM64。
+
+```bash
+adb devices
+adb shell "su -c id"
+adb push nhdd /data/local/tmp/nhdd
+adb shell chmod 755 /data/local/tmp/nhdd
+adb shell /data/local/tmp/nhdd --help
+```
+
+最后一条应能看到 `--spawn`、`--events`、`--verify` 等参数，否则可能部署了旧版二进制。
+
+### 2. 提取正在运行的应用
+
+手动打开自己的测试 App，将下例 `com.example.app` 替换为真实包名：
+
+```bash
+adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_demo --all --watch 3 --relaxed'"
+```
+
+随后在 App 中进入需要分析的页面，触发功能或动态模块加载。命令同时提取 DEX 和 SO；`--watch 3` 在连续 3 轮没有新产物或 DEX 覆盖进展后停止，默认还受 60 轮 / 120 秒上限约束。
+
+### 3. 拉取结果
+
+```bash
+adb pull /data/local/tmp/nhdd_demo ./nhdd_demo
+```
+
+若提示 `Permission denied`，Root 写出的产物可能不允许 shell 用户读取。确认路径仅是本次输出目录后，再授予读取权限并重试：
+
+```bash
+adb shell "su -c 'chmod -R a+rX /data/local/tmp/nhdd_demo'"
+adb pull /data/local/tmp/nhdd_demo ./nhdd_demo
+```
+
+产物可能包含应用私有数据，请妥善保存。优先查看 `dex/*.meta.json`、`so/*.json`，再选择完整副本进行分析。
+
+## 常用命令
+
+下面每条命令使用独立输出目录。复用旧目录前请阅读 [`--keep` 说明](#参数速查)。
+
+### 只提取 DEX 或 SO
+
+```bash
+adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dex --dex --watch 3 --relaxed'"
+adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_so --so --snapshot 2 --interval 1'"
+```
+
+也可用 PID 替换包名，例如 `12345`。PID 模式不会自动跟随其他进程；continuous 中目标退出或 PID 世代变化后停止。
+
+### 冷启动并持续捕获
+
+应用尚未运行时：
+
+```bash
+adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_spawn --spawn --all --relaxed --events auto --monitor-duration 30'"
+```
+
+应用已经运行、且允许强制重启时：
+
+```bash
+adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_restart --spawn-restart --all --relaxed --events auto --monitor-duration 30'"
+```
+
+`--spawn-restart` 会 force-stop 指定应用，可能打断当前任务。两种启动方式都要求包具有 launcher activity；`--spawn` 只提前布置事件源，不会冻结新进程。
+
+### 对运行中的应用做增量捕获
+
+```bash
+adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_live --all --continuous --relaxed --events auto --monitor-duration 60'"
+```
+
+`auto` 优先尝试 tracefs，失败时明确提示并退回轮询。必须使用内核事件时选 `--events tracefs`；主动关闭内核事件时选 `--events poll`。`--monitor-duration 0` 表示持续运行，可用 Ctrl+C 正常结束。
+
+### 查找 JNI 绑定
+
+先写目标与输出目录，再写可选的 JNI 模块筛选参数：
+
+```bash
+adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_jni --jnimap libexample.so --save-maps'"
+```
+
+需要同时提取 DEX、SO 和 JNI 候选时使用 `--all --jnimap libexample.so`。扫描到的表是候选证据，不等于完整记录所有 RegisterNatives 调用。
+
+### 离线检查已有产物
+
+```bash
+adb shell "/data/local/tmp/nhdd --verify /data/local/tmp/nhdd_demo/dex/example.fixed.dex"
+adb shell "/data/local/tmp/nhdd --verify /data/local/tmp/example.vdex"
+adb shell "/data/local/tmp/nhdd --verify /data/local/tmp/example.odex"
+```
+
+替换成真实文件名；待检文件需对执行用户可读，必要时用 `su -c`。支持 ELF 中的 OAT payload；JSON 会报告 `payload_offset`。
+
+| 退出码 | `--verify` 含义 |
+|---|---|
+| `0` | 声明范围内的检查通过；标准 DEX 还要求 SHA-1 / Adler32 通过 |
+| `1` | I/O 等运行错误 |
+| `2` | 无效或不完整 |
+| `3` | 未知格式或不支持的版本 |
+
+## 参数速查
+
+基本形式：`nhdd <pid|package> [output_dir] [options]`。默认仅扫描 DEX、执行 1 轮，输出到 `/data/local/tmp/nhdd_dump`。
+
+| 主要参数 | 说明 |
+|---|---|
+| `--dex / --so / --all` | 选择 DEX、SO 或两者；`--all` 不代表重打包 APK |
+| `--jnimap [LIB]` | 扫描 JNI 表；可追加到 `--all`，LIB 为可选 SO 筛选 |
+| `--snapshot N --interval T` | 固定轮数与轮间隔，间隔单位为秒 |
+| `--watch [K]` | 连续 K 轮无进展后停止，默认 K=3 |
+| `--max-rounds N --max-seconds S` | watch 上限，默认 60 轮 / 120 秒 |
+| `--continuous` | 长时间跟随映射、权限和采样内容变化 |
+| `--spawn / --spawn-restart` | 启动前布置事件；后者先强制停止应用；均自动开启 continuous |
+| `--spawn-timeout S` | 等待首次发现目标进程，默认 15 秒，范围 1–300 |
+| `--events auto\|tracefs\|poll` | 选择事件后端，自动开启 continuous |
+| `--monitor-interval T` | continuous 周期检查间隔，默认 2 秒 |
+| `--monitor-duration S` | continuous 调度时长，默认 0，即不限时 |
+| `--monitor-verbose` | 输出详细监控日志 |
+| `--relaxed` | 不依赖 DEX magic，但仍需可验证的 endian 和结构 |
+| `--stealth2` | 改用 `process_vm_readv`，不是权限绕过 |
+| `--save-maps` | 保存进程映射快照 |
+| `--keep` | 不清理既有产物，timeline 改为追加；不恢复上次内存缓存或累计状态 |
+| `--verify FILE` | 只执行离线校验，不需要指定目标 |
+| `--help` | 查看内置帮助 |
+
+默认复用输出目录会清理所选模式的旧产物；建议每次使用新目录。监控时长限制不是硬超时，正在进行的扫描会完成后退出。
+
+<details>
+<summary>更多扫描、JNI 与读取选项</summary>
+
+| 参数 | 说明 |
+|---|---|
+| `--anon` | DEX 只扫描 path 为空的映射，可能漏掉 named-anon、memfd 和文件映射 |
+| `--no-deep-so` | 关闭额外的深度 SO 搜索 |
+| `--stealth` | 增加区域读取间隔，并设置默认进程名伪装；不保证不可检测 |
+| `--region-delay MS` | 每个扫描区域之间的等待时间，单位毫秒 |
+| `--name NAME` | 设置工具进程名，不改变读取权限 |
+| `--jni-lib LIB` | 设置 JNI 函数指针的模块筛选 |
+| `--jni-min N` | 最小连续 JNI 表项数，默认 2 |
+| `--jni-max-region MB` | JNI 普通区域大小上限，默认 64 MiB |
+| `--jni-full` | 扩大 JNI 扫描范围，耗时更高 |
+| `--analyze-so LIB` | 组合目标库 JNI 分析、maps、函数指针及目标 SO 导出 |
+| `--target-so LIB` | 指定目标 SO，并启用 maps、目标库导出及函数指针输出 |
+| `--dump-target-so / --fnptrs` | 启用目标库导出 / 额外函数指针输出 |
+
+</details>
+
+## 输出说明
+
+```text
+nhdd_demo/
+├── dex/
+│   ├── *.partial.dex            # 有缺页的残件
+│   ├── *.raw.dex                # 字节完整的原始内容
+│   ├── *.fixed.dex              # header / checksum 修复副本
+│   ├── *.meta.json              # 覆盖率、holes、raw/fixed 结构检查
+│   ├── runtime_*.cdex / *.vdex  # 原生 ART 格式证据，另有 JSON
+│   └── *.oat-header.bin         # 仅 OAT header/KV，另有 JSON
+├── so/
+│   ├── *.reconstructed.so       # 按 PT_LOAD 重建，字节覆盖完整
+│   ├── *.partial.so             # 存在缺失字节
+│   ├── *.raw.bin                # 可用时附带的原始 load-layout
+│   └── *.json                   # segments、holes、load bias、manifest 等
+├── maps/                       # 使用 --save-maps 等选项时生成
+├── jnimap/                     # JNI 候选绑定及函数指针 JSONL
+└── timeline.jsonl              # continuous 的映射与系统调用时间线
+```
+
+- `partial`：先看 holes，不能当作完整 DEX/SO。
+- `raw / fixed`：分别保留原始字节与修复副本，便于比较；fixed 不代表方法已经全部解密。
+- `structural_checks_passed`：仅静态检查通过；`art_accepted: null` 表示未进行 ART 装载验证。
+- `reconstructed.so`：恢复文件布局，不承诺可重新加载；运行中的读取不是冻结快照。
+- `oat-header.bin`：明确只有头部证据，不能作为完整 OAT 使用。
+- `manifest_<pid>_g<starttime>.json`：记录 SO 发布状态；continuous 同时记录会话累计和最近一次扫描。
+- `timeline.jsonl`：判断变化、捕获时机、事件丢失与采样状态；丢失后补扫不能补回已经消失的明文。
+
+### 当前格式支持
+
+| 格式 | 支持范围 |
+|---|---|
+| 标准 DEX | 035 / 037 / 038 / 039 / 040 的静态结构检查；041 暂不支持 |
+| CompactDex | 001 的头、ID 表与共享数据范围；不转标准 DEX |
+| VDEX | 006 / 010 / 019 / 021 / 027 的版本化布局与内嵌 DEX/CDEX 检查 |
+| OAT | 170 / 195 / 230 / 259 / 262 / 265 / 275 / 279 的头、KV 与相应偏移检查 |
+
+OAT 279 已在 Root Pixel 6 的真实 ART 文件与只读映射上验证。当前不提供反 quickening、完整 OAT→DEX 转换、方法级回填或 VMP 自动还原；版本兼容不等于对所有壳有效。详细验证边界见[技术设计](docs/design.md)。
+
+## 从源码构建
+
+以下命令都在 `NHDD-cpp-modular` 目录执行；若从仓库根目录开始，先 `cd NHDD-cpp-modular`。需要 Android NDK、C++17 编译器；GNU make 命令适用于 Linux / WSL / MSYS2。
+
+**Linux / WSL（ARM64，API 34）：**
 
 ```bash
 make android ANDROID_CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++"
 ```
 
-Android ARMv7 可改用 `armv7a-linux-androideabi23-clang++`。默认链接参数为 `-static-libstdc++`。
+**Windows PowerShell（ARM64，API 34）：**
 
-宿主逻辑测试：
+```powershell
+$nhddNdk = "C:/Android/android-ndk-r27"
+& "$nhddNdk/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android34-clang++.cmd" -O2 -std=c++17 -Wall -Wextra -static-libstdc++ -pthread src/main.cpp -o nhdd
+```
+
+修改 NDK 路径；macOS 使用对应主机工具链目录。ARMv7 可改用 `armv7a-linux-androideabi23-clang++`（Windows 后缀 `.cmd`）。输出的 `nhdd` 是 Android ELF，不是 Windows 可执行文件。
+
+**宿主逻辑测试：**
 
 ```bash
 make test
 ```
 
-`make test` 需要 GNU make 和 POSIX shell（Linux、WSL 或 MSYS2）；在原生 PowerShell 中也可直接用同等的 `g++` 命令编译 `tests/*.cpp`。
+七组测试覆盖 DEX 合并、ELF 重建、maps 变化、manifest、进程跟随、syscall 与格式检查。设备夹具和实现细节见[源码说明](src/README.md)与[技术设计](docs/design.md)。
 
-七组宿主测试覆盖原有 DEX/ELF/maps/manifest，以及包名边界/后代改名/PID 复用、syscall 配对/失败返回/范围溢出、DEX 引用损坏、格式版本与截断输入。`tests/device_capture_probe.cpp` 是单独编译到设备的受控 mmap/mprotect/mremap/munmap 与改名子进程测试夹具。`tests/oat279_device_probe.cpp` 只读映射设备实际 OAT 279，并以排他创建方式另存头部及三种损坏副本（KV 长度、base offset、trampoline），不改写原文件；输出前缀必须未使用，映射保留 20 秒供扫描。
+## 常见问题
 
-2026-10-20 在已连接的 Root Pixel 6 上验证真实 ART `boot.oat`：`--verify` 通过，payload offset 1592、固定头 72 B、KV 3979 B / 11 对、DEX 数量 21，与设备自带 `oatdump --header-only` 一致；只读映射的跨进程捕获完整保存 4051 B header/KV，并与源文件头部逐字节一致。三种真实文件损坏副本均以退出码 2 拒绝。此记录证明该设备样本的布局兼容，不等于所有厂商 OAT 279 变体均已验证。原始日志和 JSON 位于本地 `.test-bin/device-smoke/oat279-20261020/`（不纳入 Git）。
+**没有 Root 可以用吗？**
 
-## 常用命令
+当前重点是 Root standalone 场景。未 Root 下仅可能对 debuggable 自有应用通过 `run-as` 获得同 UID 访问，仍受系统策略限制；未实现进程内 self 模式。离线 `--verify` 本身不要求 Root。
 
-```bash
-# DEX
-adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --dex --watch 3 --relaxed --stealth2'"
+**开启 `--stealth2` 还是 Permission denied？**
 
-# DEX + SO
-adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --all --watch 3 --relaxed --stealth2'"
+它只切换内存读取方式，不绕过 ptrace、UID 或 SELinux 检查。先检查 Root 授权、目标 PID 是否存活、设备策略；不要把关闭 SELinux 作为默认操作。
 
-# 映射、权限或采样内容变化时增量扫描
-adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --all --continuous --monitor-interval 2 --stealth2'"
+**tracefs 不可用怎么办？**
 
-# DEX / SO / JNI 一起增量扫描
-adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_dump --all --jnimap libjiagu.so --continuous --stealth2'"
+使用 `--events auto` 自动回退，或显式 `--events poll`。轮询仍能检测映射、权限和采样内容变化，但更容易漏掉短暂映射。要求 tracefs 时失败会直接报错。
 
-# 冷启动并跟随包内多进程，要求真实内核事件后端
-adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_spawn --spawn --all --events tracefs --monitor-duration 30'"
+**DEX 完整、checksum 正确，为什么仍有方法无法反编译？**
 
-# 正在运行的包：明确要求 force-stop 后重新启动
-adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_restart --spawn-restart --dex --events auto --monitor-duration 30'"
+字节可能仍是密文、占位方法体或虚拟化逻辑；只修 checksum 无法恢复原始代码。按需解密、方法体外置和执行后重新加密还需要方法级恢复能力。
 
-# 离线检查（也可在 Android 上运行）
-./nhdd --verify captured.fixed.dex
-./nhdd --verify captured.vdex
-```
+**为什么没有“完整 OAT”或所有系统库？**
 
-`--monitor-duration 0` 表示持续运行；非零秒数限制监控调度时长，但正在进行的对象扫描会完成后再退出。100ms 发现间隔也不是实时延迟保证，大对象扫描/调度压力会增加延迟。
+OAT 只导出明确标记的头部证据；系统/APEX/vendor 的 runtime 格式默认不额外导出。SO 也有目标与来源筛选，不是设备全内存备份工具。
 
-## 权限边界
+## 更多说明
 
-当前 standalone CLI 扫描任意 release 第三方应用通常需要 root。`--stealth2` 只把内存读取后端切换为 `process_vm_readv()`，不会绕过 ptrace、UID 或 SELinux 权限检查。未 root 环境仅可能对 debuggable 自有应用通过 `run-as` 以同 UID 运行；当前版本尚未实现 JNI / in-process self 模式。
-
-## 输出
-
-```text
-nhdd_dump/
-├── dex/
-│   ├── *.partial.dex        # 未完整，hole 以占位字节保存
-│   ├── *.raw.dex            # 完整原始内存内容
-│   ├── *.fixed.dex          # 完整且已修复 header/checksum 的分析副本
-│   ├── *.meta.json          # 状态、覆盖率、页面统计、holes、raw/fixed 结构检查
-│   ├── runtime_*.cdex / *.vdex # 原生 ART 格式证据（不反 quickening）
-│   └── runtime_*.oat-header.bin / *.json # OAT header 证据及格式检查
-├── so/
-│   ├── *.raw.bin            # 内存 load-layout 证据
-│   ├── *.reconstructed.so   # 按 PT_LOAD 文件布局重建
-│   ├── *.partial.so         # 存在未恢复 hole 的重建残件
-│   ├── *.json               # load bias、segments、holes、进程世代、证据哈希
-│   ├── anon_<pid>_g<starttime>_<addr>.bin # 可选的匿名可执行段证据
-│   └── manifest_<pid>_g<starttime>.json   # 世代隔离；continuous 保留累计与 last_scan
-├── maps/
-│   └── maps_<pid>_g<starttime>.txt        # 启用 maps 保存时生成
-├── jnimap/
-│   ├── jnimap_<pid>_g<starttime>.jsonl
-│   └── fnptrs_<pid>_g<starttime>.jsonl
-└── timeline.jsonl           # continuous 变化时间线
-```
-
-`manifest_<pid>_g<starttime>.json` 的顶层计数字段在当前 `nhdd-so-scan-v3` schema 内保持单轮/continuous 兼容：普通 snapshot/watch 表示当前单轮；continuous 表示同一 `PID + process_starttime` 会话累计发布数，其中 `maps` 始终是最近一次实际扫描的映射数。continuous 另外提供 `session.totals` 和 `last_scan`：前者是会话累计，后者记录最近一次实际扫描的序号、增量范围和本轮发布数。只有 removed 事件而没有可读当前范围时不会启动扫描，因此也不会增加 `scans_completed`。
-
-扫描期间一旦 starttime 消失或变化，本轮不会提交 manifest，计数会回滚，后续候选也会停止发布。扫描轮不是覆盖全部输出的全局事务：在较早检查仍稳定时，已经通过读前/读后及发布前/发布后守卫的独立证据产物会保留，并带有其 PID/starttime 身份。SO/DEX 产物 stem 中的 starttime 使用十六进制；manifest、maps、JNIMAP metadata 与 timeline 中使用十进制 ticks。
-
-## 代码结构
-
-核心实现为 C++17 header-based 单翻译单元：
-
-- `src/dex_capture.hpp`：多轮 DEX 覆盖合并与候选缓存。
-- `src/dex_semantics.hpp`：有预算的 DEX 结构/引用/code/debug 边界检查。
-- `src/runtime_formats.hpp`：CompactDex/VDEX/OAT 版本与布局检查。
-- `src/syscall_events.hpp`：独立 tracefs instance、读取线程、syscall 配对与事件时间线。
-- `src/process_tracking.hpp`：包名边界与进程世代/后代关系跟踪。
-- `src/elf_reconstructor.hpp`：ELF 校验、load bias 计算与 PT_LOAD 重建。
-- `src/so_artifact_identity.hpp`：SO 进程世代隔离、证据哈希与安全文件名。
-- `src/so_manifest.hpp`：跨平台的 SO 会话累计模型与原子 manifest 发布。
-- `src/process_generation_guard.hpp`：扫描期间黏性的 PID/starttime 世代校验与发布守卫。
-- `src/maps_monitor.hpp`：进程世代快照、变化检测和增量范围生成。
-- `src/nhdd_scanner.hpp`：DEX / SO / JNI 单 PID 扫描编排。
-- `src/nhdd_app.hpp`：CLI、多进程、watch 和 continuous 调度。
-- `tests/`：不依赖 Android 设备的核心逻辑测试。
-
-## 已知边界
-
-- SO 重建需要内存中仍保留可验证的 ELF header 和 program headers；完全擦头后的对象暂不做猜测式恢复。
-- SO 不反向撤销 GOT/动态重定位，也不虚构 section headers；metadata 会保留缺失范围。
-- SO 采用运行中进程读取；metadata 的 `snapshot_consistency: "best_effort_live"` 表示 `coverage_complete=true` 只证明目标字节均被读到，不承诺这些字节来自冻结后的单一时刻。
-- Continuous 对所有 maps 做结构/权限 diff；内容检测按上述优先级采用首/中/尾位置的有预算采样，预算耗尽后可能有映射未被采样，不等价于逐字节全图比较。
-- Continuous 的内容采样失败不会阻止结构/权限事件检测；请以日志与 timeline 中的 `content_sampling.available`/`sampled_bytes` 判断该轮是否具备内容变化观测能力。
-- `--keep` 只保留既有产物并追加 timeline，不会恢复上次进程内的 monitor baseline、DEX capture、去重表或 manifest 累计，也无法观测工具停机期间的变化。
-- JNIMAP 的主要目标仍是 Android ARM64；DEX/ELF 核心逻辑和主程序同时通过了 ARM64、ARMv7 交叉编译检查。
+- [技术设计与验证边界](docs/design.md)
+- [源码模块与维护约束](src/README.md)
+- [README 徽章制作方法](docs/badges.md)
+- [提交问题](https://github.com/Fruit-Guardians/NHDD/issues)：建议附设备 ABI、Android/ART 版本、命令、错误日志和脱敏 metadata，不要公开未授权 APK 或私有内存产物。

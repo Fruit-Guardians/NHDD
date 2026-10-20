@@ -1,5 +1,41 @@
-# NHDD — No-Hook DEX/SO Dumper
+<p align="center">
+  <img src="./NHDD-cpp-modular/assets/nhdd-mark.svg" alt="NHDD" width="104" height="104">
+</p>
+
+<h1 align="center">NHDD</h1>
+
+<p align="center"><strong>No-Hook DEX / SO Dumper</strong></p>
+
+<h3 align="center">Runtime capture. No in-process injection.</h3>
+
+<p align="center">
+  A focused DEX / SO extraction tool for rooted Android devices.<br>
+  Multi-pass DEX capture. PT_LOAD reconstruction. Event-driven scanning.
+</p>
+
+<p align="center">
+  <img alt="Android · Root" src="./NHDD-cpp-modular/assets/badges/nhdd-root.svg">
+  <img alt="ABI · ARM64 / ARMv7" src="./NHDD-cpp-modular/assets/badges/nhdd-abi.svg">
+  <img alt="Capture · No Hook" src="./NHDD-cpp-modular/assets/badges/nhdd-no-hook.svg">
+  <img alt="C++ · 17" src="./NHDD-cpp-modular/assets/badges/nhdd-cpp.svg">
+</p>
+
+<p align="center">
+  <a href="./NHDD-cpp-modular/README.md#快速上手">Quick Start</a> &nbsp;·&nbsp;
+  <a href="./NHDD-cpp-modular/README.md#功能介绍">Features</a> &nbsp;·&nbsp;
+  <a href="./NHDD-cpp-modular/README.md#常用命令">Usage</a> &nbsp;·&nbsp;
+  <a href="./NHDD-cpp-modular/README.md#输出说明">Outputs</a> &nbsp;·&nbsp;
+  <a href="./NHDD-cpp-modular/docs/design.md">Design</a> &nbsp;·&nbsp;
+  <a href="https://github.com/Fruit-Guardians/NHDD/issues">Issues</a>
+</p>
+
+<p align="center"><sub>One binary. No injected agent. For authorized research only.</sub></p>
+
+---
+
 English | [简体中文](./README.zh-CN.md)
+
+> **Current Root CLI:** start with the [C++ tool's feature and usage guide](./NHDD-cpp-modular/README.md) for DEX multi-round capture, PT_LOAD-based SO reconstruction, cold launch/process following, syscall-driven incremental capture, and OAT 279 checks. Its command examples and limits are authoritative for the C++ binary; the controller and legacy workflows below are not a feature-parity guarantee. [Implementation details](./NHDD-cpp-modular/docs/design.md) · [How these badges work](./NHDD-cpp-modular/docs/badges.md).
 
 NHDD is an Android **external-memory DEX/SO dumping tool** for authorized reverse engineering, malware analysis, app debugging, and mobile security research. The Android-side scanner, `nhdd`, runs as an independent root process. It reads `/proc/<pid>/maps` and `/proc/<pid>/mem` (or uses `process_vm_readv` in stealth2 mode), scans the target process memory for DEX/ELF magic, and writes resident DEX or SO images to disk.
 
@@ -27,7 +63,7 @@ For second-generation extraction shells, use NHDD with `--stealth2 --relaxed` mo
 
 | Component | Status | Notes |
 |---|---:|---|
-| `NHDD-cpp-modular/` | **v9 — recommended device binary** | C++17 class-modular rewrite of `nhdd.c` (v9.0-cpp-class). Keeps all v8 semantics (stealth2/relaxed/anon/watch) and adds no-hook **JNIMAP scanning** (`--jnimap`, recover `JNINativeMethod` bindings to JSONL), `--analyze-so`, `--continuous` maps monitoring. TUI/GUI push this binary first and fall back to the root `nhdd` (v8). |
+| `NHDD-cpp-modular/` | **Recommended Root CLI** | C++17 standalone binary: multi-round DEX coverage/revisions, PT_LOAD/load-bias ELF32/64 reconstruction, no-hook JNI candidates, cold launch and process following, tracefs/poll incremental capture, and offline DEX/CDEX/VDEX/OAT checks including OAT 279. See its [usage guide](./NHDD-cpp-modular/README.md) for current options and boundaries. |
 | `nhdd.c` | Ready (v8 baseline) | Single-file static ARM64 scanner: DEX/SO, package multi-process scanning, snapshots, watch mode, de-duplication, built-in DEX checksum repair, built-in SoFixer-style ELF repair, stealth2 (process_vm_readv), relaxed DEX validation, anonymous mapping scan. |
 | `nhdd_tui.py` | Recommended | Terminal controller (v9.0-cpp-class): device/app selection, watch live progress (v8/v9 output formats), result pulling, local DEX/SO repair, APK repack. Best daily entry point. |
 | `gui/` | Wails GUI | Go + Wails v2 desktop GUI with Web frontend. No CGO required. Mirrors the TUI flow including built-in DEX/SO repair and APK repack. |
