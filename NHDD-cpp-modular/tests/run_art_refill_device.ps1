@@ -1,14 +1,16 @@
 param(
     [Parameter(Mandatory=$true)][string]$Name,
-    [ValidateSet('normal','outside','remap','multi','conflict','multi-outside','multi-remap')][string]$Mode='normal',
+    [ValidateSet('normal','outside','remap','multi','conflict','multi-outside','multi-remap','burst')][string]$Mode='normal',
     [ValidateSet('auto','off')][string]$ArtRefill='auto',
     [ValidateSet('auto','off')][string]$ArtMerge='auto',
     [ValidateSet('tracefs','poll')][string]$Events='tracefs',
     [Parameter(Mandatory=$true)][string]$Destination,
-    [string]$Serial=''
+    [string]$Serial='',
+    [string]$Binary='/data/local/tmp/nhdd_art_refill'
 )
 $ErrorActionPreference='Stop'
 if($Name -notmatch '^nhdd_refill_[a-z0-9_]+$') {throw 'Use a new unique nhdd_refill_* prefix'}
+if($Binary -notmatch '^/data/local/tmp/[A-Za-z0-9_.-]+$'){throw 'Binary must be an explicit /data/local/tmp executable'}
 $adbArgs=@();if($Serial){$adbArgs=@('-s',$Serial)}
 function Remote([string]$command) {
     $result=& adb @adbArgs shell "su -c '$command'"
@@ -26,8 +28,8 @@ for($attempt=0;$attempt -lt 100;++$attempt) {
 }
 if($ready -notmatch 'READY pid=(\d+) payload_address=(0x[0-9a-f]+)'){throw "Fixture not ready: $ready"}
 $probePid=$Matches[1];$address=$Matches[2]
-$duration=8;if($Mode -like 'multi*' -or $Mode -eq 'conflict'){$duration=12}
-Remote "/data/local/tmp/nhdd_art_refill $probePid ${prefix}_out --dex --art-dex only --events $Events --art-refill $ArtRefill --art-merge $ArtMerge --monitor-duration $duration > $prefix.scan.log 2>&1 < /dev/null &" | Out-Null
+$duration=8;if($Mode -like 'multi*' -or $Mode -in @('conflict','burst')){$duration=12}
+Remote "$Binary $probePid ${prefix}_out --dex --art-dex only --events $Events --art-refill $ArtRefill --art-merge $ArtMerge --monitor-duration $duration > $prefix.scan.log 2>&1 < /dev/null &" | Out-Null
 $armed=$false
 for($attempt=0;$attempt -lt 160;++$attempt) {
     $log=Remote "cat $prefix.scan.log"
@@ -54,5 +56,5 @@ foreach($file in @("$prefix.probe.log","$prefix.scan.log","$prefix.golden.dex","
     & adb @adbArgs pull $file $Destination
     if($LASTEXITCODE -ne 0){throw "Could not pull $file"}
 }
-Write-Output ($log -split "`n" | Where-Object {$_ -match 'ART refill:|ART merge:|Fast capture:|Event diagnostics:'})
+Write-Output ($log -split "`n" | Where-Object {$_ -match 'ART refill:|ART merge:|ART schedule:|Fast schedule:|Fast capture:|Event diagnostics:'})
 # Payload methods are never executed. Probe exits itself, no unrelated process is killed.

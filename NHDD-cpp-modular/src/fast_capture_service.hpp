@@ -1,8 +1,11 @@
-// Collector-only acquisition; main-thread publication of frozen observations.
+// Independent collector and bounded publisher; scan thread never drains a batch.
 #pragma once
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <thread>
+#include <condition_variable>
+#include "fast_schedule.hpp"
 #include <sys/uio.h>
 #include "fast_capture.hpp"
 #include "syscall_events.hpp"
@@ -15,6 +18,22 @@ class FastCaptureService {
 public:
     FastCaptureService(std::string target,bool numeric,size_t cap,bool dex,bool art_refill=true,bool art_merge=true)
         :target_(std::move(target)),numeric_(numeric),cap_(cap),dex_(dex),refill_(art_refill && dex,art_merge) { decoder_.early_entries(true); }
+    ~FastCaptureService() {stop_publication();}
+    bool start_publication(const char* out_dir) {
+        if(publisher_.joinable() || stopping_)return false;
+        output_dir_=std::string(out_dir)+"/fast";
+        if(::mkdir(output_dir_.c_str(),0700)!=0 && errno!=EEXIST)return false;
+        try {publisher_=std::thread([this]{publication_loop();});}
+        catch(const std::exception& e) {std::fprintf(stderr,"[-] Fast publisher: %s\n",e.what());return false;}
+        publisher_started_=true;
+        return true;
+    }
+    // Caller must first stop/join the trace collector. Also used by RAII on
+    // early returns, where SyscallEvents is destroyed before this service.
+    void stop_publication() {
+        {std::lock_guard<std::mutex> lock(mutex_);stopping_=true;}
+        ready_.notify_all();if(publisher_.joinable())publisher_.join();
+    }
     void arm_art(const DexCapture& capture,const MapsRegion* maps,size_t count,const ArtRefillService::Read& read) {
         refill_.arm(capture,maps,count,read);
     }
@@ -36,25 +55,6 @@ public:
         for(const auto& event:events) {refill_.event(event);acquire(event);}
         early_losses_=decoder_.losses();
     }
-    void publish(const char* out_dir) {
-        std::deque<Snapshot> ready;
-        {std::lock_guard<std::mutex> lock(mutex_);ready.swap(queue_);queued_bytes_=0;}
-        if(ready.empty())return;
-        refill_.begin_batch();
-        const uint64_t previous=published_,previous_dex=dex_observations_;
-        const std::string dir=std::string(out_dir)+"/fast";
-        if(::mkdir(dir.c_str(),0700)!=0 && errno!=EEXIST) {write_failures_+=ready.size();return;}
-        for(auto& snapshot:ready) {
-            // Includes worst-case non-overlapping DEX raw/fixed copies and metadata.
-            const size_t reserve=3*snapshot.bytes()+1024*1024;
-            if(published_bytes_+reserve>256u*1024*1024) {++disk_drops_;continue;}
-            last_written_=0;
-            if(publish_one(dir,snapshot)) {++published_;published_bytes_+=last_written_;}
-            else ++write_failures_;
-        }
-        if(published_!=previous)std::fprintf(stderr,"[+] Fast capture batch: saved=%llu DEX-observations=%llu dir=%s\n",
-            ull(published_-previous),ull(dex_observations_-previous_dex),dir.c_str());
-    }
     void diagnostics() const {
         std::fprintf(stderr,"[*] Fast capture: observed=%llu published=%llu DEX-observations=%llu "
             "queue_drops=%llu budget_drops=%llu generation_rejected=%llu unreadable=%llu "
@@ -62,16 +62,68 @@ public:
             ull(observed_),ull(published_),ull(dex_observations_),ull(queue_drops_),ull(budget_drops_),
             ull(rejected_),ull(unreadable_),ull(early_losses_),ull(disk_drops_),ull(write_failures_));
         refill_.diagnostics();
+        std::fprintf(stderr,"[*] Fast schedule: worker=%u peak_items=%zu peak_bytes=%zu remaining=%zu "
+            "retry_attempts=%llu retry_exhausted=%llu queue_wait_max_ms=%.3f worker_failed=%u\n",
+            publisher_started_?1u:0u,schedule_.peak_items,schedule_.peak_bytes,schedule_.items,ull(retry_attempts_),ull(retry_exhausted_),
+            queue_wait_max_ms_,publisher_failed_?1u:0u);
     }
 private:
     struct Snapshot {
         MemorySyscallEvent event;FastObservation observation;uint64_t sequence=0;
         std::vector<ArtRefillService::Link> links;
+        bool raw_published=false;unsigned attempts=0;double due=0;
         size_t bytes() const {return observation.first.size()+observation.second.size();}
     };
     static unsigned long long ull(uint64_t n) {return static_cast<unsigned long long>(n);}
     static double now() {
         timespec t{};::clock_gettime(CLOCK_BOOTTIME,&t);return double(t.tv_sec)+double(t.tv_nsec)*1e-9;
+    }
+    void publication_loop() {
+        try {
+            for(;;) {
+                Snapshot s;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    for(;;) {
+                        if(queue_.empty()) {if(stopping_)return;ready_.wait(lock);continue;}
+                        auto fresh=queue_.end(),retry=queue_.end();double earliest=now()+1;
+                        const double stamp=now();
+                        for(auto it=queue_.begin();it!=queue_.end();++it) {
+                            if(!it->raw_published) {if(fresh==queue_.end())fresh=it;}
+                            else if(it->due<=stamp) {if(retry==queue_.end())retry=it;}
+                            else earliest=std::min(earliest,it->due);
+                        }
+                        auto selected=schedule_.retry_turn(fresh!=queue_.end(),retry!=queue_.end())?retry:fresh;
+                        if(selected==queue_.end()) {
+                            ready_.wait_for(lock,std::chrono::duration<double>(std::max(0.001,earliest-stamp)));continue;
+                        }
+                        schedule_.dispatched(selected->raw_published);s=std::move(*selected);queue_.erase(selected);break;
+                    }
+                }
+                const bool retry=s.raw_published;const size_t bytes=s.bytes();
+                if(retry)++retry_attempts_;
+                else queue_wait_max_ms_=std::max(queue_wait_max_ms_,1000*(now()-s.observation.end));
+                refill_.begin_batch();last_written_=0;
+                const size_t reserve=retry?0:3*bytes+1024*1024;
+                bool ok=false;
+                if(published_bytes_+reserve>256u*1024*1024)++disk_drops_;
+                else {
+                    ok=publish_one(output_dir_,s);if(!ok)++write_failures_;
+                    if(ok && !retry)++published_;
+                    if(ok)published_bytes_+=last_written_;
+                }
+                ++s.attempts;
+                const bool again=ok && !s.links.empty() && FastSchedule::can_retry(s.attempts);
+                if(ok && !s.links.empty() && !again)++retry_exhausted_;
+                {std::lock_guard<std::mutex> lock(mutex_);
+                    if(again) {s.due=now()+std::max(FastSchedule::retry_delay(s.attempts),refill_.budget_wait());queue_.push_back(std::move(s));}
+                    else schedule_.release(bytes);
+                }
+            }
+        } catch(const std::exception& e) {
+            std::fprintf(stderr,"[-] Fast publisher stopped: %s\n",e.what());publisher_failed_=true;
+            std::lock_guard<std::mutex> lock(mutex_);write_failures_+=schedule_.items;queue_.clear();schedule_.used=0;schedule_.items=0;
+        }
     }
     bool generation(int pid,uint64_t expected) const {
         uint64_t ticks=0;const auto text=std::to_string(pid);
@@ -117,7 +169,7 @@ private:
         if(budget_bytes_+charge>32u*1024*1024) {++budget_drops_;return;}
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if(queue_.size()>=512 || queued_bytes_+charge>32u*1024*1024) {++queue_drops_;return;}
+            if(publisher_failed_ || stopping_ || !schedule_.admit(charge)) {++queue_drops_;return;}
         }
         budget_bytes_+=charge;++observed_;
         struct MemoryFd {
@@ -140,14 +192,24 @@ private:
         refill_.finish(links,linked_read);
         if(!observation.generation_valid) {++rejected_;return;}
         if(!observation.read_bytes(0) && !observation.read_bytes(1)) {++unreadable_;return;}
-        Snapshot s{event,std::move(observation),++sequence_,std::move(links)};
-        std::lock_guard<std::mutex> lock(mutex_);queued_bytes_+=s.bytes();queue_.push_back(std::move(s));
+        Snapshot s;s.event=event;s.observation=std::move(observation);s.sequence=++sequence_;s.links=std::move(links);
+        {std::lock_guard<std::mutex> lock(mutex_);
+            if(publisher_failed_ || stopping_ || !schedule_.admit(s.bytes())) {++queue_drops_;return;}
+            schedule_.retain(s.bytes());queue_.push_back(std::move(s));}
+        ready_.notify_one();
     }
-    bool publish_one(const std::string& dir,const Snapshot& s) {
+    bool publish_one(const std::string& dir,Snapshot& s) {
         const auto& o=s.observation;const auto& e=s.event;
         char name[192];std::snprintf(name,sizeof(name),"fast_%d_%llx_%llx_%d_%llu_%llu",e.pid,ull(e.starttime),
             ull(e.address),::getpid(),ull(static_cast<uint64_t>(o.begin*1e9)),ull(s.sequence));
         const std::string stem=dir+"/"+name;
+        if(s.raw_published) {
+            std::vector<ArtRefillService::Link> retry;
+            const size_t available=256u*1024*1024-std::min(size_t(256u*1024*1024),size_t(published_bytes_));
+            last_written_+=refill_.publish(stem,e,o,s.links,available,&retry,s.attempts+1);
+            s.links=std::move(retry);return true;
+        }
+        const double publication_begin=now();
         std::vector<ArtifactTransactionEntryInline> entries;
         auto stage=[&](const std::string& path,const uint8_t* bytes,size_t count) {
             const auto temp=artifact_sidecar_path_inline(path.c_str(),"tmp");
@@ -208,7 +270,8 @@ private:
                 ull(b.revision),ull(b.identity.address),ull(b.object),link.before?"true":"false",
                 link.after?"true":"false",plan.reason.c_str());
         }
-        std::fputs("]}\n",f);
+        std::fprintf(f,"],\"publication_begin_boot\":%.9f,\"queue_wait_ms\":%.3f,\"publication_worker\":true}\n",
+            publication_begin,1000*(publication_begin-o.end));
         const long meta_bytes=std::ftell(f);if(meta_bytes>0)last_written_+=static_cast<size_t>(meta_bytes);
         ok=(std::fflush(f)==0 && ::fsync(::fileno(f))==0) && ok;
         if(std::fclose(f)!=0)ok=false;
@@ -216,14 +279,20 @@ private:
         if(!ok) {cleanup();return false;}
         if(!artifact_publish_transaction_inline(&entries))return false;
         dex_observations_+=candidates;
+        s.raw_published=true;
         const size_t available=256u*1024*1024-std::min(size_t(256u*1024*1024),size_t(published_bytes_)+last_written_);
-        last_written_+=refill_.publish(stem,e,o,s.links,available);
+        std::vector<ArtRefillService::Link> retry;
+        last_written_+=refill_.publish(stem,e,o,s.links,available,&retry,1);
+        s.links=std::move(retry);
         return true;
     }
     std::string target_;bool numeric_;size_t cap_;bool dex_;
     SyscallEvents decoder_;
     std::mutex mutex_;std::unordered_map<int,uint64_t> targets_;
-    std::deque<Snapshot> queue_;size_t queued_bytes_=0,budget_bytes_=0;double budget_epoch_=0;
+    std::deque<Snapshot> queue_;size_t budget_bytes_=0;double budget_epoch_=0;
+    FastSchedule schedule_;std::condition_variable ready_;std::thread publisher_;std::string output_dir_;
+    bool stopping_=false,publisher_started_=false;std::atomic<bool> publisher_failed_{false};
+    uint64_t retry_attempts_=0,retry_exhausted_=0;double queue_wait_max_ms_=0;
     uint64_t sequence_=0,published_=0,published_bytes_=0,dex_observations_=0,disk_drops_=0,write_failures_=0;
     size_t last_written_=0;
     ArtRefillService refill_;

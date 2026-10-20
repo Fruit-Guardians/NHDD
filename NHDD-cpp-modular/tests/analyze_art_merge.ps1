@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$Directory,
-    [ValidateSet('multi','conflict','outside','remap','off')][string]$Expected='multi'
+    [ValidateSet('multi','conflict','outside','remap','off','burst')][string]$Expected='multi'
 )
 $ErrorActionPreference='Stop'
 $probe=Get-ChildItem $Directory -Filter '*.probe.log' | Select-Object -First 1
@@ -15,14 +15,14 @@ $selected=@($lines | ForEach-Object {
         [pscustomobject]@{index=[int]$Matches[1];offset=[int]$Matches[2];length=[int]$Matches[3];name=$Matches[4]}
     }
 })
-if($selected.Count -ne 3){throw 'Expected three selected methods'}
+if($selected.Count -ne $(if($Expected -eq 'burst'){32}else{3})){throw 'Unexpected selected method count'}
 $windows=@($lines | ForEach-Object {
     if($_ -match '^WINDOW trial=(\d+) us=(\d+) begin=([\d.]+) end=([\d.]+) method=(\d+) offset=(\d+) alternate=(\d+)') {
         [pscustomobject]@{trial=[int]$Matches[1];us=[int]$Matches[2];begin=[double]$Matches[3];end=[double]$Matches[4];
             method=[int]$Matches[5];offset=[int]$Matches[6];alternate=[int]$Matches[7]}
     }
 })
-if($windows.Count -ne $(if($Expected -eq 'conflict'){130}else{120})){throw 'Incomplete window schedule'}
+if($windows.Count -ne $(if($Expected -eq 'conflict'){130}elseif($Expected -eq 'burst'){32}else{120})){throw 'Incomplete window schedule'}
 for($i=0;$i -lt $windows.Count;++$i) {
     $w=$windows[$i]
     if($w.trial -ne $i -or $w.offset -ne $selected[$w.method].offset -or
@@ -40,6 +40,22 @@ function AssertSame([byte[]]$a,[byte[]]$b,[string]$label) {
     if($a.Length -ne $b.Length -or (Digest $a 0 $a.Length) -ne (Digest $b 0 $b.Length)){throw "Byte mismatch: $label"}
 }
 $refills=0;$merges=@();$conflicts=@();$fullSingles=0;$fullMerges=0;$hits=@{};$headless=0
+foreach($file in Get-ChildItem $fast -Filter '*.reuse.json') {
+    $m=ReadJson $file.Name
+    if($m.dex_address -ne $address -or $m.pid -ne $probePid){continue}
+    if($m.this_observation_verified -ne $false -or $m.status -ne 'duplicate_method_bytes_not_revalidated'){throw 'Duplicate was marked verified'}
+    $rawSource=ReadJson $m.source;$capture=[IO.File]::ReadAllBytes((Join-Path $fast $rawSource.artifacts.first))
+    $captureAddress=[Convert]::ToUInt64(($rawSource.address -replace '^0x',''),16)
+    $dexAddress=[Convert]::ToUInt64(($address -replace '^0x',''),16)
+    foreach($r in $m.references) {
+        $proof=ReadJson $r.verified_source;$proofRaw=ReadBytes $proof.artifacts.raw
+        if($proof.baseline_revision -ne $m.baseline_revision -or $proof.pid -ne $m.pid -or
+           $proof.dex_address -ne $m.dex_address -or $proof.process_start_time_ticks -ne $m.process_start_time_ticks){throw 'Reuse crossed generation'}
+        $offset=[int]($dexAddress+$r.offset-$captureAddress)
+        if((Digest $capture $offset $r.length) -ne (Digest $proofRaw $r.offset $r.length)){throw 'Reuse bytes differ'}
+        if([BitConverter]::ToString($sha1.ComputeHash($proofRaw,$r.offset,$r.length)).Replace('-','').ToLowerInvariant() -ne $r.sha1){throw 'Reuse digest differs'}
+    }
+}
 foreach($file in Get-ChildItem $fast -Filter '*.refill.json') {
     $m=ReadJson $file.Name;if($m.dex_address -ne $address -or $m.pid -ne $probePid){continue}
     ++$refills;$raw=ReadBytes $m.artifacts.raw;$baseline=ReadBytes $m.artifacts.baseline
@@ -112,11 +128,13 @@ switch($Expected) {
     'outside' {if($refills -or $merges.Count -or $conflicts.Count){throw 'Outside mutation was accepted'}}
     'remap' {if($fullMerges -or $scan -notmatch 'mapping_invalidations=[1-9]'){throw 'Generation crossed remap'}}
     'off' {if($merges.Count -or $conflicts.Count -or !$refills){throw 'Merge-off control failed'}}
+    'burst' {if(!$merges.Count -or $conflicts.Count -or $fullSingles){throw 'Burst provenance/composite failed'}}
 }
-$rows=@(foreach($method in 0,1,2){foreach($us in 1000,5000,20000,50000){
+$rows=@(foreach($method in 0..($selected.Count-1)){foreach($us in 1000,5000,20000,50000){
     $group=@($windows | Where-Object {$_.method -eq $method -and $_.us -eq $us -and !$_.alternate})
     [pscustomobject]@{method=$selected[$method].name;ms=$us/1000;trials=$group.Count;hits=@($group | Where-Object {$hits.ContainsKey($_.trial)}).Count}
 }})
 [pscustomobject]@{name=$prefix;expected=$Expected;single_refills=$refills;single_full_body_matches=$fullSingles;
     headless_sources=$headless;merged_revisions=$merges.Count;full_three_method_revisions=$fullMerges;
-    conflict_records=$conflicts.Count;methods=$selected;windows=$rows} | ConvertTo-Json -Depth 6
+    conflict_records=$conflicts.Count;exposed_methods=$selected.Count;max_merged_methods=($merges | Measure-Object method_count -Maximum).Maximum;
+    methods=$selected;windows=$rows} | ConvertTo-Json -Depth 6
