@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <limits>
+#include <functional>
 #include <new>
 #include <string>
 #include <unordered_map>
@@ -600,6 +601,9 @@ static bool write_dex_metadata_inline(
 
 class NhddScanner {
 public:
+    using ArtCaptureObserver=std::function<void(const DexCapture&,const MapsRegion*,size_t,
+        const std::function<bool(uintptr_t,void*,size_t)>&)>;
+    void on_art_capture(ArtCaptureObserver observer) {art_capture_observer_=std::move(observer);}
     NhddScanner(DexDedup& dex_dedup, SoDedup& so_dedup, JniDedup& jni_dedup)
         : dex_dedup_(dex_dedup), so_dedup_(so_dedup), jni_dedup_(jni_dedup) {}
 
@@ -806,6 +810,12 @@ public:
             // remote read has been bracketed by a matching starttime check.
             if (!generation.verify() || !art_still_valid()) return;
             const DexRefreshResult update = capture.apply_observation(observation);
+            if(art_capture_observer_ && capture.art_object() && capture.complete()) {
+                const std::function<bool(uintptr_t,void*,size_t)> read=[&](uintptr_t address,void* bytes,size_t size) {
+                    return generation.verify() && READ_REMOTE(bytes,size,address)==static_cast<ssize_t>(size);
+                };
+                art_capture_observer_(capture,regs,reg_count,read);
+            }
             const size_t new_bytes = update.new_bytes;
             const size_t changed_bytes = update.changed_bytes;
             const size_t updates = new_bytes + changed_bytes;
@@ -1654,6 +1664,7 @@ private:
     DexDedup& dex_dedup_;
     SoDedup& so_dedup_;
     JniDedup& jni_dedup_;
+    ArtCaptureObserver art_capture_observer_;
     DexCaptureCache dex_capture_cache_;
     SoManifestSessionCacheInline so_manifest_sessions_{128};
     std::unordered_set<std::string> runtime_processed_;

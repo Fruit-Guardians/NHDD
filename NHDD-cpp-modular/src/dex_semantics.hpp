@@ -4,17 +4,22 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <set>
 #include <string>
 #include <tuple>
 #include <vector>
 #include "sha1.hpp"
 
+struct DexMethodCode {
+    uint32_t method_index=0, code_offset=0, instructions_offset=0, bytes=0, code_end=0;
+};
 struct DexSemanticReport {
     bool supported = true, valid = false;
     bool checksum_valid = false, signature_valid = false;
     uint32_t strings = 0, classes = 0, methods = 0, code_items = 0, debug_items = 0;
     std::vector<std::string> errors;
+    std::vector<DexMethodCode> method_code; // Opt-in, never implies opcode/type verification.
     void write_json(FILE* f) const {
         std::fprintf(f, "{\"status\":\"%s\",\"validation_scope\":\"header_map_tables_class_data_code_debug_bounds\","
             "\"art_accepted\":null,\"bytecode_type_verified\":false,\"checksum_valid\":%s,\"signature_valid\":%s,"
@@ -30,8 +35,9 @@ struct DexSemanticReport {
 
 class DexSemantics {
 public:
-    static DexSemanticReport validate(const uint8_t* data, size_t size) {
+    static DexSemanticReport validate(const uint8_t* data, size_t size, bool collect_code=false) {
         DexSemantics v(data, size);
+        v.collect_code_=collect_code;
         v.run();
         return v.report_;
     }
@@ -126,7 +132,10 @@ private:
         if (ins > registers || !span(uint64_t(off) + 16, uint64_t(instructions) * 2))
             return fail("code_insns_bounds");
         if (!debug_info(u32(off+8), registers, instructions)) return false;
-        if (!tries) return true;
+        if (!tries) {
+            if(collect_code_)code_ends_[off]=off+16+instructions*2;
+            return true;
+        }
         size_t p = off + 16 + size_t(instructions)*2;
         if (instructions & 1) p += 2;
         if (!span(p, uint64_t(tries)*8)) return fail("tries_bounds");
@@ -154,6 +163,7 @@ private:
                 !handler_offsets.count(u16(t+6))) return fail("try_handler_reference");
             if(i && uint64_t(u32(t-8))+u16(t-4)>u32(t))return fail("try_ranges_overlap");
         }
+        if(collect_code_)code_ends_[off]=static_cast<uint32_t>(p);
         return true;
     }
     bool class_data(uint32_t off,uint32_t owner) {
@@ -178,6 +188,11 @@ private:
                     const bool abstract_native = (flags & (0x100 | 0x400)) != 0;
                     if ((code_off == 0) != abstract_native) return fail("method_code_presence");
                     if (code_off && !code(code_off)) return false;
+                    if(code_off && collect_code_) {
+                        if(report_.method_code.size()>=4096)return fail("refill_method_layout_budget");
+                        report_.method_code.push_back({static_cast<uint32_t>(idx),code_off,code_off+16,
+                            u32(code_off+12)*2,code_ends_[code_off]});
+                    }
                 }
             }
         }
@@ -267,6 +282,8 @@ private:
     uint64_t budget_ = 32 * 1024 * 1024;
     uint32_t strings_=0,types_=0,protos_=0,fields_=0,methods_=0;
     DexSemanticReport report_;
+    bool collect_code_=false;
+    std::map<uint32_t,uint32_t> code_ends_;
     std::set<uint32_t> code_seen_,debug_seen_;
     std::set<std::tuple<uint32_t,uint16_t,uint32_t>> debug_contexts_;
 };

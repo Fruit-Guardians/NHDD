@@ -208,6 +208,13 @@ public:
                 }
                 cfg.fast_capture=std::strcmp(value,"off")!=0;continue;
             }
+            if (std::strcmp(argv[i], "--art-refill") == 0 && i+1<argc) {
+                const char* value=argv[++i];
+                if(std::strcmp(value,"auto") && std::strcmp(value,"off")) {
+                    std::fprintf(stderr,"[-] --art-refill requires auto or off\n");return 1;
+                }
+                cfg.art_refill=std::strcmp(value,"off")!=0;continue;
+            }
             if (std::strcmp(argv[i], "--fast-max-kb") == 0 && i+1<argc) {
                 char* end=nullptr;const unsigned long n=std::strtoul(argv[++i],&end,10);
                 if(!end || *end || n<4 || n>8192) {
@@ -453,7 +460,7 @@ public:
             // package subprocess ordering changes between polls.
             std::unordered_map<std::string, MapsMonitor> monitors;
             bool stop_numeric_continuous = false;
-            FastCaptureService fast_capture(target,is_numeric,size_t(cfg.fast_max_kb)*1024,mode & ScanMode::DEX);
+            FastCaptureService fast_capture(target,is_numeric,size_t(cfg.fast_max_kb)*1024,mode & ScanMode::DEX,cfg.art_refill);
             {
                 std::vector<int> filter;
                 for(int p=0;p<pid_count;++p)filter.push_back(std::atoi(pids[p]));
@@ -475,6 +482,10 @@ public:
             if(std::strcmp(cfg.event_backend,"tracefs")==0 && !kernel_events.active()) {
                 std::fprintf(stderr,"[-] Required tracefs backend could not establish target filtering\n");return 1;
             }
+            if(cfg.fast_capture && cfg.art_refill && kernel_events.active())scanner.on_art_capture([&](const DexCapture& capture,
+                const MapsRegion* maps,size_t count,const std::function<bool(uintptr_t,void*,size_t)>& read) {
+                if(kernel_events.active())fast_capture.arm_art(capture,maps,count,read);
+            });
             if(cfg.fast_capture)std::fprintf(stderr,kernel_events.active()
                 ? "[*] Fast local capture armed: prefix=%u KiB/event, two passes/8ms, queue=32MiB, output<=256MiB; not atomic\n"
                 : "[!] Fast local capture unavailable without tracefs; polling cannot rescue vanished bytes (prefix=%u KiB)\n",
@@ -626,6 +637,7 @@ public:
                     std::chrono::seconds(cfg.monitor_interval);
                 const bool lost_events = kernel_events.losses() != observed_losses;
                 if (lost_events) {
+                    if(cfg.fast_capture && cfg.art_refill)fast_capture.invalidate_art();
                     observed_losses = kernel_events.losses();
                     std::fprintf(stderr, "[!] Kernel event loss/read failure count=%llu; reconciling full maps snapshots\n",
                                  static_cast<unsigned long long>(observed_losses));
@@ -657,6 +669,7 @@ public:
                     kernel_events.filter_processes(filter);
                 }
                 if(event_backend_was_active && !kernel_events.active()) {
+                    if(cfg.fast_capture && cfg.art_refill)fast_capture.invalidate_art();
                     std::fprintf(stderr,"[!] Event source stopped: %s\n",kernel_events.error().c_str());
                     if(std::strcmp(cfg.event_backend,"tracefs")==0)return 1;
                     std::fprintf(stderr,"[!] Continuing with maps/content polling\n");
@@ -1074,6 +1087,7 @@ private:
             "    --art-dex auto|off|only  Verified-build ART DEX discovery (default auto); only skips header/container scan\n"
             "    --art-scan-mb N  Native-heap read budget per round, 1..512 MiB (default 64); resumes next round\n"
             "    --fast-capture auto|off  Early tracefs local double-read capture (default auto); continuous only\n"
+            "    --art-refill auto|off  Associate ART candidates; method-only validated temporal composites (default auto)\n"
             "    --fast-max-kb N  Per-event prefix 4..8192 KiB (default 1024), shared 8ms read budget\n"
             "    --anon        Only scan anonymous mappings\n"
             "    --region-delay MS  Pause between regions (ms)\n"

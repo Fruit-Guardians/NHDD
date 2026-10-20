@@ -38,6 +38,8 @@ adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_art_
 
 ART 候选首次接入时记录对象、虚表与 Build ID。已由 header 扫描发现的候选保持原始来源，不追改已有 metadata。所有内存读取仍是 best-effort live，不是冻结快照。
 
+continuous + tracefs 下可将已发现的完整 ART 候选用于[快速片段关联回填](art-refill.md)，默认 `--art-refill auto`。此路径另存方法级 temporal composite，不将其冒充原始整份内存观测；只验证发现能力时使用 snapshot，或额外 `--fast-capture off`。
+
 ## Root 真机验证
 
 2026-10-20，当前 Root Pixel 6：

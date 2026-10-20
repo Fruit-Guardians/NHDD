@@ -32,6 +32,7 @@ struct NhddConfig {
     // tracefs: fail if unavailable. poll: no kernel event source.
     char event_backend[16] = "auto";
     bool fast_capture = true;       // collector-side bounded double reads, tracefs only
+    bool art_refill = true;         // validated method-only temporal composites from ART candidates
     unsigned fast_max_kb = 1024;   // per-event prefix, both reads share an 8ms budget
     int  monitor_interval = 2;      // --monitor-interval: seconds between maps checks (default 2s)
     int  monitor_duration = 0;      // --monitor-duration: total monitoring time in seconds (0=unlimited)
