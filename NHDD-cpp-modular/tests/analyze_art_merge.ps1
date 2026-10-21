@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$Directory,
-    [ValidateSet('multi','conflict','outside','remap','off','burst')][string]$Expected='multi'
+    [ValidateSet('multi','conflict','outside','remap','off','burst','short-burst')][string]$Expected='multi'
 )
 $ErrorActionPreference='Stop'
 $probe=Get-ChildItem $Directory -Filter '*.probe.log' | Select-Object -First 1
@@ -15,14 +15,14 @@ $selected=@($lines | ForEach-Object {
         [pscustomobject]@{index=[int]$Matches[1];offset=[int]$Matches[2];length=[int]$Matches[3];name=$Matches[4]}
     }
 })
-if($selected.Count -ne $(if($Expected -eq 'burst'){32}else{3})){throw 'Unexpected selected method count'}
+if($selected.Count -ne $(if($Expected -eq 'short-burst'){64}elseif($Expected -eq 'burst'){32}else{3})){throw 'Unexpected selected method count'}
 $windows=@($lines | ForEach-Object {
     if($_ -match '^WINDOW trial=(\d+) us=(\d+) begin=([\d.]+) end=([\d.]+) method=(\d+) offset=(\d+) alternate=(\d+)') {
         [pscustomobject]@{trial=[int]$Matches[1];us=[int]$Matches[2];begin=[double]$Matches[3];end=[double]$Matches[4];
             method=[int]$Matches[5];offset=[int]$Matches[6];alternate=[int]$Matches[7]}
     }
 })
-if($windows.Count -ne $(if($Expected -eq 'conflict'){130}elseif($Expected -eq 'burst'){32}else{120})){throw 'Incomplete window schedule'}
+if($windows.Count -ne $(if($Expected -eq 'conflict'){130}elseif($Expected -eq 'short-burst'){64}elseif($Expected -eq 'burst'){32}else{120})){throw 'Incomplete window schedule'}
 for($i=0;$i -lt $windows.Count;++$i) {
     $w=$windows[$i]
     if($w.trial -ne $i -or $w.offset -ne $selected[$w.method].offset -or
@@ -129,6 +129,7 @@ switch($Expected) {
     'remap' {if($fullMerges -or $scan -notmatch 'mapping_invalidations=[1-9]'){throw 'Generation crossed remap'}}
     'off' {if($merges.Count -or $conflicts.Count -or !$refills){throw 'Merge-off control failed'}}
     'burst' {if(!$merges.Count -or $conflicts.Count -or $fullSingles){throw 'Burst provenance/composite failed'}}
+    'short-burst' {if($conflicts.Count -or $fullSingles){throw 'Short-burst provenance/composite failed'}}
 }
 $rows=@(foreach($method in 0..($selected.Count-1)){foreach($us in 1000,5000,20000,50000){
     $group=@($windows | Where-Object {$_.method -eq $method -and $_.us -eq $us -and !$_.alternate})

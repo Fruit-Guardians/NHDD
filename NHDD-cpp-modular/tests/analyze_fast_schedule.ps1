@@ -56,9 +56,10 @@ foreach($file in Get-ChildItem $fast -Filter '*.json') {
             }
         }
     } elseif($m.status -eq 'reconstructed_method_composite') {
+        if([Convert]::ToUInt64(($m.dex_address -replace '^0x',''),16) -ne $address){continue}
         ++$refills;$attempt=1;if($null -ne $m.verification_attempt){$attempt=[int]$m.verification_attempt}
         if(!$attempts.ContainsKey("$attempt")){$attempts["$attempt"]=0};++$attempts["$attempt"]
-        foreach($patch in $m.patches){$verifiedMethods[$patch.offset]=$true;foreach($w in $windows | Where-Object {$_.offset -eq $patch.offset -and
+        foreach($patch in $m.patches){$verifiedMethods[[long]$patch.offset]=$true;foreach($w in $windows | Where-Object {$_.offset -eq $patch.offset -and
             $m.capture_end_boot -ge $_.begin -and $m.capture_begin_boot -le $_.end}) {
             $verifiedHits[$w.trial]=$true;$delay=1000*($m.verification_begin_boot-$m.capture_end_boot)
             if(!$waits.ContainsKey($w.trial) -or $delay -lt $waits[$w.trial]){$waits[$w.trial]=$delay}
@@ -68,7 +69,8 @@ foreach($file in Get-ChildItem $fast -Filter '*.json') {
 $rows=@(foreach($us in 1000,5000,20000,50000){
     $group=@($windows | Where-Object {$_.us -eq $us -and !$_.alternate})
     [pscustomobject]@{ms=$us/1000;trials=$group.Count;raw_double_match_windows=@($group | Where-Object {$rawHits.ContainsKey($_.trial)}).Count;
-        independently_verified_windows=@($group | Where-Object {$verifiedHits.ContainsKey($_.trial)}).Count}
+        independently_verified_windows=@($group | Where-Object {$verifiedHits.ContainsKey($_.trial)}).Count;
+        independently_verified_methods=@($group | Select-Object -ExpandProperty offset -Unique | Where-Object {$verifiedMethods.ContainsKey([long]$_)}).Count}
 })
 [pscustomobject]@{name=$prefix;windows=$windows.Count;raw_double_match_windows=$rawHits.Count;verified_windows=$verifiedHits.Count;
     exposed_methods=$methods.Count;independently_verified_methods=$verifiedMethods.Count;refills=$refills;successful_attempts=$attempts;per_window_verification_wait_p50_ms=(Percentile $waits.Values .50);

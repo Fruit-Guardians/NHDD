@@ -22,6 +22,7 @@
 #include "common_types.hpp"
 #include "maps_parser.hpp"
 #include "nhdd_config.hpp"
+#include "process_stat.hpp"
 
 class MapsMonitor {
 public:
@@ -121,68 +122,7 @@ public:
     // Linux process identity must include starttime; a numeric PID alone may be
     // recycled while a long-running continuous session is active.
     static bool read_process_starttime(const char* pid, uint64_t* out) {
-        if (!pid || !*pid || !out) {
-            errno = EINVAL;
-            return false;
-        }
-        char path[128];
-        const int path_length =
-            std::snprintf(path, sizeof(path), "/proc/%s/stat", pid);
-        if (path_length < 0 ||
-            static_cast<size_t>(path_length) >= sizeof(path)) {
-            errno = ENAMETOOLONG;
-            return false;
-        }
-        FILE* f = std::fopen(path, "r");
-        if (!f) return false;
-
-        char line[4096];
-        errno = 0;
-        const bool ok = std::fgets(line, sizeof(line), f) != nullptr;
-        const int read_errno = errno;
-        const bool read_failed = std::ferror(f) != 0;
-        const bool truncated = ok && !std::strchr(line, '\n') &&
-                               std::feof(f) == 0;
-        errno = 0;
-        const int close_result = std::fclose(f);
-        const int close_errno = errno;
-        if (!ok || read_failed || truncated || close_result != 0) {
-            errno = read_errno != 0
-                        ? read_errno
-                        : (truncated
-                               ? EOVERFLOW
-                               : (close_errno != 0 ? close_errno : EIO));
-            return false;
-        }
-
-        // comm is parenthesized and may itself contain spaces or ')'. The last
-        // ')' is the only safe place to start tokenizing fields 3..22.
-        const char* right_paren = std::strrchr(line, ')');
-        if (!right_paren || right_paren[1] != ' ') {
-            errno = EPROTO;
-            return false;
-        }
-        std::istringstream fields(right_paren + 2);
-        std::string token;
-        for (int field = 3; field <= 22; ++field) {
-            if (!(fields >> token)) {
-                errno = EPROTO;
-                return false;
-            }
-            if (field == 22) {
-                char* end = nullptr;
-                errno = 0;
-                unsigned long long value = std::strtoull(token.c_str(), &end, 10);
-                if (errno != 0 || end == token.c_str() || *end != '\0') {
-                    if (errno == 0) errno = EPROTO;
-                    return false;
-                }
-                *out = static_cast<uint64_t>(value);
-                return true;
-            }
-        }
-        errno = EPROTO;
-        return false;
+        return ProcessStat::starttime(pid,out);
     }
 
     static std::string process_identity_key(const char* pid, uint64_t starttime) {

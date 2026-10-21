@@ -5,7 +5,12 @@
 #include <mutex>
 #include <thread>
 #include <condition_variable>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include "fast_schedule.hpp"
+#include "fast_buffer_pool.hpp"
+#include "capture_coordination.hpp"
+#include "capture_tuning.hpp"
 #include <sys/uio.h>
 #include "fast_capture.hpp"
 #include "syscall_events.hpp"
@@ -16,8 +21,9 @@
 
 class FastCaptureService {
 public:
-    FastCaptureService(std::string target,bool numeric,size_t cap,bool dex,bool art_refill=true,bool art_merge=true)
-        :target_(std::move(target)),numeric_(numeric),cap_(cap),dex_(dex),refill_(art_refill && dex,art_merge) { decoder_.early_entries(true); }
+    FastCaptureService(std::string target,bool numeric,size_t cap,bool dex,bool art_refill=true,bool art_merge=true,bool prewarm=true)
+        :target_(std::move(target)),numeric_(numeric),cap_(cap),dex_(dex),buffer_pool_(prewarm?CaptureTuning::pool_slots:0),
+        refill_(art_refill && dex,art_merge) { decoder_.early_entries(true); }
     ~FastCaptureService() {stop_publication();}
     bool start_publication(const char* out_dir) {
         if(publisher_.joinable() || stopping_)return false;
@@ -38,16 +44,19 @@ public:
         refill_.arm(capture,maps,count,read);
     }
     void invalidate_art() {refill_.invalidate_all();}
+    void scan_checkpoint() {if(CaptureTuning::background_yield)scan_background_.checkpoint(coordination_);}
     void targets(const std::vector<int>& pids) {
         std::unordered_map<int,uint64_t> next;
         for(int pid:pids) {
-            TrackedProcess p;if(ProcessManager::inspect(pid,&p))next[pid]=p.starttime;
+            TrackedProcess p;if(ProcessManager::inspect(pid,&p,false))next[pid]=p.starttime;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
-        if(numeric_ && !targets_.empty())return; // Numeric PID is pinned to its original generation.
-        targets_=std::move(next);
+        {std::lock_guard<std::mutex> lock(target_mutex_);
+            if(numeric_ && !targets_.empty())return; // Numeric PID remains generation-pinned.
+            targets_.swap(next);
+        } // Destroy the previous target map outside both collector queue locks.
     }
     void line(const std::string& text) {
+        CaptureCoordination::Lease capture_active(coordination_);
         auto events=decoder_.ingest(text,[this](int tid,int* pid,uint64_t* ticks,bool* compat) {
             return resolve(tid,pid,ticks,compat);
         });
@@ -66,44 +75,88 @@ public:
             "retry_attempts=%llu retry_exhausted=%llu queue_wait_max_ms=%.3f worker_failed=%u\n",
             publisher_started_?1u:0u,schedule_.peak_items,schedule_.peak_bytes,schedule_.items,ull(retry_attempts_),ull(retry_exhausted_),
             queue_wait_max_ms_,publisher_failed_?1u:0u);
+        std::fprintf(stderr,"[*] Fast contention: buffer_hits=%llu buffer_misses=%llu handoff_contended=%llu "
+            "scan_pauses=%llu publication_pauses=%llu publisher_nice=%d publisher_nice_end=%d priority_changes=%llu priority_failures=%llu (own thread only)\n",
+            ull(buffer_hits_),ull(buffer_misses_),ull(handoff_contended_),ull(scan_background_.pauses),
+            ull(publication_background_.pauses),publisher_nice_,publisher_nice_end_,ull(priority_changes_),ull(priority_failures_));
+        std::fprintf(stderr,"[*] Fast policy: background_yield=%u nice_delta=%d pool_slots=%u adaptive_nice=%u\n",
+            CaptureTuning::background_yield?1u:0u,CaptureTuning::nice_delta,buffer_pool_.capacity(),CaptureTuning::adaptive_nice?1u:0u);
+        std::fprintf(stderr,"[*] Fast merge flush: enabled=%u scheduled=%llu\n",CaptureTuning::coalesce_merge?1u:0u,ull(merge_flush_jobs_));
     }
 private:
+#ifdef NHDD_TESTING
+    friend struct CaptureTestAccess;
+#endif
     struct Snapshot {
         MemorySyscallEvent event;FastObservation observation;uint64_t sequence=0;
         std::vector<ArtRefillService::Link> links;
-        bool raw_published=false;unsigned attempts=0;double due=0;
+        bool raw_published=false,merge_only=false;unsigned attempts=0;double due=0;
         size_t bytes() const {return observation.first.size()+observation.second.size();}
     };
     static unsigned long long ull(uint64_t n) {return static_cast<unsigned long long>(n);}
     static double now() {
         timespec t{};::clock_gettime(CLOCK_BOOTTIME,&t);return double(t.tv_sec)+double(t.tv_nsec)*1e-9;
     }
+    static int own_priority() {
+        const auto tid=static_cast<id_t>(::syscall(SYS_gettid));errno=0;
+        const int value=::getpriority(PRIO_PROCESS,tid);return errno?20:value;
+    }
+    void publisher_priority(bool recent) {
+        const int wanted=CaptureTuning::publisher_nice(publisher_base_nice_,CaptureTuning::nice_delta,recent);
+        if(wanted==20 || wanted==publisher_current_nice_ || priority_failed_)return;
+        const auto tid=static_cast<id_t>(::syscall(SYS_gettid));
+        if(::setpriority(PRIO_PROCESS,tid,wanted)!=0) {
+            ++priority_failures_;priority_failed_=true;
+            std::fprintf(stderr,"[!] Could not set own publisher nice to %d: %s; retaining %d\n",wanted,std::strerror(errno),publisher_current_nice_);
+        } else {
+            publisher_current_nice_=wanted;++priority_changes_;
+        }
+    }
     void publication_loop() {
+        struct EndPriority {int& result;~EndPriority(){result=own_priority();}} end_priority{publisher_nice_end_};
+        struct Later {bool operator()(const Snapshot& a,const Snapshot& b) const {return a.due>b.due;}};
+        // Publisher-private heap: never scan/move deferred jobs under the
+        // producer mutex. Outstanding accounting still includes every retry.
+        std::vector<Snapshot> deferred;
         try {
+            publisher_base_nice_=publisher_current_nice_=own_priority();publisher_priority(true);
+            if(publisher_base_nice_==20){++priority_failures_;priority_failed_=true;std::fprintf(stderr,"[!] Own publisher priority unavailable\n");}
+            publisher_nice_=publisher_current_nice_;deferred.reserve(FastSchedule::max_items);
             for(;;) {
-                Snapshot s;
+                Snapshot s;bool take_retry=false,flush_merges=false,pressure=false;
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
                     for(;;) {
-                        if(queue_.empty()) {if(stopping_)return;ready_.wait(lock);continue;}
-                        auto fresh=queue_.end(),retry=queue_.end();double earliest=now()+1;
+                        if(queue_.empty() && deferred.empty()) {
+                            if(refill_.coalesced_pending()){flush_merges=true;break;}
+                            if(stopping_)return;ready_.wait(lock);continue;
+                        }
                         const double stamp=now();
-                        for(auto it=queue_.begin();it!=queue_.end();++it) {
-                            if(!it->raw_published) {if(fresh==queue_.end())fresh=it;}
-                            else if(it->due<=stamp) {if(retry==queue_.end())retry=it;}
-                            else earliest=std::min(earliest,it->due);
+                        const bool retry_due=!deferred.empty() && deferred.front().due<=stamp;
+                        take_retry=schedule_.retry_turn(!queue_.empty(),retry_due);
+                        if(!take_retry && queue_.empty()) {
+                            ready_.wait_for(lock,std::chrono::duration<double>(std::max(0.001,deferred.front().due-stamp)));continue;
                         }
-                        auto selected=schedule_.retry_turn(fresh!=queue_.end(),retry!=queue_.end())?retry:fresh;
-                        if(selected==queue_.end()) {
-                            ready_.wait_for(lock,std::chrono::duration<double>(std::max(0.001,earliest-stamp)));continue;
-                        }
-                        schedule_.dispatched(selected->raw_published);s=std::move(*selected);queue_.erase(selected);break;
+                        if(!take_retry) {s=std::move(queue_.front());queue_.pop_front();}
+                        pressure=queue_.size()>=32;
+                        break;
                     }
                 }
+                if(flush_merges) {enqueue_merge_flushes();continue;}
+                if(take_retry) {
+                    std::pop_heap(deferred.begin(),deferred.end(),Later{});s=std::move(deferred.back());deferred.pop_back();
+                }
+                schedule_.dispatched(take_retry);
+                // Keep capture isolation through short gaps, but let the same
+                // publisher drain at its inherited nice after a quiet 20ms.
+                // Never boost above inherited priority, touch another TID, or
+                // retry a denied priority change on every pending observation.
+                if(CaptureTuning::adaptive_nice)publisher_priority(coordination_.busy(CaptureCoordination::now(),20000000));
+                if(CaptureTuning::background_yield)publication_background_.checkpoint(coordination_);
                 const bool retry=s.raw_published;const size_t bytes=s.bytes();
-                if(retry)++retry_attempts_;
-                else queue_wait_max_ms_=std::max(queue_wait_max_ms_,1000*(now()-s.observation.end));
-                refill_.begin_batch();last_written_=0;
+                if(retry) {if(!s.merge_only || s.attempts)++retry_attempts_;}
+                else if(!s.merge_only)queue_wait_max_ms_=std::max(queue_wait_max_ms_,1000*(now()-s.observation.end));
+                refill_.begin_batch(pressure && !s.merge_only);last_written_=0;
                 const size_t reserve=retry?0:3*bytes+1024*1024;
                 bool ok=false;
                 if(published_bytes_+reserve>256u*1024*1024)++disk_drops_;
@@ -115,14 +168,30 @@ private:
                 ++s.attempts;
                 const bool again=ok && !s.links.empty() && FastSchedule::can_retry(s.attempts);
                 if(ok && !s.links.empty() && !again)++retry_exhausted_;
-                {std::lock_guard<std::mutex> lock(mutex_);
-                    if(again) {s.due=now()+std::max(FastSchedule::retry_delay(s.attempts),refill_.budget_wait());queue_.push_back(std::move(s));}
-                    else schedule_.release(bytes);
+                if(again) {
+                    s.due=now()+std::max(FastSchedule::retry_delay(s.attempts),refill_.budget_wait());
+                    deferred.push_back(std::move(s));std::push_heap(deferred.begin(),deferred.end(),Later{});
+                } else {
+                    if(CaptureTuning::pool_slots && !s.merge_only)(void)buffer_pool_.give(s.observation);
+                    std::lock_guard<std::mutex> lock(mutex_);schedule_.release(bytes);
                 }
             }
         } catch(const std::exception& e) {
             std::fprintf(stderr,"[-] Fast publisher stopped: %s\n",e.what());publisher_failed_=true;
-            std::lock_guard<std::mutex> lock(mutex_);write_failures_+=schedule_.items;queue_.clear();schedule_.used=0;schedule_.items=0;
+            std::deque<Snapshot> abandoned;
+            {std::lock_guard<std::mutex> lock(mutex_);write_failures_+=schedule_.items;abandoned.swap(queue_);schedule_.used=0;schedule_.items=0;}
+            // Destruction and allocator work occur after releasing the handoff.
+        }
+    }
+    void enqueue_merge_flushes() {
+        for(auto& link:refill_.take_coalesced()) {
+            const auto& b=*link.baseline;Snapshot task;task.merge_only=true;task.raw_published=true;
+            task.event.pid=static_cast<int>(b.identity.pid);task.event.starttime=b.identity.process_start_time;
+            task.observation.address=b.identity.address;task.observation.begin=task.observation.end=now();
+            task.sequence=++merge_flush_sequence_;task.links.push_back(std::move(link));
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(!schedule_.admit(0)){++queue_drops_;continue;}
+            schedule_.retain(0);queue_.push_back(std::move(task));++merge_flush_jobs_;
         }
     }
     bool generation(int pid,uint64_t expected) const {
@@ -130,22 +199,19 @@ private:
         return MapsMonitor::read_process_starttime(text.c_str(),&ticks) && ticks==expected;
     }
     bool resolve(int tid,int* pid,uint64_t* ticks,bool* compat) {
-        const auto status="/proc/"+std::to_string(tid)+"/status";
-        FILE* f=std::fopen(status.c_str(),"r");if(!f)return false;
-        char line[256];int leader=0;
-        while(std::fgets(line,sizeof(line),f))if(std::sscanf(line,"Tgid: %d",&leader)==1)break;
-        std::fclose(f);
-        TrackedProcess p;if(!ProcessManager::inspect(leader,&p))return false;
+        int leader=0;if(!ProcessStat::tgid(tid,&leader))return false;
+        TrackedProcess p;if(!ProcessManager::inspect(leader,&p,!numeric_))return false;
         bool match=false;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::mutex> lock(target_mutex_);
             auto it=targets_.find(leader);match=it!=targets_.end() && it->second==p.starttime;
-            if(!match && !numeric_) {
-                TrackedProcess parent;
-                if(ProcessManager::inspect(p.parent,&parent)) {
-                    it=targets_.find(parent.pid);
-                    match=it!=targets_.end() && it->second==parent.starttime && p.starttime>=parent.starttime;
-                }
+        }
+        if(!match && !numeric_) {
+            TrackedProcess parent;
+            if(ProcessManager::inspect(p.parent,&parent,false)) {
+                std::lock_guard<std::mutex> lock(target_mutex_);
+                const auto it=targets_.find(parent.pid);
+                match=it!=targets_.end() && it->second==parent.starttime && p.starttime>=parent.starttime;
             }
         }
         if(!match && !numeric_)match=PackageProcessTracker::matches(target_.c_str(),p.command);
@@ -187,20 +253,32 @@ private:
                 read(address,static_cast<uint8_t*>(bytes),count)==count;
         };
         auto links=refill_.prepare(event,linked_read);
-        auto observation=FastObservation::capture(event.address,event.end-event.address,cap_,read,
+        FastObservation buffers;
+        if(CaptureTuning::pool_slots) {
+            buffers=std::move(collector_spare_);
+            if(buffers.first.capacity()<4096)buffers=buffer_pool_.take();
+        }
+        const size_t needed=std::min(cap_,size_t(event.end-event.address));
+        if(buffers.first.capacity()>=needed && buffers.second.capacity()>=needed)++buffer_hits_;else ++buffer_misses_;
+        auto observation=FastObservation::capture_reusing(std::move(buffers),event.address,event.end-event.address,cap_,read,
             [&]{return generation(event.pid,event.starttime);},[]{return now();});
         refill_.finish(links,linked_read);
-        if(!observation.generation_valid) {++rejected_;return;}
-        if(!observation.read_bytes(0) && !observation.read_bytes(1)) {++unreadable_;return;}
+        auto keep_spare=[&] {
+            if(CaptureTuning::pool_slots && observation.first.capacity()<=4096 && observation.second.capacity()<=4096 && observation.pages.capacity()<=1)
+                collector_spare_=std::move(observation);
+        };
+        if(!observation.generation_valid) {++rejected_;keep_spare();return;}
+        if(!observation.read_bytes(0) && !observation.read_bytes(1)) {++unreadable_;keep_spare();return;}
         Snapshot s;s.event=event;s.observation=std::move(observation);s.sequence=++sequence_;s.links=std::move(links);
-        {std::lock_guard<std::mutex> lock(mutex_);
+        {std::unique_lock<std::mutex> lock(mutex_,std::defer_lock);
+            if(!lock.try_lock()) {++handoff_contended_;lock.lock();}
             if(publisher_failed_ || stopping_ || !schedule_.admit(s.bytes())) {++queue_drops_;return;}
             schedule_.retain(s.bytes());queue_.push_back(std::move(s));}
         ready_.notify_one();
     }
     bool publish_one(const std::string& dir,Snapshot& s) {
         const auto& o=s.observation;const auto& e=s.event;
-        char name[192];std::snprintf(name,sizeof(name),"fast_%d_%llx_%llx_%d_%llu_%llu",e.pid,ull(e.starttime),
+        char name[192];std::snprintf(name,sizeof(name),"%s_%d_%llx_%llx_%d_%llu_%llu",s.merge_only?"fast_merge_flush":"fast",e.pid,ull(e.starttime),
             ull(e.address),::getpid(),ull(static_cast<uint64_t>(o.begin*1e9)),ull(s.sequence));
         const std::string stem=dir+"/"+name;
         if(s.raw_published) {
@@ -288,11 +366,19 @@ private:
     }
     std::string target_;bool numeric_;size_t cap_;bool dex_;
     SyscallEvents decoder_;
-    std::mutex mutex_;std::unordered_map<int,uint64_t> targets_;
+    alignas(64) std::mutex mutex_;
+    alignas(64) std::mutex target_mutex_;
+    std::unordered_map<int,uint64_t> targets_;
+    FastBufferPool buffer_pool_;FastObservation collector_spare_;
+    CaptureCoordination coordination_;CaptureCoordination::Background scan_background_,publication_background_;
+    uint64_t buffer_hits_=0,buffer_misses_=0,handoff_contended_=0;int publisher_nice_=20,publisher_nice_end_=20;
+    int publisher_base_nice_=20,publisher_current_nice_=20;bool priority_failed_=false;
+    uint64_t priority_changes_=0,priority_failures_=0;
     std::deque<Snapshot> queue_;size_t budget_bytes_=0;double budget_epoch_=0;
     FastSchedule schedule_;std::condition_variable ready_;std::thread publisher_;std::string output_dir_;
     bool stopping_=false,publisher_started_=false;std::atomic<bool> publisher_failed_{false};
     uint64_t retry_attempts_=0,retry_exhausted_=0;double queue_wait_max_ms_=0;
+    uint64_t merge_flush_sequence_=0,merge_flush_jobs_=0;
     uint64_t sequence_=0,published_=0,published_bytes_=0,dex_observations_=0,disk_drops_=0,write_failures_=0;
     size_t last_written_=0;
     ArtRefillService refill_;

@@ -36,6 +36,7 @@
 #include "so_artifact_identity.hpp"
 #include "so_manifest.hpp"
 #include "process_generation_guard.hpp"
+#include "process_stat.hpp"
 
 static uint64_t read_process_start_time_inline(const char* pid);
 
@@ -413,39 +414,7 @@ static int deep_scan_mem_elf_inline(int mem_fd, pid_t pid, const char* pid_s,
 // ---- DEX capture helpers -------------------------------------------------
 
 static uint64_t read_process_start_time_inline(const char* pid) {
-    char path[64];
-    std::snprintf(path, sizeof(path), "/proc/%s/stat", pid);
-    FILE* f = std::fopen(path, "r");
-    if (!f) return 0;
-    char line[4096];
-    if (!std::fgets(line, sizeof(line), f)) {
-        std::fclose(f);
-        return 0;
-    }
-    std::fclose(f);
-
-    // comm (field 2) is parenthesized and may itself contain spaces or ')'.
-    char* p = std::strrchr(line, ')');
-    if (!p) return 0;
-    ++p;
-    while (*p == ' ') ++p;
-    for (int field = 3; field <= 22; ++field) {
-        if (!*p) return 0;
-        char* end = p;
-        while (*end && *end != ' ') ++end;
-        if (field == 22) {
-            char saved = *end;
-            *end = '\0';
-            char* parse_end = nullptr;
-            unsigned long long value = std::strtoull(p, &parse_end, 10);
-            bool valid = parse_end && *parse_end == '\0';
-            *end = saved;
-            return valid ? static_cast<uint64_t>(value) : 0;
-        }
-        p = end;
-        while (*p == ' ') ++p;
-    }
-    return 0;
+    uint64_t value=0;return ProcessStat::starttime(pid,&value)?value:0;
 }
 
 static bool write_staged_bytes_inline(const char* temporary_path,
@@ -604,6 +573,7 @@ public:
     using ArtCaptureObserver=std::function<void(const DexCapture&,const MapsRegion*,size_t,
         const std::function<bool(uintptr_t,void*,size_t)>&)>;
     void on_art_capture(ArtCaptureObserver observer) {art_capture_observer_=std::move(observer);}
+    void on_background_read(std::function<void()> checkpoint) {background_checkpoint_=std::move(checkpoint);}
     NhddScanner(DexDedup& dex_dedup, SoDedup& so_dedup, JniDedup& jni_dedup)
         : dex_dedup_(dex_dedup), so_dedup_(so_dedup), jni_dedup_(jni_dedup) {}
 
@@ -746,9 +716,12 @@ public:
         // READ_REMOTE macro equivalent: retry-aware. The first C++ OOP
         // refactor used one-shot pread/process_vm_readv here, which made
         // large DEX reads more fragile on partially readable mappings.
+        auto background_read=[&](void* out,size_t length,uintptr_t address) {
+            if(background_checkpoint_)background_checkpoint_();
+            return read_remote_retry_inline(mem_fd,target_pid,out,length,address,cfg.use_vm_readv);
+        };
         #define READ_REMOTE(buf, size, addr) \
-            read_remote_retry_inline(mem_fd, target_pid, (buf), (size), \
-                                     static_cast<uintptr_t>(addr), cfg.use_vm_readv)
+            background_read((buf),(size),static_cast<uintptr_t>(addr))
 
 
         const ScanCounters counters_before_scan = c;
@@ -1665,6 +1638,7 @@ private:
     SoDedup& so_dedup_;
     JniDedup& jni_dedup_;
     ArtCaptureObserver art_capture_observer_;
+    std::function<void()> background_checkpoint_;
     DexCaptureCache dex_capture_cache_;
     SoManifestSessionCacheInline so_manifest_sessions_{128};
     std::unordered_set<std::string> runtime_processed_;

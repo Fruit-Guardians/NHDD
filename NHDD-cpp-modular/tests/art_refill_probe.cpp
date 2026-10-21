@@ -39,7 +39,8 @@ extern "C" JNIEXPORT jstring JNICALL Java_ArtRefillProbe_prepare(JNIEnv* env,jcl
     const char* out=env->GetStringUTFChars(prefix,nullptr);assert(out);const std::string output=out;env->ReleaseStringUTFChars(prefix,out);
     const char* mode_chars=env->GetStringUTFChars(mode,nullptr);assert(mode_chars);const std::string test=mode_chars;
     env->ReleaseStringUTFChars(mode,mode_chars);
-    const bool burst=test=="burst";
+    const bool short_burst=test=="short-burst";
+    const bool burst=test=="burst" || short_burst;
     const bool multi=test.find("multi")==0 || test=="conflict" || burst;
     FILE* maps=std::fopen("/proc/self/maps","r");assert(maps);char line[2048];
     while(std::fgets(line,sizeof(line),maps)) {
@@ -56,11 +57,11 @@ extern "C" JNIEXPORT jstring JNICALL Java_ArtRefillProbe_prepare(JNIEnv* env,jcl
     unsigned eligible=0;
     for(const auto& m:layout.methods)if(m.instructions_offset>=2*page && m.bytes>=6 &&
         (base+m.instructions_offset)/page==(base+m.instructions_offset+m.bytes-1)/page) {
-        if(burst) {if(eligible++%12)continue;}
+        if(burst) {if(eligible++%(short_burst?6:12))continue;}
         else if(!selected.empty() && m.instructions_offset/page==selected.back().instructions_offset/page)continue;
-        selected.push_back(m);if(selected.size()==(burst?32u:(multi?3u:1u)))break;
+        selected.push_back(m);if(selected.size()==(burst?(short_burst?64u:32u):(multi?3u:1u)))break;
     }
-    assert(selected.size()==(burst?32u:(multi?3u:1u)));
+    assert(selected.size()==(burst?(short_burst?64u:32u):(multi?3u:1u)));
     method_offset=selected[0].instructions_offset;method_bytes=selected[0].bytes;
     assert(method_offset && method_offset/page != (original.size()-1)/page);
     write_file(output+".golden.dex",original);
@@ -91,8 +92,9 @@ extern "C" JNIEXPORT void JNICALL Java_ArtRefillProbe_windows(JNIEnv* env,jclass
         const uintptr_t last=base+original.size()-1;
         permission(last,1,PROT_READ|PROT_WRITE);*reinterpret_cast<uint8_t*>(last)^=0x5a;permission(last,1,PROT_READ);
     }
-    const bool burst=test=="burst";
-    const unsigned trials=burst?32u:(multi?(test=="conflict"?130u:120u):(test=="remap"?2u:40u));
+    const bool short_burst=test=="short-burst";
+    const bool burst=test=="burst" || short_burst;
+    const unsigned trials=burst?(short_burst?64u:32u):(multi?(test=="conflict"?130u:120u):(test=="remap"?2u:40u));
     for(unsigned i=0;i<trials;++i) {
         const size_t index=burst?i:(multi?(i<120?i/40:0):0);
         method_offset=selected[index].instructions_offset;method_bytes=selected[index].bytes;
@@ -108,7 +110,7 @@ extern "C" JNIEXPORT void JNICALL Java_ArtRefillProbe_windows(JNIEnv* env,jclass
             if(multi)::usleep(1500000);
         }
         const unsigned durations[]={1000,5000,20000,50000};
-        const unsigned us=(test=="remap" || i>=120)?20000:durations[burst?i%4:(i%40)/10];
+        const unsigned us=(test=="remap" || i>=120)?20000:durations[short_burst?i%2:(burst?i%4:(i%40)/10)];
         method(true,i>=120);const double begin=boot();::usleep(us);method(false);const double end=boot();
         std::printf("WINDOW trial=%u us=%u begin=%.9f end=%.9f method=%zu offset=%zu alternate=%u\n",
             i,us,begin,end,index,method_offset,i>=120?1u:0u);std::fflush(stdout);::usleep(burst?2000:20000);
