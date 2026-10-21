@@ -352,7 +352,7 @@ nhdd_output/<package>/<YYYYMMDD-HHMMSS>/
 
 ```bash
 cd gui
-wails build
+wails build -trimpath -ldflags "-s -w -buildid="
 ```
 
 运行时把 Android ARM64 版 `nhdd` 放在 GUI 可执行文件同目录：
@@ -450,10 +450,7 @@ NHDD/
 └── BUILD_WINDOWS.md               # Windows/Linux GUI 构建说明
 ```
 
-## 作者
-
-- **漫宿骄盛**
-- **weixiao**
+## 项目
 
 仓库地址：https://github.com/Fruit-Guardians/NHDD
 

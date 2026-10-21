@@ -14,7 +14,12 @@ foreach($line in Get-Content -LiteralPath (Join-Path $dir 'SHA256SUMS.txt')){
     if((Get-FileHash -LiteralPath (Join-Path $dir $name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $hash){throw "Asset checksum mismatch: $name"}
     $hashes[$name]=$hash
 }
-if($hashes.Count -ne 3 -or @(Get-ChildItem -LiteralPath $dir -Filter '*.zip' -File).Count -ne 3){throw 'Expected two binary ZIPs and one source ZIP'}
+$zipNames=@(Get-ChildItem -LiteralPath $dir -Filter '*.zip' -File | ForEach-Object Name)
+if($hashes.Count -notin @(3,5) -or $zipNames.Count -ne $hashes.Count){throw 'Expected three CLI/source ZIPs, optionally two desktop ZIPs'}
+$version=$manifest[0].version
+$expectedNames=@("NHDD-v$version-android-arm64-v8a.zip","NHDD-v$version-android-armeabi-v7a.zip","NHDD-v$version-source.zip")
+if($hashes.Count -eq 5){$expectedNames+=@("NHDD-v$version-tui.zip","NHDD-v$version-windows-amd64-gui.zip")}
+foreach($name in $zipNames){if($name -notin $expectedNames -or !$hashes.ContainsKey($name)){throw 'Unexpected release ZIP'}}
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('nhdd-release-verify-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $temp | Out-Null
 foreach($m in $manifest){
@@ -64,4 +69,40 @@ try {
     try {$sourceLicense=$reader.ReadToEnd().Replace("`r`n","`n")} finally {$reader.Dispose()}
     foreach($text in $licenseTexts){if($text -cne $sourceLicense){throw 'Source and binary package licenses differ'}}
 } finally {$zip.Dispose()}
+foreach($kind in @('tui','windows-amd64-gui')){
+    $name="NHDD-v$version-$kind.zip"
+    if(!$hashes.ContainsKey($name)){continue}
+    $zip=[IO.Compression.ZipFile]::OpenRead((Join-Path $dir $name))
+    try {
+        $entries=@{};foreach($entry in $zip.Entries){
+            if($entries.ContainsKey($entry.FullName) -or $entry.FullName -match '(^/|\\|:|(^|/)\.\.(/|$))'){throw 'Unsafe desktop ZIP entry'}
+            $entries[$entry.FullName]=$entry
+        }
+        foreach($required in @('nhdd','LICENSE','README.md','BUILD-INFO.json','SHA256SUMS.txt','THIRD-PARTY/LLVM-NOTICE.txt','THIRD-PARTY/ANDROID-SYSROOT-NOTICE.txt')){
+            if(!$entries.ContainsKey($required)){throw "Missing desktop file: $required"}
+        }
+        $checksReader=[IO.StreamReader]::new($entries['SHA256SUMS.txt'].Open())
+        try {$checks=$checksReader.ReadToEnd() -split '\r?\n' | Where-Object {$_}} finally {$checksReader.Dispose()}
+        $checked=@{}
+        foreach($line in $checks){
+            if($line -notmatch '^([0-9a-f]{64})  (.+)$'){throw 'Malformed desktop checksum'}
+            $expected=$Matches[1];$relative=$Matches[2]
+            if(!$entries.ContainsKey($relative) -or $checked.ContainsKey($relative) -or $relative -eq 'SHA256SUMS.txt'){throw 'Unexpected desktop checksum target'}
+            $stream=$entries[$relative].Open();$sha=[Security.Cryptography.SHA256]::Create()
+            try {$actual=[Convert]::ToHexString($sha.ComputeHash($stream)).ToLowerInvariant()} finally {$stream.Dispose();$sha.Dispose()}
+            if($actual -ne $expected){throw "Desktop checksum mismatch: $relative"};$checked[$relative]=$actual
+        }
+        if($checked.Count -ne $entries.Count-1){throw 'Incomplete desktop checksum coverage'}
+        $reader=[IO.StreamReader]::new($entries['BUILD-INFO.json'].Open())
+        try {$info=$reader.ReadToEnd() | ConvertFrom-Json} finally {$reader.Dispose()}
+        $arm=@($manifest | Where-Object abi -eq 'arm64-v8a')[0]
+        if($info.source_commit -ne $commits[0] -or $info.component -ne $kind -or $checked['nhdd'] -ne $arm.binary_sha256 -or $checked['LICENSE'] -ne $arm.license_sha256){throw 'Desktop provenance mismatch'}
+        if($kind -eq 'tui'){
+            foreach($required in @('nhdd_tui.py','fix_dex_checksum.py','fix_so.py','scripts/repack_apk_fast.py','scripts/repack_apk.py')){
+                if(!$entries.ContainsKey($required)){throw "Missing TUI dependency: $required"}
+            }
+        } elseif(!$info.gui_trimpath -or !$entries.ContainsKey('nhdd-gui.exe') -or !$entries.ContainsKey('THIRD-PARTY/GO-MODULES.txt') -or !$entries.ContainsKey('THIRD-PARTY/FONT-OFL.txt')){throw 'Missing GUI privacy or attribution metadata'}
+        Write-Output "Verified $name (engine, provenance, licenses, complete internal/asset checksums)"
+    } finally {$zip.Dispose()}
+}
 Write-Output "Release verification passed; retained extracted files: $temp"

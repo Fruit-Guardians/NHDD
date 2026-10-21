@@ -6,7 +6,11 @@
   "frontend:build": "npm run build",
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
-  "author": {
-    "name": "漫宿骄盛"
+  "info": {
+    "companyName": "NHDD contributors",
+    "productName": "NHDD",
+    "productVersion": "9.0.1",
+    "copyright": "Copyright (c) 2026 NHDD contributors",
+    "comments": "Android Root DEX/SO dumper"
   }
 }

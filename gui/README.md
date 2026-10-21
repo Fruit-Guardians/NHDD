@@ -16,4 +16,14 @@ to this in your browser, and you can call your Go code from devtools.
 
 ## Building
 
-To build a redistributable, production mode package, use `wails build`.
+Release builds must remove local source paths. With Go and Wails v2.12.0 on PATH:
+
+```powershell
+wails build -trimpath -ldflags "-s -w -buildid="
+```
+
+Use `NHDD-cpp-modular/release/build-desktop.ps1` for the distributable ZIPs,
+checksums and third-party licenses. Do not upload `wails dev` or debug builds.
+The Windows GUI requires WebView2 Runtime and ADB; the Android engine still
+requires Root. Advanced ART / event / spawn controls are available in the C++ CLI,
+not all exposed by the desktop UI.

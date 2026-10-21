@@ -2,7 +2,7 @@
 
 The desktop GUI is built with Go + Wails v2, providing a native window with a Web frontend. No CGO or GCC required.
 
-Both the desktop GUI and the command-line TUI are only controllers. The Android-side scanner is `nhdd.c`; you still need to compile it into an Android ARM64 binary named `nhdd` and put it next to the GUI executable.
+Both the desktop GUI and the command-line TUI are controllers. Put the Android ARM64 engine named `nhdd` next to the GUI executable. The v9.0.1 release bundles the C++ engine; the `nhdd.c` commands below build the older C baseline, not the current ART-assisted capture implementation.
 
 ## 1. Build Android-side `nhdd`
 
@@ -51,8 +51,8 @@ python scripts/doctor.py --su-cmd "su -c"
 
 ### Prerequisites
 
-- Go 1.21+
-- Wails CLI: `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
+- Go 1.23+ (v9.0.1 Windows release built with Go 1.26.10)
+- Wails CLI: `go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0`
 - Node.js (for frontend build)
 - Android platform-tools for `adb`
 
@@ -60,7 +60,8 @@ python scripts/doctor.py --su-cmd "su -c"
 
 ```powershell
 cd gui
-wails build
+$env:GOFLAGS='-buildvcs=false'
+wails build -trimpath -ldflags "-s -w -buildid="
 ```
 
 Output:
@@ -73,7 +74,7 @@ gui/build/bin/nhdd-gui.exe
 
 ```bash
 cd gui
-wails build
+GOFLAGS=-buildvcs=false wails build -trimpath -ldflags '-s -w -buildid='
 ```
 
 If Go module downloads are blocked, configure proxy first:
@@ -89,7 +90,7 @@ Put files like this:
 ```text
 NHDD-run/
 ├── nhdd-gui.exe   # Wails desktop GUI
-└── nhdd           # Android ARM64 binary compiled from nhdd.c
+└── nhdd           # Android ARM64 engine, not a Windows executable
 ```
 
 Make sure `adb.exe` is in PATH, or fill the absolute adb path in the GUI.
@@ -113,4 +114,10 @@ The GUI also supports a custom placeholder form:
 
 ## 4. Important limitations
 
-NHDD is a no-hook memory scanner. It can quickly dump DEX/SO files already resident in memory, but it does not solve method-body extraction or CodeItem backfill. For second-generation extraction shells, use it as a low-intrusion auxiliary scanner, not as a replacement for a DefineClass + LoadMethod/FART-style pipeline.
+The desktop UI does not expose every v9 ART / event / spawn option. Use the standalone C++ CLI for those features. ART-assisted method recovery requires a supported Build ID; it is not a universal unpacker or a guarantee of a runnable repacked APK.
+
+For release ZIPs, use `NHDD-cpp-modular/release/build-release.ps1` followed by
+`build-desktop.ps1`, `verify-release.ps1` and `scripts/audit_release.py`.
+The privacy gate checks actual ZIP/EXE contents, not just the frontend source.
+Keep project and third-party license notices. Linux GUI builds still need their
+normal Wails system dependencies; the Windows release does not validate Linux.
