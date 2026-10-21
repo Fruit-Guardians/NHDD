@@ -5,6 +5,7 @@ $manifest=Get-Content -LiteralPath (Join-Path $dir 'build-manifest.json') -Raw |
 if(@($manifest).Count -ne 2){throw 'Expected two ABI manifests'}
 $commits=@($manifest.source_commit | Select-Object -Unique)
 if($commits.Count -ne 1 -or ($ExpectedCommit -and $commits[0] -ne $ExpectedCommit)){throw 'Mixed or unexpected source commit'}
+$licenseTexts=@()
 $hashes=@{}
 foreach($line in Get-Content -LiteralPath (Join-Path $dir 'SHA256SUMS.txt')){
     if($line -notmatch '^([0-9a-f]{64})  ([A-Za-z0-9_.-]+\.zip)$'){throw 'Malformed asset checksum'}
@@ -17,11 +18,12 @@ if($hashes.Count -ne 3 -or @(Get-ChildItem -LiteralPath $dir -Filter '*.zip' -Fi
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('nhdd-release-verify-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $temp | Out-Null
 foreach($m in $manifest){
+    if(!$m.project_license_present -or $m.project_license -ne 'MIT' -or $m.license_sha256 -notmatch '^[0-9a-f]{64}$'){throw 'Missing MIT license metadata'}
     $name="NHDD-v$($m.version)-android-$($m.abi).zip"
     $zip=[IO.Compression.ZipFile]::OpenRead((Join-Path $dir $name))
     try {
         $allowed=@('nhdd','README.md','BUILD-INFO.json','SHA256SUMS.txt','THIRD-PARTY/LLVM-NOTICE.txt','THIRD-PARTY/ANDROID-SYSROOT-NOTICE.txt')
-        if($m.project_license_present){$allowed+='LICENSE'}
+        $allowed+='LICENSE'
         foreach($entry in $zip.Entries){if($entry.FullName -notin $allowed){throw "Unexpected ZIP entry: $($entry.FullName)"}}
         if($zip.Entries.Count -ne $allowed.Count){throw 'Missing or duplicate binary package entries'}
     } finally {$zip.Dispose()}
@@ -35,6 +37,9 @@ foreach($m in $manifest){
     if(@(Get-Content -LiteralPath (Join-Path $out 'SHA256SUMS.txt')).Count -ne $allowed.Count-1){throw 'Incomplete internal checksums'}
     $info=Get-Content -LiteralPath (Join-Path $out 'BUILD-INFO.json') -Raw | ConvertFrom-Json
     if($info.source_commit -ne $commits[0] -or $info.abi -ne $m.abi -or $info.binary_sha256 -ne $m.binary_sha256){throw 'Internal build info mismatch'}
+    if($info.project_license -ne 'MIT' -or $info.license_sha256 -ne $m.license_sha256 -or
+       (Get-FileHash -LiteralPath (Join-Path $out 'LICENSE') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $m.license_sha256){throw 'Bundled MIT license mismatch'}
+    $licenseTexts+=(Get-Content -LiteralPath (Join-Path $out 'LICENSE') -Raw).Replace("`r`n","`n")
     $binary=Join-Path $out 'nhdd';$bytes=[IO.File]::ReadAllBytes($binary)
     if($bytes.Length -lt 64 -or $bytes[0] -ne 127 -or $bytes[1] -ne 69 -or $bytes[2] -ne 76 -or $bytes[3] -ne 70){throw 'Not an ELF binary'}
     $machine=[BitConverter]::ToUInt16($bytes,18)
@@ -54,5 +59,9 @@ try {
         }
     }
     if(@($zip.Entries | Where-Object FullName -eq "${prefix}NHDD-cpp-modular/src/main.cpp").Count -ne 1){throw 'Missing source entry point'}
+    $licenseEntry=$zip.GetEntry("${prefix}LICENSE");if(!$licenseEntry){throw 'Source archive missing LICENSE'}
+    $reader=[IO.StreamReader]::new($licenseEntry.Open())
+    try {$sourceLicense=$reader.ReadToEnd().Replace("`r`n","`n")} finally {$reader.Dispose()}
+    foreach($text in $licenseTexts){if($text -cne $sourceLicense){throw 'Source and binary package licenses differ'}}
 } finally {$zip.Dispose()}
 Write-Output "Release verification passed; retained extracted files: $temp"

@@ -10,8 +10,8 @@ $module=Split-Path $PSScriptRoot -Parent
 Push-Location -LiteralPath $module
 try {
     $commit=(& git rev-parse HEAD).Trim();if($LASTEXITCODE -ne 0){throw 'Run from a Git checkout'}
-    & git diff --quiet HEAD -- src
-    if($LASTEXITCODE -ne 0){throw 'Commit source changes before packaging'}
+    & git diff --quiet HEAD -- . ../LICENSE
+    if($LASTEXITCODE -ne 0){throw 'Commit source, release templates and license before packaging'}
     $bin=Join-Path $Ndk 'toolchains/llvm/prebuilt/windows-x86_64/bin'
     foreach($required in @('aarch64-linux-android34-clang++.cmd','armv7a-linux-androideabi23-clang++.cmd','llvm-readelf.exe')){
         if(!(Test-Path -LiteralPath (Join-Path $bin $required))){throw "Missing NDK tool: $required"}
@@ -23,7 +23,14 @@ try {
     $sysrootNotice=Join-Path $Ndk 'toolchains/llvm/prebuilt/windows-x86_64/sysroot/NOTICE'
     foreach($notice in $llvmNotice,$sysrootNotice){if(!(Test-Path -LiteralPath $notice)){throw "Missing notice: $notice"}}
     $license=Join-Path (Split-Path $module -Parent) 'LICENSE'
-    $licenseStatus=if(Test-Path -LiteralPath $license){'See bundled LICENSE'}else{'未指定；仅为待确认的发布草稿'}
+    & git ls-files --error-unmatch ../LICENSE | Out-Null
+    if($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $license)){throw 'A committed project LICENSE is required for release'}
+    $licenseText=Get-Content -LiteralPath $license -Raw
+    if($licenseText -notmatch '^MIT License\r?\n' -or $licenseText -notmatch 'Permission is hereby granted, free of charge'){
+        throw 'Expected the owner-approved MIT license'
+    }
+    $licenseHash=(Get-FileHash -LiteralPath $license -Algorithm SHA256).Hash.ToLowerInvariant()
+    $licenseStatus='MIT (see bundled LICENSE)'
     New-Item -ItemType Directory $dest | Out-Null
     $flags=@('-O2','-std=c++17','-Wall','-Wextra','-Werror')
     $records=@()
@@ -48,11 +55,11 @@ try {
         $readme | Set-Content -LiteralPath (Join-Path $folder 'README.md') -Encoding utf8
         Copy-Item -LiteralPath $llvmNotice -Destination (Join-Path $folder 'THIRD-PARTY/LLVM-NOTICE.txt')
         Copy-Item -LiteralPath $sysrootNotice -Destination (Join-Path $folder 'THIRD-PARTY/ANDROID-SYSROOT-NOTICE.txt')
-        if(Test-Path -LiteralPath $license){Copy-Item -LiteralPath $license -Destination (Join-Path $folder 'LICENSE')}
+        Copy-Item -LiteralPath $license -Destination (Join-Path $folder 'LICENSE')
         $info=[ordered]@{version=$Version;component='NHDD-cpp-modular CLI';source_commit=$commit;abi=$arch.abi;minimum_build_api=$arch.api;
             ndk_revision=((Get-Content (Join-Path $Ndk 'source.properties') | Select-String '^Pkg.Revision = ').Line -replace '^Pkg.Revision = ','');
             compile_flags=$flags+@('-static-libstdc++','-pthread');binary_sha256=$hash;stripped=$false;
-            validation=$arch.verified;project_license_present=(Test-Path -LiteralPath $license);internal_help_version='v9.0-cpp-class'}
+            validation=$arch.verified;project_license='MIT';project_license_present=$true;license_sha256=$licenseHash;internal_help_version='v9.0-cpp-class'}
         $info | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $folder 'BUILD-INFO.json') -Encoding utf8
         $checks=@(Get-ChildItem -LiteralPath $folder -File -Recurse | Sort-Object FullName | ForEach-Object {
             $relative=[IO.Path]::GetRelativePath($folder,$_.FullName).Replace('\','/')
@@ -63,7 +70,7 @@ try {
         $records+=[pscustomobject]$info
     }
     $source=Join-Path $dest "NHDD-v$Version-source.zip"
-    $paths=@('NHDD-cpp-modular');if(Test-Path -LiteralPath $license){$paths+='LICENSE'}
+    $paths=@('NHDD-cpp-modular','LICENSE')
     & git -C (Split-Path $module -Parent) archive --format=zip "--prefix=NHDD-v$Version-source/" "--output=$source" $commit -- @paths
     if($LASTEXITCODE -ne 0){throw 'Source archive failed'}
     $notes=(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'notes-v9.0.0.md') -Raw).
