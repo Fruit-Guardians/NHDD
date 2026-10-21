@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$Ndk,
-    [ValidateSet('9.0.0')][string]$Version='9.0.0',
+    [ValidatePattern('^9\.0\.\d+$')][string]$Version='9.0.1',
     [string]$Destination='',
     [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedArm64Sha256='e785d6ce3d6121be2eb4829f6c5e47559b5fe0f55c7afb49fb126c742cb28180',
     [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedArmv7Sha256='d5b6c3ac34a9ada6f46af98f5666a95761ae7b602b30068970e6fa5cd0571234'
@@ -10,7 +10,7 @@ $module=Split-Path $PSScriptRoot -Parent
 Push-Location -LiteralPath $module
 try {
     $commit=(& git rev-parse HEAD).Trim();if($LASTEXITCODE -ne 0){throw 'Run from a Git checkout'}
-    & git diff --quiet HEAD -- . ../LICENSE
+    & git diff --quiet HEAD -- ..
     if($LASTEXITCODE -ne 0){throw 'Commit source, release templates and license before packaging'}
     $bin=Join-Path $Ndk 'toolchains/llvm/prebuilt/windows-x86_64/bin'
     foreach($required in @('aarch64-linux-android34-clang++.cmd','armv7a-linux-androideabi23-clang++.cmd','llvm-readelf.exe')){
@@ -70,10 +70,9 @@ try {
         $records+=[pscustomobject]$info
     }
     $source=Join-Path $dest "NHDD-v$Version-source.zip"
-    $paths=@('NHDD-cpp-modular','LICENSE')
-    & git -C (Split-Path $module -Parent) archive --format=zip "--prefix=NHDD-v$Version-source/" "--output=$source" $commit -- @paths
+    & git -C (Split-Path $module -Parent) archive --format=zip "--prefix=NHDD-v$Version-source/" "--output=$source" $commit
     if($LASTEXITCODE -ne 0){throw 'Source archive failed'}
-    $notes=(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'notes-v9.0.0.md') -Raw).
+    $notes=(Get-Content -LiteralPath (Join-Path $PSScriptRoot "notes-v$Version.md") -Raw).
         Replace('@COMMIT@',$commit).Replace('@ARM64_SHA@',$ExpectedArm64Sha256).Replace('@ARMV7_SHA@',$ExpectedArmv7Sha256).
         Replace('@LICENSE_STATUS@',$licenseStatus)
     $notes | Set-Content -LiteralPath (Join-Path $dest 'RELEASE-NOTES.md') -Encoding utf8

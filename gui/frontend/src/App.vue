@@ -129,8 +129,7 @@
         </div>
 
         <div class="disclaimer">
-          <div>作者：漫宿骄盛、weixiao</div>
-          <div>仓库：<a href="https://github.com/mansujiaosheng/NHDD" target="_blank">github.com/mansujiaosheng/NHDD</a></div>
+          <div>仓库：<a href="https://github.com/Fruit-Guardians/NHDD" target="_blank" rel="noopener noreferrer">github.com/Fruit-Guardians/NHDD</a></div>
           <div>免责声明：本工具仅用于合法授权的安全研究、逆向分析与自有应用调试。请勿用于未授权访问、绕过商业授权、窃取代码或数据、侵犯第三方权益等行为。</div>
         </div>
       </div>

@@ -16,6 +16,21 @@ third_party/SoFixer/build_android64/
 third_party/SoFixer/build/
 __pycache__/
 *.pyc
+
+# Local credentials, signing keys and runtime logs must not enter releases.
+.env
+.env.*
+!.env.example
+!.env.sample
+.npmrc
+.pypirc
+id_rsa
+id_ed25519
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.log
 tests/contract/.work/
 !tests/fixtures/**/*.dex
 !tests/fixtures/**/*.so

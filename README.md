@@ -354,7 +354,7 @@ Build:
 
 ```bash
 cd gui
-wails build
+wails build -trimpath -ldflags "-s -w -buildid="
 ```
 
 Place the Android ARM64 `nhdd` binary next to the GUI executable:
@@ -454,10 +454,7 @@ NHDD/
 └── BUILD_WINDOWS.md               # Windows/Linux GUI build notes
 ```
 
-## Authors
-
-- **漫宿骄盛**
-- **weixiao**
+## Project
 
 Repository: https://github.com/Fruit-Guardians/NHDD
 

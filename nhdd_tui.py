@@ -89,8 +89,7 @@ LOGO = r"""
 """
 
 TAGLINE = "No-Hook DEX/SO/JNI Dumper   ·   C++类重构 · 无注入 · 反检测"
-AUTHORS = "漫宿骄盛、weixiao"
-REPO_URL = "https://github.com/mansujiaosheng/NHDD"
+REPO_URL = "https://github.com/Fruit-Guardians/NHDD"
 DISCLAIMER = "免责声明：本工具仅用于合法授权的安全研究、逆向分析与自有应用调试.请勿用于未授权访问、绕过商业授权、窃取代码或数据、侵犯第三方权益等行为."
 
 
@@ -101,13 +100,11 @@ def show_logo():
     logo_text = Text(LOGO.rstrip(), style="bold cyan")
     tag = Text(TAGLINE, style="dim")
     ver = Text(f"v{VERSION}", style="bold yellow")
-    authors = Text(f"Authors: {AUTHORS}", style="dim cyan")
     repo = Text(f"Repo: {REPO_URL}", style="dim")
     disclaimer = Text(DISCLAIMER, style="dim yellow")
     console.print()
     console.print(Align.center(logo_text))
     console.print(Align.center(Text.assemble(ver, "   ", tag)))
-    console.print(Align.center(authors))
     console.print(Align.center(repo))
     console.print(Align.center(disclaimer))
     console.print()
@@ -1105,7 +1102,6 @@ def main():
         return
     if "-v" in args or "--version" in args:
         print(f"NHDD v{VERSION}")
-        print(f"Authors: {AUTHORS}")
         print(f"Repository: {REPO_URL}")
         return
     if "-h" in args or "--help" in args:

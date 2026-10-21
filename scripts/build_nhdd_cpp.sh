@@ -6,12 +6,17 @@ set -euo pipefail
 #   ./scripts/build_nhdd_cpp.sh
 # Optional:
 #   API=34 OUT=nhdd ./scripts/build_nhdd_cpp.sh
+# Set NDK (or ANDROID_NDK_HOME / ANDROID_NDK_ROOT) to your own NDK directory.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NDK="${NDK:-/mnt/c/Users/19678/AppData/Local/Android/Sdk/ndk/27.2.12479018}"
+NDK="${NDK:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+if [[ -z "${NDK}" ]]; then
+  echo "ERROR: set NDK, ANDROID_NDK_HOME, or ANDROID_NDK_ROOT to your Android NDK directory" >&2
+  exit 1
+fi
 API="${API:-34}"
 OUT="${OUT:-${ROOT_DIR}/nhdd}"
-HOST_TAG="windows-x86_64"
+HOST_TAG="${HOST_TAG:-windows-x86_64}"
 CXX="${NDK}/toolchains/llvm/prebuilt/${HOST_TAG}/bin/aarch64-linux-android${API}-clang++"
 
 if [[ ! -x "${CXX}" ]]; then
