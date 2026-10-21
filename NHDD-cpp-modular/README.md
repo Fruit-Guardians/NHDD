@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Fruit-Guardians/NHDD/releases/tag/v9.0.0">下载 v9.0.0</a> &nbsp;·&nbsp;
+  <a href="https://github.com/Fruit-Guardians/NHDD/releases/latest">下载最新版</a> &nbsp;·&nbsp;
   <a href="#快速上手">快速上手</a> &nbsp;·&nbsp;
   <a href="#功能介绍">功能介绍</a> &nbsp;·&nbsp;
   <a href="#常用命令">使用说明</a> &nbsp;·&nbsp;
