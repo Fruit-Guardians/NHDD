@@ -156,6 +156,8 @@ adb shell "su -c '/data/local/tmp/nhdd com.example.app /data/local/tmp/nhdd_live
 
 快速产物由独立发布线程处理，不再等待主扫描整批落盘。实时校验失败但身份仍匹配时，可对原冻结片段进行有界延迟重试，每次重新执行完整检查。合并开启时，已验证过的相同方法字节仅生成 `*.reuse.json` 引用，原始双读仍保留；引用明确标记**本次观测未重新校验**，不算新增恢复或独立验证。不同方法/不同内容仍走完整校验。调度边界和对照测试见[快速发布与回填调度](docs/fast-scheduling.md)。
 
+采集资源协调包括 4KiB 缓冲复用、缩短锁占用、私有重试堆和栈缓冲身份读取。发布线程在采集活跃时降低自身优先级、安静后恢复继承值；积压时合并中间累计发布任务，每个方法的独立证据仍完整校验落盘，最终累计副本重新执行全部检查。Root 设备三组 1ms/5ms 对照均通过本次未退化验收，但不保证全捕获，见[分项定位、修复与真机结果](docs/capture-contention-fix.md)。
+
 ### 查找 JNI 绑定
 
 先写目标与输出目录，再写可选的 JNI 模块筛选参数：
@@ -307,7 +309,7 @@ $nhddNdk = "C:/Android/android-ndk-r27"
 make test
 ```
 
-十组测试覆盖 DEX 合并、ELF 重建、maps 变化、manifest、进程跟随、syscall、格式检查、ART 对象发现、局部双读与关联回填反例。设备夹具和实现细节见[源码说明](src/README.md)与[技术设计](docs/design.md)。
+十五组测试覆盖 DEX 合并、ELF 重建、maps 变化、manifest、进程跟随、syscall、格式检查、ART 对象发现、局部双读、关联回填、多方法合并、发布调度、缓冲池、资源协调与身份解析。设备夹具和实现细节见[源码说明](src/README.md)与[技术设计](docs/design.md)。
 
 ## 常见问题
 

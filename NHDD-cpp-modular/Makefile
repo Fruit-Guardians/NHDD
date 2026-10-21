@@ -35,6 +35,9 @@ test:
 	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror tests/art_refill_test.cpp -o $(TEST_BIN_DIR)/art_refill_test
 	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror tests/art_method_merge_test.cpp -o $(TEST_BIN_DIR)/art_method_merge_test
 	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror tests/fast_schedule_test.cpp -o $(TEST_BIN_DIR)/fast_schedule_test
+	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror tests/capture_coordination_test.cpp -o $(TEST_BIN_DIR)/capture_coordination_test -pthread
+	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror tests/fast_buffer_pool_test.cpp -o $(TEST_BIN_DIR)/fast_buffer_pool_test -pthread
+	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra -Werror tests/process_stat_test.cpp -o $(TEST_BIN_DIR)/process_stat_test
 	$(TEST_BIN_DIR)/dex_capture_test
 	$(TEST_BIN_DIR)/elf_reconstructor_test
 	$(TEST_BIN_DIR)/maps_monitor_test
@@ -47,6 +50,9 @@ test:
 	$(TEST_BIN_DIR)/art_refill_test
 	$(TEST_BIN_DIR)/art_method_merge_test
 	$(TEST_BIN_DIR)/fast_schedule_test
+	$(TEST_BIN_DIR)/capture_coordination_test
+	$(TEST_BIN_DIR)/fast_buffer_pool_test
+	$(TEST_BIN_DIR)/process_stat_test
 
 push: android
 	adb push $(NHDD_BIN) /data/local/tmp/nhdd && adb shell chmod 755 /data/local/tmp/nhdd

@@ -48,12 +48,18 @@ int main() {
     auto third=capture(2,3);plan=ArtRefill::plan(b,third,42,100,true);
     assert(merge.accept(b,third,plan,{"third.refill.json",6,6,7})==ArtMethodMerge::Result::Added);
     raw=merge.materialize(b);assert(raw[6016]==3 && raw[216]==1 && raw[4096]==2);
+    assert(merge.defer_publication(true) && merge.take_deferred(b));
+    assert(!merge.take_deferred(b)); // Consumed once, cannot recreate failed jobs forever.
+    assert(merge.defer_publication(true) && !merge.take_deferred(other));
+    assert(merge.defer_publication(true));b.active=false;assert(!merge.take_deferred(b));b.active=true;
+    merge.published_revision=merge.revision;assert(!merge.defer_publication(true));merge.published_revision=0;
     // A conflicting same-method variant must freeze the WHOLE generation, not
     // choose whichever appears newer, nor affect the previously exported bytes.
     auto alternate=capture(0,4);plan=ArtRefill::plan(b,alternate,42,100,true);
     assert(!merge.known(b,alternate,plan));
     assert(merge.accept(b,alternate,plan,{"conflict.refill.json",8,8,9})==ArtMethodMerge::Result::Conflict);
     assert(merge.conflicted && merge.methods[0].variants.size()==2 && merge.revision==4);
+    assert(!merge.defer_publication(true)); // Conflicts must never wait for a batch.
     assert(merge.materialize(b).empty() && !merge.compatible(b,read,[]{return true;}));
     assert(raw[216]==1 && merge.methods[0].variants[1].bytes[0]==4);
     assert(merge.accept(b,first,ArtRefill::plan(b,first,42,100,true),source)==ArtMethodMerge::Result::Blocked);

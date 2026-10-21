@@ -467,7 +467,8 @@ public:
             // package subprocess ordering changes between polls.
             std::unordered_map<std::string, MapsMonitor> monitors;
             bool stop_numeric_continuous = false;
-            FastCaptureService fast_capture(target,is_numeric,size_t(cfg.fast_max_kb)*1024,mode & ScanMode::DEX,cfg.art_refill,cfg.art_merge);
+            FastCaptureService fast_capture(target,is_numeric,size_t(cfg.fast_max_kb)*1024,mode & ScanMode::DEX,cfg.art_refill,cfg.art_merge,
+                cfg.fast_capture && std::strcmp(cfg.event_backend,"poll")!=0);
             {
                 std::vector<int> filter;
                 for(int p=0;p<pid_count;++p)filter.push_back(std::atoi(pids[p]));
@@ -496,6 +497,7 @@ public:
             if(cfg.fast_capture && kernel_events.active() && !fast_capture.start_publication(out_dir)) {
                 std::fprintf(stderr,"[-] Could not start bounded fast publication worker\n");return 1;
             }
+            if(cfg.fast_capture && kernel_events.active())scanner.on_background_read([&]{fast_capture.scan_checkpoint();});
             if(cfg.fast_capture)std::fprintf(stderr,kernel_events.active()
                 ? "[*] Fast local capture armed: prefix=%u KiB/event, two passes/8ms, queue=32MiB, output<=256MiB; not atomic\n"
                 : "[!] Fast local capture unavailable without tracefs; polling cannot rescue vanished bytes (prefix=%u KiB)\n",
@@ -922,6 +924,7 @@ public:
             }
 
             kernel_events.stop(); // Join acquisition before the final frozen-buffer drain.
+            scanner.on_background_read({});
             if(cfg.fast_capture) {fast_capture.stop_publication();fast_capture.diagnostics();}
             std::fprintf(stderr, "[*] Continuous monitoring stopped after %d checks\n", check_count);
             std::fprintf(stderr, "[*] Event diagnostics: lost=%llu malformed=%llu\n",

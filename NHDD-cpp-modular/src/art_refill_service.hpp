@@ -6,6 +6,7 @@
 #include "syscall_events.hpp"
 #include "nhdd_scanner.hpp"
 #include "art_merge_publication.hpp"
+#include "capture_tuning.hpp"
 
 class ArtRefillService {
 public:
@@ -73,10 +74,17 @@ public:
             b->mappings.push_back(maps[i]);
         }
         if(!anchors(*b,read)) {++arm_rejected_;return;}
-        std::lock_guard<std::mutex> lock(mutex_);
-        baselines_.erase(std::remove_if(baselines_.begin(),baselines_.end(),[&](const auto& old) {
+        // Procfs I/O and last-reference destruction must not hold the registry
+        // mutex needed by collector prepare/event. Only arm() mutates the list.
+        std::vector<std::shared_ptr<ArtRefillBaseline>> retired;
+        {std::lock_guard<std::mutex> lock(mutex_);retired=baselines_;}
+        for(const auto& old:retired) {
             const auto pid=std::to_string(old->identity.pid);
             if(read_process_start_time_inline(pid.c_str())!=old->identity.process_start_time)old->active=false;
+        }
+        if(!anchors(*b,read)) {++arm_rejected_;return;}
+        std::lock_guard<std::mutex> lock(mutex_);
+        baselines_.erase(std::remove_if(baselines_.begin(),baselines_.end(),[&](const auto& old) {
             return !old->active || (old->identity.pid==b->identity.pid && old->identity.address==b->identity.address);
         }),baselines_.end());
         if(baselines_.size()>=32) {++arm_rejected_;return;}
@@ -117,11 +125,24 @@ public:
     void finish(std::vector<Link>& links,const Read& read) {
         for(auto& link:links)link.after=anchors(*link.baseline,read);
     }
-    void begin_batch() {
+    void begin_batch(bool pressure=false) {
+        coalesce_current_=CaptureTuning::coalesce_merge && pressure;
         const double stamp=boot();
         if(!verification_epoch_ || stamp-verification_epoch_>=1) {verification_epoch_=stamp;verification_budget_=64u*1024*1024;}
     }
     double budget_wait() const {return budget_wait_;}
+    bool coalesced_pending() const {return coalesced_pending_;}
+    // Publisher only. References to independently committed proofs, not new
+    // observations or cached live-validation results.
+    std::vector<Link> take_coalesced() {
+        coalesced_pending_=false;std::vector<std::shared_ptr<ArtRefillBaseline>> baselines;
+        {std::lock_guard<std::mutex> lock(mutex_);baselines=baselines_;}
+        std::vector<Link> result;
+        for(const auto& b:baselines)if(b->merge && b->merge->take_deferred(*b)) {
+            Link link;link.baseline=b;link.refill_done=true;result.push_back(std::move(link));
+        }
+        return result;
+    }
     size_t publish(const std::string& source_stem,const MemorySyscallEvent& e,const FastObservation& o,
                    const std::vector<Link>& links,size_t output_budget,std::vector<Link>* retry=nullptr,unsigned attempt=1) {
         size_t written=0;budget_wait_=0;
@@ -253,8 +274,12 @@ public:
             ull(merge_budget_drops_),ull(merge_invalid_));
         std::fprintf(stderr,"[*] ART schedule: reused_unverified=%llu reuse_records=%llu (raw observations retained; not new proofs)\n",
             ull(reused_),ull(reuse_records_));
+        std::fprintf(stderr,"[*] ART coalesce: deferred_operations=%llu (independent proofs retained; not extra validations)\n",ull(merge_coalesced_));
     }
 private:
+#ifdef NHDD_TESTING
+    friend struct CaptureTestAccess;
+#endif
     size_t record_reuse(const std::string& stem,const std::string& source,const ArtRefillBaseline& b,
                         const FastObservation& o,const ArtRefillPlan& plan,size_t budget) {
         ++reused_;
@@ -289,6 +314,9 @@ private:
     size_t publish_merge(const ArtRefillBaseline& b,const std::string& stem,const Read& read,Guard guard,
                          size_t budget,bool& again) {
         if(!b.merge)return 0;
+        if(b.merge->defer_publication(coalesce_current_)) {
+            coalesced_pending_=true;++merge_coalesced_;return 0;
+        }
         const auto result=ArtMergePublication::publish(b,*b.merge,stem,read,guard,budget,verification_budget_,boot());
         switch(result.status) {
         case ArtMergePublication::Status::Published:++merge_published_;break;
@@ -350,6 +378,7 @@ private:
         return static_cast<size_t>(n);
     }
     bool enabled_,merge_enabled_;std::shared_ptr<ArtRefillBudget> budget_;
+    bool coalesce_current_=false,coalesced_pending_=false;uint64_t merge_coalesced_=0;
     double verification_epoch_=0,budget_wait_=0;uint64_t reused_=0,reuse_records_=0;
     std::mutex mutex_;std::vector<std::shared_ptr<ArtRefillBaseline>> baselines_;uint64_t revision_=0;
     uint64_t armed_=0,arm_rejected_=0,published_=0,rejected_=0,verification_budget_=0,verification_drops_=0,output_drops_=0,write_failures_=0;

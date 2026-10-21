@@ -16,6 +16,7 @@
 #include <sys/wait.h>
 #include "process_tracking.hpp"
 #include "common_types.hpp"
+#include "process_stat.hpp"
 
 class ProcessManager {
 public:
@@ -30,35 +31,23 @@ public:
             }
         }
     };
-    static bool inspect(int pid, TrackedProcess* out) {
+    static bool inspect(int pid, TrackedProcess* out,bool include_command=true) {
         if (!out || pid <= 0) return false;
-        char path[64], line[4096], command[512] = {};
-        std::snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-        FILE* f = std::fopen(path, "r");
-        if (!f) return false;
-        bool ok = std::fgets(line, sizeof(line), f) != nullptr;
-        std::fclose(f);
-        char* tail = ok ? std::strrchr(line, ')') : nullptr;
-        if (!tail) return false;
-        char* cursor = tail + 1;
+        char path[64],command[512] = {};
+        char numeric_pid[32];std::snprintf(numeric_pid,sizeof(numeric_pid),"%d",pid);
+        ProcessStatFields identity;if(!ProcessStat::read(numeric_pid,&identity))return false;
         TrackedProcess p;
-        p.pid = pid;
-        for (int field = 3; field <= 22; ++field) {
-            while (*cursor == ' ') ++cursor;
-            if (!*cursor) return false;
-            char* end = cursor;
-            while (*end && *end != ' ' && *end != '\n') ++end;
-            if (field == 4) p.parent = std::atoi(cursor);
-            if (field == 22) p.starttime = std::strtoull(cursor, nullptr, 10);
-            cursor = end;
-        }
+        p.pid=pid;p.parent=identity.parent;p.starttime=identity.starttime;
         std::snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
         int fd = ::open(path, O_RDONLY | O_CLOEXEC);
         if (fd < 0) return false;
         ssize_t n = ::read(fd, command, sizeof(command) - 1);
         ::close(fd);
         if (n <= 0 || !p.starttime) return false;
-        p.command = command;
+        // Still read cmdline and reject empty/unreadable processes. Numeric
+        // capture membership uses PID+starttime, so don't allocate an unused
+        // command string there; package discovery retains the full command.
+        if(include_command)p.command = command;
         *out = std::move(p);
         return true;
     }

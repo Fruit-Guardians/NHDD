@@ -39,9 +39,17 @@ struct FastObservation {
     template<class Reader,class Guard,class Clock>
     static FastObservation capture(uintptr_t address,size_t length,size_t cap,
                                    Reader read,Guard guard,Clock clock,double seconds=0.008) {
-        FastObservation o;o.address=address;o.requested=length;o.begin=clock();
+        return capture_reusing(FastObservation{},address,length,cap,read,guard,clock,seconds);
+    }
+    template<class Reader,class Guard,class Clock>
+    static FastObservation capture_reusing(FastObservation o,uintptr_t address,size_t length,size_t cap,
+                                   Reader read,Guard guard,Clock clock,double seconds=0.008) {
+        o.first.clear();o.second.clear();o.pages.clear();o.truncated=false;o.generation_valid=false;
+        o.deadline_hit=false;o.end=0;o.address=address;o.requested=length;o.begin=clock();
         if(!length || !cap || length>std::numeric_limits<uintptr_t>::max()-address || !guard())return o;
         const size_t n=std::min(length,cap);o.truncated=n<length;
+        // clear()+resize() zeroes reused storage, including unread tails. Old
+        // bytes/coverage/timestamps must never become a new observation.
         o.first.resize(n);o.second.resize(n);
         for(size_t off=0;off<n;off+=4096)o.pages.push_back({off,std::min(size_t(4096),n-off),0,0,0});
         for(unsigned pass=0;pass<2;++pass) {

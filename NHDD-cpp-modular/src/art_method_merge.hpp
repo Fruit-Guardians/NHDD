@@ -2,6 +2,7 @@
 #pragma once
 #include "art_refill.hpp"
 #include "sha1.hpp"
+#include "capture_tuning.hpp"
 
 class ArtMethodMerge {
 public:
@@ -17,6 +18,7 @@ public:
     uint64_t revision=0,published_revision=0;
     std::string session;
     bool conflicted=false;
+    bool publication_deferred=false; // Publisher-owned scheduling state only.
 
     // Only call after the independent single-event artifact was verified and
     // committed. Retain the first source for each distinct variant, not an
@@ -52,6 +54,14 @@ public:
         return conflict?Result::Conflict:(added?Result::Added:Result::Duplicate);
     }
     bool dirty() const {return revision!=published_revision;}
+    bool defer_publication(bool pressure) {
+        publication_deferred=CaptureTuning::defer_merge(pressure,conflicted,revision,published_revision);
+        return publication_deferred;
+    }
+    bool take_deferred(const ArtRefillBaseline& b) {
+        const bool requested=publication_deferred;publication_deferred=false;
+        return requested && &b==owner_ && b.active && dirty() && methods.size()>=2;
+    }
     // Scheduling hint only. Matching old evidence never validates this new
     // observation's live complement/identity and must not increment proofs.
     bool known(const ArtRefillBaseline& b,const FastObservation& o,const ArtRefillPlan& p) const {
