@@ -16,6 +16,12 @@ if(!$RunId){$RunId=(Get-Date -Format 'yyyyMMddHHmmss')+'_'+[guid]::NewGuid().ToS
 if($RunId -notmatch '^[a-z0-9_]{1,40}$'){throw 'RunId must be unique lowercase alphanumeric/underscore'}
 if(!$Destination){$Destination=".test-bin/device-smoke/capture-contention-$RunId"}
 if(Test-Path $Destination){throw 'Destination exists; preserve previous evidence'}
+# adb on Windows still encounters MAX_PATH in recursively pulled artifacts.
+# Refuse BEFORE launching any process, rather than leave an incomplete ABBA.
+$longestName="nhdd_refill_cont_${RunId}_conflict"
+if($env:OS -eq 'Windows_NT' -and ([IO.Path]::GetFullPath($Destination).Length+13+$longestName.Length+4+5+128) -ge 260){
+    throw 'Evidence path may exceed Windows adb MAX_PATH; use a short -RunId and -Destination (for example .test-bin/w01)'
+}
 foreach($file in @($Candidate,$Baseline,$Helper,$Probe,$Payload,$Verifier)){if(!(Test-Path -LiteralPath $file -PathType Leaf)){throw "Missing artifact: $file"}}
 $baselineHash=(Get-FileHash -LiteralPath $Baseline -Algorithm SHA256).Hash.ToLowerInvariant()
 if($baselineHash -ne $ExpectedBaselineSha256){throw 'Baseline does not match the explicitly pinned expected SHA-256'}
@@ -52,7 +58,7 @@ foreach($role in @('baseline','candidate','candidate','baseline')) {
     $log=Get-Content (Join-Path $dir "$name.scan.log") -Raw
     $runs+=[pscustomobject]@{role=$role;name=$name;verified_methods=$timing.independently_verified_methods;
         merged_methods=$provenance.max_merged_methods;full_body_composites=$provenance.full_three_method_revisions;timing=$timing;
-        diagnostics=@($log -split "`n" | Where-Object {$_ -match 'Fast capture:|ART refill:|ART coalesce:|Fast merge flush:|Fast schedule:|Fast contention:|Fast policy:|Event diagnostics:'})}
+        diagnostics=@($log -split "`n" | Where-Object {$_ -match 'Fast capture:|ART refill:|ART coalesce:|Fast merge flush:|Fast schedule:|Fast contention:|Fast policy:|Trace collector:|Event diagnostics:'})}
     if($role -eq 'candidate' -and $provenance.full_three_method_revisions -gt 0) {
         $fast=Join-Path $dir "${name}_out/fast"
         $complete=Get-ChildItem $fast -Filter '*.merge.json' | Where-Object {

@@ -5,6 +5,20 @@
 #include <sys/mman.h>
 #include "../src/fast_capture_service.hpp"
 struct CaptureTestAccess {
+    static void package_identity(FastCaptureService& service,int child) {
+        int pid=0;uint64_t ticks=0;bool compat=false;
+        assert(service.resolve(::getpid(),&pid,&ticks,&compat) && pid==::getpid());
+        assert(service.resolve(child,&pid,&ticks,&compat) && pid==child); // Existing parent-follow path.
+    }
+    static void numeric_identity(FastCaptureService& service,int foreign) {
+        int pid=0;uint64_t ticks=0;bool compat=false;
+        assert(service.resolve(::getpid(),&pid,&ticks,&compat) && pid==::getpid() && ticks!=0);
+        assert(!service.resolve(foreign,&pid,&ticks,&compat));
+        const auto expected=service.targets_.at(::getpid());
+        service.targets_[::getpid()]=expected+1;
+        assert(!service.resolve(::getpid(),&pid,&ticks,&compat));
+        service.targets_[::getpid()]=expected;
+    }
     static void pending_invalid_merge(FastCaptureService& service) {
         auto b=std::make_shared<ArtRefillBaseline>();b->identity.pid=::getpid();
         const auto pid=std::to_string(::getpid());b->identity.process_start_time=read_process_start_time_inline(pid.c_str());
@@ -30,6 +44,14 @@ int main() {
     assert(page!=MAP_FAILED);std::memset(page,0x5a,4096);
     const int pid=::getpid();FastCaptureService service(std::to_string(pid),true,4096,false);
     service.targets({pid});
+    const pid_t foreign=::fork();assert(foreign>=0);
+    if(!foreign){::sleep(5);::_exit(0);} // Also self-exits if a parent assertion fails.
+    CaptureTestAccess::numeric_identity(service,foreign);
+    {
+        FastCaptureService package("unmatched.own.fixture",false,4096,false,false,false,false);
+        package.targets({pid});CaptureTestAccess::package_identity(package,foreign);
+    }
+    assert(!::kill(foreign,SIGTERM));assert(::waitpid(foreign,nullptr,0)==foreign);
     CaptureTestAccess::pending_invalid_merge(service); // Before start: no race with publisher-owned state.
 #if defined(__aarch64__)
     const char* protect="226";

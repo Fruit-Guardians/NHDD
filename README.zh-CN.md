@@ -21,6 +21,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Fruit-Guardians/NHDD/releases/tag/v9.0.0">下载 v9.0.0</a> &nbsp;·&nbsp;
   <a href="./NHDD-cpp-modular/README.md#快速上手">快速上手</a> &nbsp;·&nbsp;
   <a href="./NHDD-cpp-modular/README.md#功能介绍">功能介绍</a> &nbsp;·&nbsp;
   <a href="./NHDD-cpp-modular/README.md#常用命令">使用说明</a> &nbsp;·&nbsp;
@@ -468,4 +469,4 @@ NHDD/
 
 ## License
 
-MIT
+[MIT](./LICENSE)。第三方组件保留各自的许可证与 notices。

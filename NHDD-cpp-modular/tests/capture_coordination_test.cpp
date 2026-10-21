@@ -30,7 +30,8 @@ int main() {
     }
     assert(CaptureTuning::publisher_nice(20,3,true)==20);
     assert(CaptureTuning::defer_merge(true,false,7,0));
-    assert(!CaptureTuning::defer_merge(true,false,8,0));
+    assert(CaptureTuning::defer_merge(true,false,CaptureTuning::merge_batch-1,0));
+    assert(!CaptureTuning::defer_merge(true,false,CaptureTuning::merge_batch,0));
     assert(!CaptureTuning::defer_merge(true,true,7,0));
     assert(!CaptureTuning::defer_merge(false,false,7,0));
     assert(!CaptureTuning::defer_merge(true,false,4,5));

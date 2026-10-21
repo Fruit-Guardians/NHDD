@@ -44,6 +44,7 @@ int main() {
     assert(!ProcessStat::parse(bytes,&value));
     uint64_t unchanged=77;assert(!ProcessStat::starttime(nullptr,&unchanged) && unchanged==77);
     assert(!ProcessStat::starttime("../self",&unchanged) && unchanged==77);
+    assert(!ProcessStat::member(0,1) && !ProcessStat::member(1,0));
 #if defined(__linux__)
     char pid[32];std::snprintf(pid,sizeof(pid),"%d",::getpid());
     assert(ProcessStat::read(pid,&value) && value.pid==::getpid() && value.parent==::getppid());

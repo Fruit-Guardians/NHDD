@@ -21,6 +21,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Fruit-Guardians/NHDD/releases/tag/v9.0.0">Download v9.0.0</a> &nbsp;·&nbsp;
   <a href="./NHDD-cpp-modular/README.md#快速上手">Quick Start</a> &nbsp;·&nbsp;
   <a href="./NHDD-cpp-modular/README.md#功能介绍">Features</a> &nbsp;·&nbsp;
   <a href="./NHDD-cpp-modular/README.md#常用命令">Usage</a> &nbsp;·&nbsp;
@@ -472,4 +473,4 @@ Do not use this project for unauthorized access, bypassing commercial licensing,
 
 ## License
 
-MIT
+[MIT](./LICENSE). Third-party components retain their respective licenses and notices.

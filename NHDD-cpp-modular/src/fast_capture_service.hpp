@@ -56,12 +56,13 @@ public:
         } // Destroy the previous target map outside both collector queue locks.
     }
     void line(const std::string& text) {
+        const double received=now();
         CaptureCoordination::Lease capture_active(coordination_);
         auto events=decoder_.ingest(text,[this](int tid,int* pid,uint64_t* ticks,bool* compat) {
             return resolve(tid,pid,ticks,compat);
         });
         if(decoder_.losses()!=early_losses_)refill_.invalidate_all();
-        for(const auto& event:events) {refill_.event(event);acquire(event);}
+        for(const auto& event:events) {refill_.event(event);acquire(event,received);}
         early_losses_=decoder_.losses();
     }
     void diagnostics() const {
@@ -81,7 +82,7 @@ public:
             ull(publication_background_.pauses),publisher_nice_,publisher_nice_end_,ull(priority_changes_),ull(priority_failures_));
         std::fprintf(stderr,"[*] Fast policy: background_yield=%u nice_delta=%d pool_slots=%u adaptive_nice=%u\n",
             CaptureTuning::background_yield?1u:0u,CaptureTuning::nice_delta,buffer_pool_.capacity(),CaptureTuning::adaptive_nice?1u:0u);
-        std::fprintf(stderr,"[*] Fast merge flush: enabled=%u scheduled=%llu\n",CaptureTuning::coalesce_merge?1u:0u,ull(merge_flush_jobs_));
+        std::fprintf(stderr,"[*] Fast merge flush: enabled=%u scheduled=%llu revision_batch=%u\n",CaptureTuning::coalesce_merge?1u:0u,ull(merge_flush_jobs_),CaptureTuning::merge_batch);
     }
 private:
 #ifdef NHDD_TESTING
@@ -91,6 +92,7 @@ private:
         MemorySyscallEvent event;FastObservation observation;uint64_t sequence=0;
         std::vector<ArtRefillService::Link> links;
         bool raw_published=false,merge_only=false;unsigned attempts=0;double due=0;
+        double line_received=0,acquire_begin=0,anchors_done=0,acquire_end=0;
         size_t bytes() const {return observation.first.size()+observation.second.size();}
     };
     static unsigned long long ull(uint64_t n) {return static_cast<unsigned long long>(n);}
@@ -199,7 +201,13 @@ private:
         return MapsMonitor::read_process_starttime(text.c_str(),&ticks) && ticks==expected;
     }
     bool resolve(int tid,int* pid,uint64_t* ticks,bool* compat) {
-        int leader=0;if(!ProcessStat::tgid(tid,&leader))return false;
+        int leader=0;
+        if(numeric_) {
+            // Numeric targets are already generation-pinned. Fresh task-dir
+            // membership replaces status parsing, not leader/cmdline/ABI checks.
+            {std::lock_guard<std::mutex> lock(target_mutex_);if(targets_.size()==1)leader=targets_.begin()->first;}
+            if(!ProcessStat::member(leader,tid))return false;
+        } else if(!ProcessStat::tgid(tid,&leader))return false;
         TrackedProcess p;if(!ProcessManager::inspect(leader,&p,!numeric_))return false;
         bool match=false;
         {
@@ -226,7 +234,7 @@ private:
 #endif
         return true;
     }
-    void acquire(const MemorySyscallEvent& event) {
+    void acquire(const MemorySyscallEvent& event,double received) {
         if(!event.before && (event.operation=="munmap" ||
             ((event.operation=="mmap" || event.operation=="mprotect") && !(event.protection&1))))return;
         const double stamp=now();
@@ -239,12 +247,16 @@ private:
         }
         budget_bytes_+=charge;++observed_;
         struct MemoryFd {
-            int value;
+            int value=-1;bool attempted=false;
             ~MemoryFd() {if(value>=0)::close(value);}
-        } memory_fd{::open(("/proc/"+std::to_string(event.pid)+"/mem").c_str(),O_RDONLY|O_CLOEXEC)};
+        } memory_fd;
         auto read=[&](uintptr_t address,uint8_t* bytes,size_t count)->size_t {
             iovec local{bytes,count},remote{reinterpret_cast<void*>(address),count};
             ssize_t n=::process_vm_readv(event.pid,&local,1,&remote,1,0);
+            if(n<=0 && !memory_fd.attempted) {
+                memory_fd.attempted=true;
+                memory_fd.value=::open(("/proc/"+std::to_string(event.pid)+"/mem").c_str(),O_RDONLY|O_CLOEXEC);
+            }
             if(n<=0 && memory_fd.value>=0)n=::pread(memory_fd.value,bytes,count,static_cast<off_t>(address));
             return n>0?static_cast<size_t>(n):0;
         };
@@ -253,6 +265,7 @@ private:
                 read(address,static_cast<uint8_t*>(bytes),count)==count;
         };
         auto links=refill_.prepare(event,linked_read);
+        const double anchors_done=now();
         FastObservation buffers;
         if(CaptureTuning::pool_slots) {
             buffers=std::move(collector_spare_);
@@ -270,6 +283,7 @@ private:
         if(!observation.generation_valid) {++rejected_;keep_spare();return;}
         if(!observation.read_bytes(0) && !observation.read_bytes(1)) {++unreadable_;keep_spare();return;}
         Snapshot s;s.event=event;s.observation=std::move(observation);s.sequence=++sequence_;s.links=std::move(links);
+        s.line_received=received;s.acquire_begin=stamp;s.anchors_done=anchors_done;s.acquire_end=now();
         {std::unique_lock<std::mutex> lock(mutex_,std::defer_lock);
             if(!lock.try_lock()) {++handoff_contended_;lock.lock();}
             if(publisher_failed_ || stopping_ || !schedule_.admit(s.bytes())) {++queue_drops_;return;}
@@ -348,8 +362,9 @@ private:
                 ull(b.revision),ull(b.identity.address),ull(b.object),link.before?"true":"false",
                 link.after?"true":"false",plan.reason.c_str());
         }
-        std::fprintf(f,"],\"publication_begin_boot\":%.9f,\"queue_wait_ms\":%.3f,\"publication_worker\":true}\n",
-            publication_begin,1000*(publication_begin-o.end));
+        std::fprintf(f,"],\"publication_begin_boot\":%.9f,\"queue_wait_ms\":%.3f,\"publication_worker\":true,"
+            "\"line_received_boot\":%.9f,\"acquire_begin_boot\":%.9f,\"anchors_done_boot\":%.9f,\"acquire_end_boot\":%.9f}\n",
+            publication_begin,1000*(publication_begin-o.end),s.line_received,s.acquire_begin,s.anchors_done,s.acquire_end);
         const long meta_bytes=std::ftell(f);if(meta_bytes>0)last_written_+=static_cast<size_t>(meta_bytes);
         ok=(std::fflush(f)==0 && ::fsync(::fileno(f))==0) && ok;
         if(std::fclose(f)!=0)ok=false;

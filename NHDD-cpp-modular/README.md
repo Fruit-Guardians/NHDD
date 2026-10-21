@@ -21,6 +21,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Fruit-Guardians/NHDD/releases/tag/v9.0.0">下载 v9.0.0</a> &nbsp;·&nbsp;
   <a href="#快速上手">快速上手</a> &nbsp;·&nbsp;
   <a href="#功能介绍">功能介绍</a> &nbsp;·&nbsp;
   <a href="#常用命令">使用说明</a> &nbsp;·&nbsp;
@@ -54,6 +55,8 @@
 | 离线校验 | `--verify FILE` 输出 JSON，不启动或执行待检代码 |
 
 “字节完整”“静态结构检查通过”“ART 可装载”“业务方法已解密”不是同一件事。NHDD 会分别表达已知状态，不把格式识别当作完整脱壳。
+
+短窗口捕获支持亚毫秒重试、采集/发布调度隔离与分阶段时延诊断；已用 Root 自建样本重复验证多方法跨窗口恢复。[实测结果、剩余漏捕与 CPU 取舍](docs/short-window-misses.md)均保留，不保证 1ms 窗口全捕获。
 
 ## 快速上手
 

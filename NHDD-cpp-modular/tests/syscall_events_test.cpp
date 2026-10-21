@@ -2,6 +2,10 @@
 #include <cstdio>
 #include "../src/syscall_events.hpp"
 int main() {
+    assert(SyscallEvents::retry_nanoseconds(true)==NHDD_TRACE_RETRY_US*1000L);
+    assert(SyscallEvents::retry_nanoseconds(false)==100000000L);
+    assert(SyscallEvents::collector_nice(0)==-NHDD_TRACE_NICE_DELTA);
+    assert(SyscallEvents::collector_nice(-20)==-20);
     SyscallEventDecoder::Record r;
     assert(SyscallEventDecoder::parse("    worker-with-dash-123  [004] .... 1234.567890: sys_enter: NR 9 (0, 1000, 3, 22, ffffffffffffffff, 0)",&r));
     assert(r.tid==123 && r.entry && r.id==9 && r.args[1]==0x1000 && r.args[4]==~uint64_t(0));

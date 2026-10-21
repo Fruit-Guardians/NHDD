@@ -15,12 +15,22 @@
 #include <unordered_map>
 #include <vector>
 #include <thread>
+#ifndef NHDD_TRACE_RETRY_US
+#define NHDD_TRACE_RETRY_US 250
+#endif
+static_assert(NHDD_TRACE_RETRY_US>=50 && NHDD_TRACE_RETRY_US<=2000,"trace retry must be bounded (50..2000us)");
+#ifndef NHDD_TRACE_NICE_DELTA
+#define NHDD_TRACE_NICE_DELTA 2
+#endif
+static_assert(NHDD_TRACE_NICE_DELTA>=0 && NHDD_TRACE_NICE_DELTA<=3,"collector nice adjustment must be small (0..3)");
 #include "common_types.hpp"
 #if defined(__linux__)
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #endif
 
@@ -137,6 +147,8 @@ public:
     uint64_t losses() const { return losses_; }
     uint64_t malformed() const { return malformed_; }
     const std::string& error() const { return error_; }
+    static constexpr long retry_nanoseconds(bool early) {return early?NHDD_TRACE_RETRY_US*1000L:100000000L;}
+    static constexpr int collector_nice(int base) {return base-NHDD_TRACE_NICE_DELTA < -20?-20:base-NHDD_TRACE_NICE_DELTA;}
     // Configure before start(). Called on the collector, not the scan thread.
     void early_lines(std::function<void(const std::string&)> handler) { early_line_ = std::move(handler); }
     void early_entries(bool enabled) { early_entries_ = enabled; }
@@ -172,7 +184,7 @@ public:
         // Only our isolated instance: do not wait for half a ring buffer before
         // waking the observer. Older kernels retain a short nonblocking retry.
         if(early_line_ && !control("buffer_percent","0"))
-            std::fprintf(stderr,"[!] Low-watermark trace wakeup unavailable; using 2ms nonblocking retries\n");
+            std::fprintf(stderr,"[!] Low-watermark trace wakeup unavailable; using %dus nonblocking retries\n",NHDD_TRACE_RETRY_US);
         std::string ids;
 #if defined(__aarch64__)
         ids = "id == 222 || id == 226 || id == 215 || id == 216 || id == 192 || id == 125 || id == 91 || id == 163";
@@ -348,17 +360,42 @@ private:
     }
 #if defined(__linux__)
     void collect() {
+        const auto own_tid=static_cast<id_t>(::syscall(SYS_gettid));errno=0;
+        const int base_nice=::getpriority(PRIO_PROCESS,own_tid);const bool base_valid=errno==0;bool priority_ok=base_valid;
+        const int wanted=early_line_?collector_nice(base_nice):base_nice;
+        if(priority_ok && wanted!=base_nice)priority_ok=::setpriority(PRIO_PROCESS,own_tid,wanted)==0;
+        if(!priority_ok)std::fprintf(stderr,"[!] Own collector nice adjustment unavailable: %s; continuing without boost\n",std::strerror(errno));
+        timespec cpu_begin{};::clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu_begin);
+        uint64_t reads=0,empty_reads=0;
+        struct Report {
+            timespec begin;uint64_t& reads;uint64_t& empty;bool early;id_t tid;int base;bool base_valid,priority_ok;
+            ~Report() {
+                timespec end{};::clock_gettime(CLOCK_THREAD_CPUTIME_ID,&end);
+                const double ms=1000.0*(end.tv_sec-begin.tv_sec)+(end.tv_nsec-begin.tv_nsec)*1e-6;
+                errno=0;const int current=::getpriority(PRIO_PROCESS,tid);
+                const bool restore_ok=!base_valid || (errno==0 && (current==base || ::setpriority(PRIO_PROCESS,tid,base)==0));
+                std::fprintf(stderr,"[*] Trace collector: retry_us=%ld reads=%llu empty_reads=%llu cpu_ms=%.3f "
+                    "base_nice=%d active_nice=%d collector_priority_failures=%u restore_failed=%u (own TID only)\n",
+                    retry_nanoseconds(early)/1000,static_cast<unsigned long long>(reads),static_cast<unsigned long long>(empty),ms,
+                    base,current,priority_ok?0u:1u,restore_ok?0u:1u);
+            }
+        } report{cpu_begin,reads,empty_reads,bool(early_line_),own_tid,base_nice,base_valid,priority_ok};
         char bytes[65536];
         std::string early_buffer;
         while(!stopping_) {
             pollfd pfd{fd_,POLLIN,0};
-            int r=::poll(&pfd,1,early_line_?2:100);
+            // poll() only accepts whole milliseconds. Even with low-watermark
+            // wakeups, a nonblocking trace read may need a retry before poll
+            // signals readiness; do not round a 1ms plaintext window to 2ms.
+            const timespec timeout{0,retry_nanoseconds(bool(early_line_))};
+            int r=::ppoll(&pfd,1,&timeout,nullptr);
             if(r<0 && errno==EINTR)continue;
             if(r<0 || (pfd.revents&(POLLERR|POLLHUP|POLLNVAL))) {reader_failed_=true;queue_ready_.notify_one();break;}
             if(!r && !early_line_)continue;
             ssize_t n=::read(fd_,bytes,sizeof(bytes));
-            if(n<0 && (errno==EAGAIN || errno==EINTR))continue;
+            if(n<0 && (errno==EAGAIN || errno==EINTR)){++empty_reads;continue;}
             if(n<=0){reader_failed_=true;queue_ready_.notify_one();break;}
+            ++reads;
             if (early_line_) {
                 early_buffer.append(bytes, static_cast<size_t>(n));
                 size_t cursor=0, end=0;
