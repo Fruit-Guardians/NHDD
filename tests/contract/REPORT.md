@@ -4,14 +4,14 @@
 
 - go: ok (17 fixtures)
 - python: ok (17 fixtures)
-- **v8: SKIPPED** — build failed: In file included from D:\project\NHDD\tests\contract\v8_harness.c:20:
-D:/project/NHDD/nhdd.c:36:10: fatal error: sys/prctl.h: No such file or directory
+- **v8: SKIPPED** — build failed: In file included from <repo>\tests\contract\v8_harness.c:20:
+<repo>/nhdd.c:36:10: fatal error: sys/prctl.h: No such file or directory
    36 | #include <sys/prctl.h>
       |          ^~~~~~~~~~~~~
 compilation terminated.
-- **v9: SKIPPED** — build failed: In file included from D:\project\NHDD\NHDD-cpp-modular\src/so_dumper.hpp:10,
-                 from D:\project\NHDD\tests\contract\v9_harness.cpp:20:
-D:\project\NHDD\NHDD-cpp-modular\src/process_memory.hpp:10:10: fatal error: sys/uio.h: No such file or directory
+- **v9: SKIPPED** — build failed: In file included from <repo>\NHDD-cpp-modular\src/so_dumper.hpp:10,
+                 from <repo>\tests\contract\v9_harness.cpp:20:
+<repo>\NHDD-cpp-modular\src/process_memory.hpp:10:10: fatal error: sys/uio.h: No such file or directory
    10 | #include <sys/uio.h>
       |          ^~~~~~~~~~~
 compilation terminated.

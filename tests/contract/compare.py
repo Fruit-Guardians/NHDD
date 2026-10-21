@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -279,6 +280,15 @@ def check_expected(runs: dict) -> list:
     return problems
 
 
+def public_report(text: str) -> str:
+    """Do not publish machine-specific source/home paths in diagnostics."""
+    for root, label in ((REPO, "<repo>"), (os.path.expanduser("~"), "<home>")):
+        for variant in {root, root.replace("\\", "/"), root.replace("/", "\\")}:
+            text = text.replace(variant, label)
+    return re.sub(r"(?:[A-Za-z]:[\\/]+Users[\\/]+|/home/|/Users/)[^\s\"'<>]+",
+                  "<home-path>", text)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     try:
@@ -304,7 +314,7 @@ def main() -> int:
     if runs["go"].get("skipped"):
         print("[!] go baseline skipped — divergence analysis limited")
     rows, divergences = build_report(fixtures, runs)
-    md = render_md(fixtures, rows, divergences, runs)
+    md = public_report(render_md(fixtures, rows, divergences, runs))
     with open(REPORT_MD, "w", encoding="utf-8") as fh:
         fh.write(md)
 

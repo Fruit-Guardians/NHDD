@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -42,6 +43,17 @@ class ReleasePrivacyTests(unittest.TestCase):
                 package.writestr("safe/README.md", b"safe")
             self.assertEqual(audit.inspect_asset(path, [])[0]["category"], "unsafe_archive_entry")
             self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_contract_report_redacts_build_roots(self):
+        spec = importlib.util.spec_from_file_location("contract_compare", ROOT / "tests/contract/compare.py")
+        compare = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(compare)
+        private = str(ROOT) + os.sep + "tests/example.c"
+        cleaned = compare.public_report(private + "\n" + str(Path.home()) + os.sep + "sdk")
+        self.assertNotIn(str(ROOT), cleaned)
+        self.assertNotIn(str(Path.home()), cleaned)
+        self.assertIn("<repo>", cleaned)
+        self.assertIn("<home>", cleaned)
 
 
 if __name__ == "__main__":
