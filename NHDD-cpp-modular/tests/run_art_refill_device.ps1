@@ -61,5 +61,5 @@ foreach($file in @("$prefix.probe.log","$prefix.scan.log","$prefix.golden.dex","
     & adb @adbArgs pull $file $Destination
     if($LASTEXITCODE -ne 0){throw "Could not pull $file"}
 }
-Write-Output ($log -split "`n" | Where-Object {$_ -match 'ART refill:|ART merge:|ART schedule:|ART coalesce:|Fast merge flush:|Fast schedule:|Fast contention:|Fast policy:|Fast capture:|Event diagnostics:'})
+Write-Output ($log -split "`n" | Where-Object {$_ -match 'ART refill:|ART merge:|ART schedule:|ART coalesce:|Fast merge flush:|Fast schedule:|Fast contention:|Fast policy:|Fast capture:|Trace collector:|Event diagnostics:'})
 # Payload methods are never executed. Probe exits itself, no unrelated process is killed.

@@ -14,14 +14,14 @@
 | `dex_semantics.hpp` | DEX raw/fixed 结构和引用检查，明确不等价于 ART 验证 |
 | `runtime_formats.hpp` | 版本化 CompactDex/VDEX/OAT 检查及内嵌对象偏移；含实机验证的 OAT 279 头/KV/偏移检查 |
 | `process_tracking.hpp` | 包名精确边界、改名后代和 PID/starttime 世代跟随 |
-| `syscall_events.hpp` | tracefs 独立实例、后台采集、系统调用 entry/exit 配对 |
+| `syscall_events.hpp` | tracefs 独立实例、250µs 空读重试、仅自身采集 TID nice 调整/恢复、entry/exit 配对 |
 | `fast_capture.hpp` | 可注入读取器的两遍局部观测、逐页有效前缀、变化与缺页检查 |
 | `fast_capture_service.hpp` | 采集线程读取、独立发布线程、覆盖在途/重试的有界队列与安全退出 drain |
 | `fast_schedule.hpp` | 队列额度、fresh/retry 公平调度、退避及重试次数上限的纯逻辑策略 |
 | `fast_buffer_pool.hpp` | 32 槽 SPSC 4KiB 双读缓冲回收；只复用存储，绝不复用证据字节 |
 | `capture_coordination.hpp` | 采集活跃提示、独立后台让步预算；不替代身份或一致性检查 |
-| `capture_tuning.hpp` | 资源策略与编译期消融控制；nice 恢复不超过继承值，冲突不进入延迟发布 |
-| `process_stat.hpp` | 新鲜 stat/status 栈读取与严格解析，不缓存进程身份或 FD |
+| `capture_tuning.hpp` | 资源策略与编译期消融控制；发布线程 nice 不高于继承优先级，积压累计批次 16，冲突不延迟 |
+| `process_stat.hpp` | 新鲜 stat/status/task 成员栈读取与严格解析，不缓存进程身份或 FD |
 | `art_refill.hpp` | 保守 code_item/指令布局、方法片段规划、双遍补集核对与映射 backing 对比 |
 | `art_refill_service.hpp` | 不可变 ART 基线注册、捕获锚点、映射/丢失失效、带来源的跨时刻重建发布 |
 | `art_method_merge.hpp` | 代际绑定的多窗口方法证据、内容去重、版本冲突冻结、已知版本补集核对 |

@@ -1,6 +1,7 @@
 param(
     [string[]]$Summaries=@(),
     [string]$ExpectedCandidateSha256='',
+    [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedBaselineSha256='3384af4442e8e85e85ecaac918559d6f915e8090314d6fb7948824201d10e485',
     [string]$Output='',
     [switch]$SelfTest
 )
@@ -20,7 +21,7 @@ function CheckBlock($summary) {
         if($split -ne $run.verified_methods){throw 'Duration/total method counts disagree'}
         if($run.verified_methods -gt 1 -and $run.merged_methods -ne $run.verified_methods){$failures+="$($run.name): final merge did not retain all independently verified methods"}
         $diag=$run.diagnostics -join "`n"
-        foreach($m in [regex]::Matches($diag,'\b(queue_drops|budget_drops|generation_rejected|unreadable|early_trace_losses|disk_drops|write_failures|verification_drops|output_drops|lost|malformed|remaining|worker_failed|priority_failures)=(\d+)')) {
+        foreach($m in [regex]::Matches($diag,'\b(queue_drops|budget_drops|generation_rejected|unreadable|early_trace_losses|disk_drops|write_failures|verification_drops|output_drops|lost|malformed|remaining|worker_failed|priority_failures|collector_priority_failures|restore_failed)=(\d+)')) {
             if([long]$m.Groups[2].Value -ne 0){$failures+="$($run.name): $($m.Value)"}
         }
         if($diag -notmatch 'remaining=0' -or $diag -notmatch 'worker_failed=0' -or $diag -notmatch 'Event diagnostics: lost=0 malformed=0'){
@@ -70,6 +71,10 @@ if($SelfTest) {
     if((CheckBlock $s).passed){throw 'Queue drop was accepted'}
     $s=Fixture;$s.runs[1].diagnostics+= 'priority_failures=1'
     if((CheckBlock $s).passed){throw 'Priority failure was accepted'}
+    $s=Fixture;$s.runs[1].diagnostics+= 'collector_priority_failures=1'
+    if((CheckBlock $s).passed){throw 'Collector priority failure was accepted'}
+    $s=Fixture;$s.runs[1].diagnostics+= 'restore_failed=1'
+    if((CheckBlock $s).passed){throw 'Collector restoration failure was accepted'}
     $s=Fixture;$s.runs[1].merged_methods=63
     if((CheckBlock $s).passed){throw 'Missing final merged method was accepted'}
     $s=Fixture;$s.runs[1].timing.by_duration[0].raw_double_match_windows=31
@@ -86,13 +91,13 @@ foreach($path in $Summaries) {
     if(!$seenPaths.Add([IO.Path]::GetFullPath($path))){throw 'Duplicate evidence path is not an independent block'}
     $s=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
     if(!$s.run -or !$seenRuns.Add($s.run)){throw 'Duplicate or missing run identity'}
-    if($s.baseline_sha256 -ne '3384af4442e8e85e85ecaac918559d6f915e8090314d6fb7948824201d10e485' -or $s.candidate_sha256 -ne $ExpectedCandidateSha256){throw 'Unpinned or mixed binaries'}
+    if($s.baseline_sha256 -ne $ExpectedBaselineSha256 -or $s.candidate_sha256 -ne $ExpectedCandidateSha256){throw 'Unpinned or mixed binaries'}
     if($s.before.selinux -ne $s.after.selinux -or $s.before.buffer_percent -ne $s.after.buffer_percent -or $s.before.instances -ne $s.after.instances){throw 'Global environment changed'}
     foreach($r in $s.runtime){if(@($r.result -split "`n" | Where-Object {$_ -match '^ART_VERIFY_PASS '}).Count -ne 64){throw 'Incomplete ART execution record'}}
     $blocks+=CheckBlock $s;$runtimeCount+=@($s.runtime).Count
 }
 $passed=(@($blocks | Where-Object {-not $_.passed}).Count -eq 0) -and $runtimeCount -gt 0
-$report=[ordered]@{passed=$passed;candidate_sha256=$ExpectedCandidateSha256;blocks=$blocks;complete_art_verified_runs=$runtimeCount;
+$report=[ordered]@{passed=$passed;baseline_sha256=$ExpectedBaselineSha256;candidate_sha256=$ExpectedCandidateSha256;blocks=$blocks;complete_art_verified_runs=$runtimeCount;
     scope='Finite own-fixture validation, not a statistical or commercial-shell guarantee; safety regressions/native tests also required'}
 $json=$report | ConvertTo-Json -Depth 10
 if($Output){$json | Set-Content -LiteralPath $Output -Encoding utf8}

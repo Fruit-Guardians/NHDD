@@ -66,9 +66,23 @@ public:
         if(!pid || !*pid || !out){errno=EINVAL;return false;}
         uint64_t expected=0;
         if(!number(pid,pid+std::strlen(pid),&expected) || !expected || expected>0x7fffffff){errno=EINVAL;return false;}
-        char path[128],bytes[4096];
+        char path[128];
         const int length=std::snprintf(path,sizeof(path),"/proc/%s/stat",pid);
         if(length<0 || static_cast<size_t>(length)>=sizeof(path)){errno=ENAMETOOLONG;return false;}
+        return read_path(path,static_cast<int>(expected),out);
+    }
+    // A fresh lookup through this leader's task directory proves membership,
+    // without generating the much larger status report. Not a TGID cache:
+    // every record reopens the task stat; caller still checks leader generation.
+    static bool member(int leader,int tid) {
+        if(leader<=0 || tid<=0){errno=EINVAL;return false;}
+        char path[96];std::snprintf(path,sizeof(path),"/proc/%d/task/%d/stat",leader,tid);
+        ProcessStatFields value;
+        return read_path(path,tid,&value) && value.starttime!=0;
+    }
+private:
+    static bool read_path(const char* path,int expected,ProcessStatFields* out) {
+        char bytes[4096];
         int flags=O_RDONLY;
 #ifdef O_CLOEXEC
         flags|=O_CLOEXEC;
@@ -79,9 +93,10 @@ public:
         if(!ok){errno=error;return false;}if(closed!=0)return false;
         ProcessStatFields value;
         if(!parse(bytes,&value))return false;
-        if(static_cast<uint64_t>(value.pid)!=expected){errno=EPROTO;return false;}
+        if(value.pid!=expected){errno=EPROTO;return false;}
         *out=value;return true;
     }
+public:
     static bool starttime(const char* pid,uint64_t* out) {
         if(!out){errno=EINVAL;return false;}ProcessStatFields value;
         if(!read(pid,&value))return false;
