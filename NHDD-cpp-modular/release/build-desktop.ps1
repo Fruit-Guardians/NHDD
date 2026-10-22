@@ -1,7 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$ReleaseDirectory,
-    [Parameter(Mandatory=$true)][string]$Go,
-    [Parameter(Mandatory=$true)][string]$Wails
+    [Parameter(Mandatory=$true)][string]$Go
 )
 $ErrorActionPreference='Stop'
 $root=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -22,7 +21,7 @@ try {
     $env:GOFLAGS='-buildvcs=false'
     Push-Location -LiteralPath $gui
     try {
-        & $Wails build -trimpath -ldflags '-s -w -buildid=' -m
+        & $Go tool wails build -trimpath -ldflags '-s -w -buildid=' -m
         if($LASTEXITCODE -ne 0){throw 'Wails build failed'}
     } finally {Pop-Location}
     $exe=Join-Path $gui 'build/bin/nhdd-gui.exe'

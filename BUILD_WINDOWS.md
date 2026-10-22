@@ -1,8 +1,8 @@
 # NHDD Windows / Linux Build Notes
 
-The desktop GUI is built with Go + Wails v2, providing a native window with a Web frontend. No CGO or GCC required.
+The desktop GUI is built with Go + Wails v2, providing a native window with a Web frontend. Windows builds do not need a separate GCC installation.
 
-Both the desktop GUI and the command-line TUI are controllers. Put the Android ARM64 engine named `nhdd` next to the GUI executable. The v9.0.1 release bundles the C++ engine; the `nhdd.c` commands below build the older C baseline, not the current ART-assisted capture implementation.
+Both the desktop GUI and the command-line TUI are controllers. Put the Android ARM64 engine named `nhdd` next to the GUI executable. Current releases bundle the C++ engine; the `nhdd.c` commands below build the older C baseline, not the current ART-assisted capture implementation.
 
 ## 1. Build Android-side `nhdd`
 
@@ -51,9 +51,9 @@ python scripts/doctor.py --su-cmd "su -c"
 
 ### Prerequisites
 
-- Go 1.23+ (v9.0.1 Windows release built with Go 1.26.10)
-- Wails CLI: `go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0`
-- Node.js (for frontend build)
+- Go 1.26+ (release validation uses Go 1.26.10)
+- Wails CLI: pinned in gui/go.mod; use `go tool wails`, not an independently installed old CLI
+- Node.js 20.19+ / 22.12+ (release validation uses Node 24)
 - Android platform-tools for `adb`
 
 ### From Windows
@@ -61,7 +61,7 @@ python scripts/doctor.py --su-cmd "su -c"
 ```powershell
 cd gui
 $env:GOFLAGS='-buildvcs=false'
-wails build -trimpath -ldflags "-s -w -buildid="
+go tool wails build -trimpath -ldflags "-s -w -buildid="
 ```
 
 Output:
@@ -74,7 +74,7 @@ gui/build/bin/nhdd-gui.exe
 
 ```bash
 cd gui
-GOFLAGS=-buildvcs=false wails build -trimpath -ldflags '-s -w -buildid='
+GOFLAGS=-buildvcs=false go tool wails build -trimpath -ldflags '-s -w -buildid='
 ```
 
 If Go module downloads are blocked, configure proxy first:

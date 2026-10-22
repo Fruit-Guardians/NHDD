@@ -10,7 +10,7 @@
         <label>ADB路径:</label>
         <input v-model="adbPath" placeholder="adb" />
         <label>Host:Port:</label>
-        <input v-model="hostPort" placeholder="192.168.238.1:5037" />
+        <input v-model="hostPort" placeholder="127.0.0.1:5037" />
         <button class="btn btn-primary" @click="connectADB" :disabled="connecting">
           {{ connecting ? '连接中...' : '连接' }}
         </button>

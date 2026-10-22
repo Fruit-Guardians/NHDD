@@ -7,10 +7,9 @@ on:
       - "nhdd.c"
       - "fix_dex_checksum.py"
       - "fix_so.py"
-      - "gui/dexfix.go"
-      - "gui/sofix.go"
-      - "gui/wails.json"
-      - "gui/frontend/src/App.vue"
+      - "gui/**"
+      - "README*.md"
+      - "BUILD_WINDOWS.md"
       - "nhdd_tui.py"
       - "scripts/**"
       - "NHDD-cpp-modular/**"
@@ -21,10 +20,9 @@ on:
       - "nhdd.c"
       - "fix_dex_checksum.py"
       - "fix_so.py"
-      - "gui/dexfix.go"
-      - "gui/sofix.go"
-      - "gui/wails.json"
-      - "gui/frontend/src/App.vue"
+      - "gui/**"
+      - "README*.md"
+      - "BUILD_WINDOWS.md"
       - "nhdd_tui.py"
       - "scripts/**"
       - "NHDD-cpp-modular/**"
@@ -44,7 +42,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.26.10"
 
       - name: Prepare wails embed placeholder
         run: |
@@ -59,6 +57,7 @@ jobs:
           python3 -m pip install rich
           python3 tests/test_public_metadata.py
           python3 tests/test_release_privacy.py
+          python3 tests/test_docs_and_security.py
           python3 scripts/audit_publication.py
 
       - name: Check against frozen baseline (if present)
@@ -77,3 +76,56 @@ jobs:
             tests/contract/REPORT.md
             tests/contract/.work/*.json
           if-no-files-found: warn
+
+  frontend-security:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gui/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: gui/frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm audit --audit-level=low
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+
+  go-security:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.10"
+          cache-dependency-path: gui/go.sum
+      - run: go mod verify
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -scan=module
+
+  windows-gui:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.10"
+          cache-dependency-path: gui/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: gui/frontend/package-lock.json
+      - name: Build production GUI with the patched tool graph
+        env:
+          GOFLAGS: -buildvcs=false
+        run: go tool wails build -trimpath -ldflags "-s -w -buildid=" -m

@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$Ndk,
-    [ValidatePattern('^9\.0\.\d+$')][string]$Version='9.0.1',
+    [ValidatePattern('^9\.0\.\d+$')][string]$Version='9.0.2',
     [string]$Destination='',
     [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedArm64Sha256='e785d6ce3d6121be2eb4829f6c5e47559b5fe0f55c7afb49fb126c742cb28180',
     [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedArmv7Sha256='d5b6c3ac34a9ada6f46af98f5666a95761ae7b602b30068970e6fa5cd0571234'

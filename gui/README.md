@@ -16,10 +16,11 @@ to this in your browser, and you can call your Go code from devtools.
 
 ## Building
 
-Release builds must remove local source paths. With Go and Wails v2.12.0 on PATH:
+Release builds require Go 1.26+ and Node 20.19+ / 22.12+. Wails v2.12.0 is
+pinned as a Go tool so the CLI uses the same patched dependency graph as the app:
 
 ```powershell
-wails build -trimpath -ldflags "-s -w -buildid="
+go tool wails build -trimpath -ldflags "-s -w -buildid="
 ```
 
 Use `NHDD-cpp-modular/release/build-desktop.ps1` for the distributable ZIPs,

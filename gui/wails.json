@@ -2,14 +2,14 @@
   "$schema": "https://wails.io/schemas/config.v2.json",
   "name": "nhdd-gui",
   "outputfilename": "nhdd-gui",
-  "frontend:install": "npm install",
+  "frontend:install": "npm ci --ignore-scripts",
   "frontend:build": "npm run build",
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
   "info": {
     "companyName": "NHDD contributors",
     "productName": "NHDD",
-    "productVersion": "9.0.1",
+    "productVersion": "9.0.2",
     "copyright": "Copyright (c) 2026 NHDD contributors",
     "comments": "Android Root DEX/SO dumper"
   }

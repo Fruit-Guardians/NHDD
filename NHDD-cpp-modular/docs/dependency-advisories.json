@@ -1,0 +1,279 @@
+{
+  "audit_date": "2026-10-22",
+  "scope": "Default branch baseline; identities and repository-specific metadata omitted.",
+  "advisories": [
+    {
+      "ghsa": "GHSA-68fv-2mgg-jv7q",
+      "severity": "high",
+      "package": "source-map-js",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "1.2.2"
+    },
+    {
+      "ghsa": "GHSA-vfp3-v2gw-7wfq",
+      "severity": "high",
+      "package": "github.com/labstack/echo/v4",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "4.15.3"
+    },
+    {
+      "ghsa": "GHSA-2v37-7h3g-55p8",
+      "severity": "high",
+      "package": "nanoid",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "3.3.18"
+    },
+    {
+      "ghsa": "GHSA-fxqj-rqcc-2cmp",
+      "severity": "medium",
+      "package": "postcss",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "8.5.23"
+    },
+    {
+      "ghsa": "GHSA-28wg-ghj8-5hjv",
+      "severity": "high",
+      "package": "nanoid",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "3.3.16"
+    },
+    {
+      "ghsa": "GHSA-r28c-9q8g-f849",
+      "severity": "high",
+      "package": "postcss",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "8.5.18"
+    },
+    {
+      "ghsa": "GHSA-qpw4-5x99-6vjp",
+      "severity": "medium",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-9m57-25v3-79x9",
+      "severity": "medium",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-vgwf-h737-ff37",
+      "severity": "critical",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-jppx-rxg9-jmrx",
+      "severity": "critical",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-w879-237q-wc7r",
+      "severity": "high",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-q4h4-gmj2-qvw2",
+      "severity": "high",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-89gr-r52h-f8rx",
+      "severity": "critical",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-rm3j-f69w-wqmq",
+      "severity": "critical",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-78mq-xcr3-xm33",
+      "severity": "medium",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-f5wc-c3c7-36mc",
+      "severity": "critical",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-5cgq-3rg8-m6cv",
+      "severity": "critical",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-45gg-vh54-h5m9",
+      "severity": "medium",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-x527-x647-q7gg",
+      "severity": "critical",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.52.0"
+    },
+    {
+      "ghsa": "GHSA-5cv4-jp36-h3mw",
+      "severity": "medium",
+      "package": "golang.org/x/net",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.55.0"
+    },
+    {
+      "ghsa": "GHSA-f6x5-jh6r-wrfv",
+      "severity": "medium",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.45.0"
+    },
+    {
+      "ghsa": "GHSA-j5w8-q4qc-rx2x",
+      "severity": "medium",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.45.0"
+    },
+    {
+      "ghsa": "GHSA-vvgc-356p-c3xw",
+      "severity": "medium",
+      "package": "golang.org/x/net",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.38.0"
+    },
+    {
+      "ghsa": "GHSA-hcg3-q754-cr77",
+      "severity": "high",
+      "package": "golang.org/x/crypto",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.35.0"
+    },
+    {
+      "ghsa": "GHSA-qxp5-gwg8-xv66",
+      "severity": "medium",
+      "package": "golang.org/x/net",
+      "manifest": "gui/go.mod",
+      "baseline_minimum_fix": "0.36.0"
+    },
+    {
+      "ghsa": "GHSA-v6wh-96g9-6wx3",
+      "severity": "medium",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "6.4.3"
+    },
+    {
+      "ghsa": "GHSA-fx2h-pf6j-xcff",
+      "severity": "high",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "6.4.3"
+    },
+    {
+      "ghsa": "GHSA-c27g-q93r-2cwf",
+      "severity": "high",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "5.4.9"
+    },
+    {
+      "ghsa": "GHSA-4w7w-66w2-5vf9",
+      "severity": "medium",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "6.4.2"
+    },
+    {
+      "ghsa": "GHSA-93m4-6634-74q7",
+      "severity": "medium",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "5.4.21"
+    },
+    {
+      "ghsa": "GHSA-g4jq-h2w9-997c",
+      "severity": "low",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "5.4.20"
+    },
+    {
+      "ghsa": "GHSA-jqfw-vq24-v9c3",
+      "severity": "low",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "5.4.20"
+    },
+    {
+      "ghsa": "GHSA-859w-5945-r5v3",
+      "severity": "medium",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "4.5.14"
+    },
+    {
+      "ghsa": "GHSA-356w-63v5-8wf4",
+      "severity": "medium",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "4.5.13"
+    },
+    {
+      "ghsa": "GHSA-xcj6-pq6g-qj4x",
+      "severity": "medium",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "4.5.12"
+    },
+    {
+      "ghsa": "GHSA-4r4m-qw57-chr8",
+      "severity": "medium",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "4.5.11"
+    },
+    {
+      "ghsa": "GHSA-x574-m823-4x7w",
+      "severity": "medium",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "4.5.10"
+    },
+    {
+      "ghsa": "GHSA-67mh-4wv8-2f99",
+      "severity": "medium",
+      "package": "esbuild",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "0.25.0"
+    },
+    {
+      "ghsa": "GHSA-vg6x-rcgg-rjx6",
+      "severity": "medium",
+      "package": "vite",
+      "manifest": "gui/frontend/package-lock.json",
+      "baseline_minimum_fix": "4.5.6"
+    }
+  ]
+}
