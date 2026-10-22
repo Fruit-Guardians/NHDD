@@ -52,3 +52,9 @@ go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary build/bin/nhdd-gui.
 ```
 
 不要通过关闭 Dependabot、降级扫描范围或手工标记修复来消除告警。推送后以 GitHub 对默认分支的重新分析为准。旧 Git 提交和旧下载不会因为新版本发布而自动升级。
+
+## Go 依赖图提交
+
+如果 GitHub 的 Go 图任务仍停在旧提交，`.github/workflows/dependency-graph.yml` 会在默认分支的模块文件变更时，或手动运行时，提交与当前提交 SHA 绑定的完整模块快照。解析器使用 `go list -m -json all` 的 MVS 选定版本，并从 `go mod graph` 建立依赖关系；包含工具、测试和间接模块，不以生产 GUI 的 import 列表缩小范围。
+
+任务先执行模块校验和漏洞扫描，再通过 [Dependency Submission API](https://docs.github.com/en/rest/dependency-graph/dependency-submission) 提交 `gui/go.mod` 的真实依赖，保存原始快照作为 CI 附件。只授予该任务 `contents: write`，不授予告警管理权限；缺失模块、解析错误、本地替换、未提交模块文件和非默认分支均拒绝提交。最终以 Dependabot 返回 `state: fixed` 和 `fixed_at` 为关闭证据，而不是以快照提交成功代替告警关闭。
