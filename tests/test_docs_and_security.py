@@ -43,6 +43,8 @@ class DocsAndSecurityTests(unittest.TestCase):
             self.assertIn("~~~mermaid", text)
             self.assertIn("assets/screenshots/gui.png", text)
             self.assertIn("assets/screenshots/tui.svg", text)
+            self.assertIn("assets/screenshots/tui-setup.svg", text)
+            self.assertIn("python nhdd_tui.py", text)
             for relative in re.findall(r'(?:\]\(|src=")(\./[^)"#]+)', text):
                 self.assertTrue((ROOT / relative).is_file(), relative)
 

@@ -40,17 +40,25 @@ Replace com.example.app with your own or explicitly authorized app. Use a fresh 
 
 ## Interface
 
+### Windows GUI
+
 ![NHDD desktop GUI](./NHDD-cpp-modular/assets/screenshots/gui.png)
 
 Built GUI frontend in a browser preview, before connecting a device; no private device identifiers or dumps are shown. This does not substitute for native WebView2 testing.
 
+### Python TUI
+
+![NHDD TUI live progress dashboard](./NHDD-cpp-modular/assets/screenshots/tui.svg)
+
+App selection → configuration → live watch dashboard → results. Install rich and run `python nhdd_tui.py`, or select a target directly with `python nhdd_tui.py com.example.app`.
+
 <details>
-<summary>Terminal entry screen</summary>
+<summary>App selection and configuration</summary>
 
-![NHDD terminal](./NHDD-cpp-modular/assets/screenshots/tui.svg)
-
-Generated from the real TUI logo renderer; this is an entry screen, not a capture result.
+![NHDD TUI app selection and configuration](./NHDD-cpp-modular/assets/screenshots/tui-setup.svg)
 </details>
+
+Both TUI views use the real Rich UI functions with synthetic packages, input and logs—not Root device results. Reproduce them with `python scripts/capture_tui.py`.
 
 ## Architecture
 

@@ -40,17 +40,25 @@ adb pull /data/local/tmp/nhdd_run01 ./nhdd_run01
 
 ## 界面预览
 
+### Windows GUI
+
 ![NHDD 桌面界面](./NHDD-cpp-modular/assets/screenshots/gui.png)
 
 实际 GUI 前端的浏览器预览，尚未连接设备；不展示私有设备标识或转储，不替代原生 WebView2 测试。
 
+### Python TUI
+
+![NHDD TUI 实时进度面板](./NHDD-cpp-modular/assets/screenshots/tui.svg)
+
+应用选择 → 参数配置 → watch 实时进度 → 结果统计。安装 rich 后运行 `python nhdd_tui.py`；支持 `python nhdd_tui.py com.example.app` 直接选择目标。
+
 <details>
-<summary>终端入口预览</summary>
+<summary>查看应用选择与参数配置</summary>
 
-![NHDD 终端入口](./NHDD-cpp-modular/assets/screenshots/tui.svg)
-
-由实际 TUI Logo 渲染器导出，仅展示入口，不代表捕获结果。
+![NHDD TUI 应用选择与配置](./NHDD-cpp-modular/assets/screenshots/tui-setup.svg)
 </details>
+
+两张 TUI 图由实际 Rich 界面函数生成；包名、输入和日志均为演示数据，不是 Root 真机捕获结果。可运行 `python scripts/capture_tui.py` 重新生成。
 
 ## 架构概览
 

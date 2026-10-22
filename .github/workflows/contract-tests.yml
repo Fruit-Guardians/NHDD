@@ -58,6 +58,7 @@ jobs:
           python3 tests/test_public_metadata.py
           python3 tests/test_release_privacy.py
           python3 tests/test_docs_and_security.py
+          python3 tests/test_tui_previews.py
           python3 scripts/audit_publication.py
 
       - name: Check against frozen baseline (if present)

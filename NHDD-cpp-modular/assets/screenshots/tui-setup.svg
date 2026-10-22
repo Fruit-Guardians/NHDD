@@ -1,0 +1,285 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="rich-terminal" viewBox="0 0 1482 733.1999999999999">
+  <style>
+
+
+    .NHDD-TUI-Setup-matrix {
+        font-family: Consolas, "Noto Sans Mono CJK SC", "Microsoft YaHei", monospace;
+        font-size: 20px;
+        line-height: 24.4px;
+        font-variant-east-asian: full-width;
+    }
+
+    .NHDD-TUI-Setup-title {
+        font-size: 18px;
+        font-weight: bold;
+        font-family: arial;
+    }
+
+    .NHDD-TUI-Setup-r1 { fill: #d0b344;font-weight: bold }
+.NHDD-TUI-Setup-r2 { fill: #c5c8c6 }
+.NHDD-TUI-Setup-r3 { fill: #68a0b3 }
+.NHDD-TUI-Setup-r4 { fill: #c5c8c6;font-style: italic; }
+.NHDD-TUI-Setup-r5 { fill: #c5c8c6;font-weight: bold }
+.NHDD-TUI-Setup-r6 { fill: #868887 }
+.NHDD-TUI-Setup-r7 { fill: #8d7b39 }
+.NHDD-TUI-Setup-r8 { fill: #6b546f }
+.NHDD-TUI-Setup-r9 { fill: #68a0b3;font-weight: bold }
+.NHDD-TUI-Setup-r10 { fill: #98729f;font-weight: bold }
+    </style>
+  <defs>
+    <clipPath id="NHDD-TUI-Setup-clip-terminal">
+      <rect x="0" y="0" width="1463.0" height="682.1999999999999" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-0">
+      <rect x="0" y="1.5" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-1">
+      <rect x="0" y="25.9" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-2">
+      <rect x="0" y="50.3" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-3">
+      <rect x="0" y="74.7" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-4">
+      <rect x="0" y="99.1" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-5">
+      <rect x="0" y="123.5" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-6">
+      <rect x="0" y="147.9" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-7">
+      <rect x="0" y="172.3" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-8">
+      <rect x="0" y="196.7" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-9">
+      <rect x="0" y="221.1" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-10">
+      <rect x="0" y="245.5" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-11">
+      <rect x="0" y="269.9" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-12">
+      <rect x="0" y="294.3" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-13">
+      <rect x="0" y="318.7" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-14">
+      <rect x="0" y="343.1" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-15">
+      <rect x="0" y="367.5" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-16">
+      <rect x="0" y="391.9" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-17">
+      <rect x="0" y="416.3" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-18">
+      <rect x="0" y="440.7" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-19">
+      <rect x="0" y="465.1" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-20">
+      <rect x="0" y="489.5" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-21">
+      <rect x="0" y="513.9" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-22">
+      <rect x="0" y="538.3" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-23">
+      <rect x="0" y="562.7" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-24">
+      <rect x="0" y="587.1" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-25">
+      <rect x="0" y="611.5" width="1464" height="24.65" />
+    </clipPath>
+    <clipPath id="NHDD-TUI-Setup-line-26">
+      <rect x="0" y="635.9" width="1464" height="24.65" />
+    </clipPath>
+  </defs>
+  <rect fill="#292929" stroke="rgba(255,255,255,0.35)" stroke-width="1" x="1" y="1" width="1480" height="731.2" rx="8" />
+  <text class="NHDD-TUI-Setup-title" fill="#c5c8c6" text-anchor="middle" x="740" y="27">NHDD TUI Setup</text>
+  <g transform="translate(26,22)">
+    <circle cx="0" cy="0" r="7" fill="#ff5f57" />
+    <circle cx="22" cy="0" r="7" fill="#febc2e" />
+    <circle cx="44" cy="0" r="7" fill="#28c840" />
+  </g>
+  <g transform="translate(9, 41)" clip-path="url(#NHDD-TUI-Setup-clip-terminal)">
+    <g class="NHDD-TUI-Setup-matrix">
+      <text class="NHDD-TUI-Setup-r1" x="0" y="20" textLength="585.6" clip-path="url(#NHDD-TUI-Setup-line-0)" lengthAdjust="spacingAndGlyphs">界面演示 / DEMO · 合成应用与日志，非真机捕获结果</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="20" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-0)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="44.4" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-1)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r3" x="0" y="68.8" textLength="658.8" clip-path="url(#NHDD-TUI-Setup-line-2)" lengthAdjust="spacingAndGlyphs">───────────────────────────────────────────────────── </text>
+      <text class="NHDD-TUI-Setup-r2" x="658.8" y="68.8" textLength="146.4" clip-path="url(#NHDD-TUI-Setup-line-2)" lengthAdjust="spacingAndGlyphs">加载应用列表</text>
+      <text class="NHDD-TUI-Setup-r3" x="805.2" y="68.8" textLength="658.8" clip-path="url(#NHDD-TUI-Setup-line-2)" lengthAdjust="spacingAndGlyphs"> ─────────────────────────────────────────────────────</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="68.8" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-2)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r4" x="0" y="93.2" textLength="366" clip-path="url(#NHDD-TUI-Setup-line-3)" lengthAdjust="spacingAndGlyphs">  第三方应用 (3 个 · 页 1/1)  </text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="93.2" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-3)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="117.6" textLength="366" clip-path="url(#NHDD-TUI-Setup-line-4)" lengthAdjust="spacingAndGlyphs">╭───────┬────────────────────╮</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="117.6" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-4)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="142" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-5)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r5" x="24.4" y="142" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-5)" lengthAdjust="spacingAndGlyphs">#    </text>
+      <text class="NHDD-TUI-Setup-r2" x="97.6" y="142" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-5)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r5" x="122" y="142" textLength="219.6" clip-path="url(#NHDD-TUI-Setup-line-5)" lengthAdjust="spacingAndGlyphs">包名              </text>
+      <text class="NHDD-TUI-Setup-r2" x="353.8" y="142" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-5)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="142" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-5)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="166.4" textLength="366" clip-path="url(#NHDD-TUI-Setup-line-6)" lengthAdjust="spacingAndGlyphs">├───────┼────────────────────┤</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="166.4" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-6)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="190.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-7)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r6" x="24.4" y="190.8" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-7)" lengthAdjust="spacingAndGlyphs">1    </text>
+      <text class="NHDD-TUI-Setup-r2" x="97.6" y="190.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-7)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r3" x="122" y="190.8" textLength="219.6" clip-path="url(#NHDD-TUI-Setup-line-7)" lengthAdjust="spacingAndGlyphs">com.example.demo  </text>
+      <text class="NHDD-TUI-Setup-r2" x="353.8" y="190.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-7)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="190.8" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-7)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="215.2" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-8)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r6" x="24.4" y="215.2" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-8)" lengthAdjust="spacingAndGlyphs">2    </text>
+      <text class="NHDD-TUI-Setup-r2" x="97.6" y="215.2" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-8)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r3" x="122" y="215.2" textLength="219.6" clip-path="url(#NHDD-TUI-Setup-line-8)" lengthAdjust="spacingAndGlyphs">com.example.native</text>
+      <text class="NHDD-TUI-Setup-r2" x="353.8" y="215.2" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-8)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="215.2" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-8)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="239.6" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-9)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r6" x="24.4" y="239.6" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-9)" lengthAdjust="spacingAndGlyphs">3    </text>
+      <text class="NHDD-TUI-Setup-r2" x="97.6" y="239.6" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-9)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r3" x="122" y="239.6" textLength="219.6" clip-path="url(#NHDD-TUI-Setup-line-9)" lengthAdjust="spacingAndGlyphs">com.example.reader</text>
+      <text class="NHDD-TUI-Setup-r2" x="353.8" y="239.6" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-9)" lengthAdjust="spacingAndGlyphs">│</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="239.6" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-9)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="264" textLength="366" clip-path="url(#NHDD-TUI-Setup-line-10)" lengthAdjust="spacingAndGlyphs">╰───────┴────────────────────╯</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="264" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-10)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="288.4" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-11)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r6" x="0" y="312.8" textLength="353.8" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">输入:序号选择 | 关键词搜索 | </text>
+      <text class="NHDD-TUI-Setup-r7" x="353.8" y="312.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">n</text>
+      <text class="NHDD-TUI-Setup-r6" x="366" y="312.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">=</text>
+      <text class="NHDD-TUI-Setup-r8" x="378.2" y="312.8" textLength="73.2" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">下一页</text>
+      <text class="NHDD-TUI-Setup-r7" x="463.6" y="312.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">p</text>
+      <text class="NHDD-TUI-Setup-r6" x="475.8" y="312.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">=</text>
+      <text class="NHDD-TUI-Setup-r8" x="488" y="312.8" textLength="73.2" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">上一页</text>
+      <text class="NHDD-TUI-Setup-r6" x="561.2" y="312.8" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs"> | </text>
+      <text class="NHDD-TUI-Setup-r7" x="597.8" y="312.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">q</text>
+      <text class="NHDD-TUI-Setup-r6" x="610" y="312.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">=</text>
+      <text class="NHDD-TUI-Setup-r8" x="622.2" y="312.8" textLength="48.8" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">退出</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="312.8" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-12)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r5" x="0" y="337.2" textLength="48.8" clip-path="url(#NHDD-TUI-Setup-line-13)" lengthAdjust="spacingAndGlyphs">选择</text>
+      <text class="NHDD-TUI-Setup-r9" x="61" y="337.2" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-13)" lengthAdjust="spacingAndGlyphs">()</text>
+      <text class="NHDD-TUI-Setup-r2" x="85.4" y="337.2" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-13)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="109.8" y="337.2" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-13)" lengthAdjust="spacingAndGlyphs">1</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="337.2" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-13)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r3" x="0" y="361.6" textLength="683.2" clip-path="url(#NHDD-TUI-Setup-line-14)" lengthAdjust="spacingAndGlyphs">─────────────────────────────────────────────────────── </text>
+      <text class="NHDD-TUI-Setup-r2" x="683.2" y="361.6" textLength="97.6" clip-path="url(#NHDD-TUI-Setup-line-14)" lengthAdjust="spacingAndGlyphs">脱壳配置</text>
+      <text class="NHDD-TUI-Setup-r3" x="780.8" y="361.6" textLength="683.2" clip-path="url(#NHDD-TUI-Setup-line-14)" lengthAdjust="spacingAndGlyphs"> ───────────────────────────────────────────────────────</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="361.6" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-14)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="386" textLength="122" clip-path="url(#NHDD-TUI-Setup-line-15)" lengthAdjust="spacingAndGlyphs">Dump 模式 </text>
+      <text class="NHDD-TUI-Setup-r10" x="122" y="386" textLength="231.8" clip-path="url(#NHDD-TUI-Setup-line-15)" lengthAdjust="spacingAndGlyphs">[apk/dex/so/jnimap]</text>
+      <text class="NHDD-TUI-Setup-r9" x="366" y="386" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-15)" lengthAdjust="spacingAndGlyphs">(apk)</text>
+      <text class="NHDD-TUI-Setup-r2" x="427" y="386" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-15)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="451.4" y="386" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-15)" lengthAdjust="spacingAndGlyphs">dex</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="386" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-15)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="410.4" textLength="183" clip-path="url(#NHDD-TUI-Setup-line-16)" lengthAdjust="spacingAndGlyphs">重启 app 再扫? </text>
+      <text class="NHDD-TUI-Setup-r10" x="183" y="410.4" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-16)" lengthAdjust="spacingAndGlyphs">[y/n]</text>
+      <text class="NHDD-TUI-Setup-r9" x="256.2" y="410.4" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-16)" lengthAdjust="spacingAndGlyphs">(y)</text>
+      <text class="NHDD-TUI-Setup-r2" x="292.8" y="410.4" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-16)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="317.2" y="410.4" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-16)" lengthAdjust="spacingAndGlyphs">n</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="410.4" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-16)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="434.8" textLength="451.4" clip-path="url(#NHDD-TUI-Setup-line-17)" lengthAdjust="spacingAndGlyphs">启用 watch 监听(推荐,捕获懒加载 DEX) </text>
+      <text class="NHDD-TUI-Setup-r10" x="451.4" y="434.8" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-17)" lengthAdjust="spacingAndGlyphs">[y/n]</text>
+      <text class="NHDD-TUI-Setup-r9" x="524.6" y="434.8" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-17)" lengthAdjust="spacingAndGlyphs">(y)</text>
+      <text class="NHDD-TUI-Setup-r2" x="561.2" y="434.8" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-17)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="585.6" y="434.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-17)" lengthAdjust="spacingAndGlyphs">y</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="434.8" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-17)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="459.2" textLength="414.8" clip-path="url(#NHDD-TUI-Setup-line-18)" lengthAdjust="spacingAndGlyphs">  连续几轮无新 DEX 自动停 (dry K) </text>
+      <text class="NHDD-TUI-Setup-r9" x="414.8" y="459.2" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-18)" lengthAdjust="spacingAndGlyphs">(3)</text>
+      <text class="NHDD-TUI-Setup-r2" x="451.4" y="459.2" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-18)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="475.8" y="459.2" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-18)" lengthAdjust="spacingAndGlyphs">3</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="459.2" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-18)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="483.6" textLength="183" clip-path="url(#NHDD-TUI-Setup-line-19)" lengthAdjust="spacingAndGlyphs">  最大运行秒数 </text>
+      <text class="NHDD-TUI-Setup-r9" x="183" y="483.6" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-19)" lengthAdjust="spacingAndGlyphs">(120)</text>
+      <text class="NHDD-TUI-Setup-r2" x="244" y="483.6" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-19)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="268.4" y="483.6" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-19)" lengthAdjust="spacingAndGlyphs">120</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="483.6" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-19)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="508" textLength="488" clip-path="url(#NHDD-TUI-Setup-line-20)" lengthAdjust="spacingAndGlyphs">启用 stealth(区域间延时,降低被检测概率) </text>
+      <text class="NHDD-TUI-Setup-r10" x="488" y="508" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-20)" lengthAdjust="spacingAndGlyphs">[y/n]</text>
+      <text class="NHDD-TUI-Setup-r9" x="561.2" y="508" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-20)" lengthAdjust="spacingAndGlyphs">(y)</text>
+      <text class="NHDD-TUI-Setup-r2" x="597.8" y="508" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-20)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="622.2" y="508" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-20)" lengthAdjust="spacingAndGlyphs">n</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="508" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-20)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="532.4" textLength="610" clip-path="url(#NHDD-TUI-Setup-line-21)" lengthAdjust="spacingAndGlyphs">启用 stealth2(process_vm_readv 反检测,二代壳推荐) </text>
+      <text class="NHDD-TUI-Setup-r10" x="610" y="532.4" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-21)" lengthAdjust="spacingAndGlyphs">[y/n]</text>
+      <text class="NHDD-TUI-Setup-r9" x="683.2" y="532.4" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-21)" lengthAdjust="spacingAndGlyphs">(y)</text>
+      <text class="NHDD-TUI-Setup-r2" x="719.8" y="532.4" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-21)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="744.2" y="532.4" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-21)" lengthAdjust="spacingAndGlyphs">n</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="532.4" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-21)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="556.8" textLength="634.4" clip-path="url(#NHDD-TUI-Setup-line-22)" lengthAdjust="spacingAndGlyphs">启用 relaxed(宽松 DEX 验证,不依赖 magic,二代壳推荐) </text>
+      <text class="NHDD-TUI-Setup-r10" x="634.4" y="556.8" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-22)" lengthAdjust="spacingAndGlyphs">[y/n]</text>
+      <text class="NHDD-TUI-Setup-r9" x="707.6" y="556.8" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-22)" lengthAdjust="spacingAndGlyphs">(y)</text>
+      <text class="NHDD-TUI-Setup-r2" x="744.2" y="556.8" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-22)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="768.6" y="556.8" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-22)" lengthAdjust="spacingAndGlyphs">n</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="556.8" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-22)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="581.2" textLength="366" clip-path="url(#NHDD-TUI-Setup-line-23)" lengthAdjust="spacingAndGlyphs">启用 anon(仅扫描匿名内存映射) </text>
+      <text class="NHDD-TUI-Setup-r10" x="366" y="581.2" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-23)" lengthAdjust="spacingAndGlyphs">[y/n]</text>
+      <text class="NHDD-TUI-Setup-r9" x="439.2" y="581.2" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-23)" lengthAdjust="spacingAndGlyphs">(n)</text>
+      <text class="NHDD-TUI-Setup-r2" x="475.8" y="581.2" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-23)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="500.2" y="581.2" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-23)" lengthAdjust="spacingAndGlyphs">n</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="581.2" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-23)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="605.6" textLength="536.8" clip-path="url(#NHDD-TUI-Setup-line-24)" lengthAdjust="spacingAndGlyphs">启用 JNIMAP(Native方法扫描, 叠加到当前模式) </text>
+      <text class="NHDD-TUI-Setup-r10" x="536.8" y="605.6" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-24)" lengthAdjust="spacingAndGlyphs">[y/n]</text>
+      <text class="NHDD-TUI-Setup-r9" x="610" y="605.6" textLength="36.6" clip-path="url(#NHDD-TUI-Setup-line-24)" lengthAdjust="spacingAndGlyphs">(n)</text>
+      <text class="NHDD-TUI-Setup-r2" x="646.6" y="605.6" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-24)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="671" y="605.6" textLength="12.2" clip-path="url(#NHDD-TUI-Setup-line-24)" lengthAdjust="spacingAndGlyphs">n</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="605.6" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-24)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="630" textLength="902.8" clip-path="url(#NHDD-TUI-Setup-line-25)" lengthAdjust="spacingAndGlyphs">SU 命令(读其他进程内存需要 root:留空=普通shell 或 su -c / kp -c / ksud -c)</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="630" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-25)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="654.4" textLength="573.4" clip-path="url(#NHDD-TUI-Setup-line-26)" lengthAdjust="spacingAndGlyphs">      支持 {cmd} 模板(如 kp --exec-file {cmd}) </text>
+      <text class="NHDD-TUI-Setup-r9" x="573.4" y="654.4" textLength="85.4" clip-path="url(#NHDD-TUI-Setup-line-26)" lengthAdjust="spacingAndGlyphs">(su -c)</text>
+      <text class="NHDD-TUI-Setup-r2" x="658.8" y="654.4" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-26)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="683.2" y="654.4" textLength="61" clip-path="url(#NHDD-TUI-Setup-line-26)" lengthAdjust="spacingAndGlyphs">su -c</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="654.4" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-26)" lengthAdjust="spacingAndGlyphs">
+</text>
+      <text class="NHDD-TUI-Setup-r2" x="0" y="678.8" textLength="158.6" clip-path="url(#NHDD-TUI-Setup-line-27)" lengthAdjust="spacingAndGlyphs">本地输出目录 </text>
+      <text class="NHDD-TUI-Setup-r9" x="158.6" y="678.8" textLength="183" clip-path="url(#NHDD-TUI-Setup-line-27)" lengthAdjust="spacingAndGlyphs">(./nhdd_output)</text>
+      <text class="NHDD-TUI-Setup-r2" x="341.6" y="678.8" textLength="24.4" clip-path="url(#NHDD-TUI-Setup-line-27)" lengthAdjust="spacingAndGlyphs">: </text>
+      <text class="NHDD-TUI-Setup-r2" x="366" y="678.8" textLength="158.6" clip-path="url(#NHDD-TUI-Setup-line-27)" lengthAdjust="spacingAndGlyphs">./nhdd_output</text>
+      <text class="NHDD-TUI-Setup-r2" x="1464" y="678.8" textLength="0" clip-path="url(#NHDD-TUI-Setup-line-27)" lengthAdjust="spacingAndGlyphs">
+</text>
+    </g>
+  </g>
+</svg>
