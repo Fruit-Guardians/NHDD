@@ -19,7 +19,12 @@ class DocsAndSecurityTests(unittest.TestCase):
         text = (ROOT / "gui/go.mod").read_text(encoding="utf-8")
         for module, minimum in {"golang.org/x/crypto": "0.58.0",
                                 "golang.org/x/net": "0.61.0",
-                                "github.com/labstack/echo/v4": "4.16.0"}.items():
+                                "github.com/labstack/echo/v4": "4.16.0",
+                                "github.com/go-git/go-git/v5": "5.19.2",
+                                "github.com/go-git/go-billy/v5": "5.9.0",
+                                "golang.org/x/image": "0.41.0",
+                                "github.com/cloudflare/circl": "1.6.3",
+                                "github.com/sirupsen/logrus": "1.9.3"}.items():
             found = re.search(r"(?m)^\s*" + re.escape(module) + r"\s+(v\S+)", text)
             self.assertIsNotNone(found, module)
             self.assertGreaterEqual(version(found.group(1)), version(minimum))
@@ -27,6 +32,13 @@ class DocsAndSecurityTests(unittest.TestCase):
         script = (ROOT / "NHDD-cpp-modular/release/build-desktop.ps1").read_text(encoding="utf-8")
         self.assertIn("& $Go tool wails build", script)
         self.assertNotIn("& $Wails build", script)
+
+    def test_full_graph_advisory_baseline_is_preserved(self):
+        baseline = json.loads((ROOT / "NHDD-cpp-modular/docs/dependency-advisories-tools.json").read_text())
+        self.assertEqual(len(baseline["advisories"]), 18)
+        self.assertEqual(sum(a["severity"] == "high" for a in baseline["advisories"]), 6)
+        self.assertEqual(len({a["ghsa"] for a in baseline["advisories"]}), 18)
+        self.assertEqual(len({a["package"] for a in baseline["advisories"]}), 5)
 
     def test_npm_security_floors(self):
         packages = json.loads((ROOT / "gui/frontend/package-lock.json").read_text())["packages"]

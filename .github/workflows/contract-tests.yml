@@ -61,6 +61,10 @@ jobs:
           python3 tests/test_tui_previews.py
           python3 scripts/audit_publication.py
 
+      - name: Offline Go dependency API regressions
+        working-directory: gui
+        run: go test -count=1 dependency_security_test.go
+
       - name: Check against frozen baseline (if present)
         run: |
           if [ -f tests/contract/expected.json ]; then

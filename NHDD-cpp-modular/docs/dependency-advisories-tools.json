@@ -1,0 +1,24 @@
+{
+  "audit_date": "2026-10-22",
+  "scope": "18 additional alerts discovered by the complete selected Go module graph, including tool and test dependencies. Original 39-alert baseline is preserved separately.",
+  "advisories": [
+    {"ghsa": "GHSA-hc8v-wwc9-vgxm", "severity": "high", "package": "github.com/go-git/go-git/v5", "baseline_minimum_fix": "5.19.2"},
+    {"ghsa": "GHSA-q675-qj96-32m9", "severity": "high", "package": "golang.org/x/image", "baseline_minimum_fix": "0.41.0"},
+    {"ghsa": "GHSA-qw64-3x98-g7q2", "severity": "high", "package": "github.com/go-git/go-billy/v5", "baseline_minimum_fix": "5.9.0"},
+    {"ghsa": "GHSA-389r-gv7p-r3rp", "severity": "high", "package": "github.com/go-git/go-git/v5", "baseline_minimum_fix": "5.19.0"},
+    {"ghsa": "GHSA-4f99-4q7p-p3gh", "severity": "high", "package": "github.com/sirupsen/logrus", "baseline_minimum_fix": "1.9.1"},
+    {"ghsa": "GHSA-9phm-fm57-rhg8", "severity": "high", "package": "golang.org/x/image", "baseline_minimum_fix": "0.18.0"},
+    {"ghsa": "GHSA-qgq7-7hm3-q39j", "severity": "medium", "package": "github.com/go-git/go-git/v5", "baseline_minimum_fix": "5.19.2"},
+    {"ghsa": "GHSA-w5pp-99ch-qj29", "severity": "medium", "package": "github.com/go-git/go-git/v5", "baseline_minimum_fix": "5.19.1"},
+    {"ghsa": "GHSA-crhj-59gh-8x96", "severity": "medium", "package": "github.com/go-git/go-git/v5", "baseline_minimum_fix": "5.19.1"},
+    {"ghsa": "GHSA-m3xc-h892-ggx6", "severity": "medium", "package": "github.com/go-git/go-billy/v5", "baseline_minimum_fix": "5.9.0"},
+    {"ghsa": "GHSA-3xc5-wrhm-f963", "severity": "medium", "package": "github.com/go-git/go-git/v5", "baseline_minimum_fix": "5.18.0"},
+    {"ghsa": "GHSA-jhf3-xxhw-2wpp", "severity": "medium", "package": "github.com/go-git/go-git/v5", "baseline_minimum_fix": "5.17.1"},
+    {"ghsa": "GHSA-44p7-9xx4-hf2g", "severity": "medium", "package": "golang.org/x/image", "baseline_minimum_fix": "0.38.0"},
+    {"ghsa": "GHSA-37cx-329c-33x3", "severity": "medium", "package": "github.com/go-git/go-git/v5", "baseline_minimum_fix": "5.16.5"},
+    {"ghsa": "GHSA-m7cr-m3pv-hgrp", "severity": "low", "package": "github.com/go-git/go-git/v5", "baseline_minimum_fix": "5.19.1"},
+    {"ghsa": "GHSA-gm2x-2g9h-ccm8", "severity": "low", "package": "github.com/go-git/go-git/v5", "baseline_minimum_fix": "5.17.1"},
+    {"ghsa": "GHSA-q9hv-hpm4-hj6x", "severity": "low", "package": "github.com/cloudflare/circl", "baseline_minimum_fix": "1.6.3"},
+    {"ghsa": "GHSA-2x5j-vhc8-9cwm", "severity": "low", "package": "github.com/cloudflare/circl", "baseline_minimum_fix": "1.6.1"}
+  ]
+}

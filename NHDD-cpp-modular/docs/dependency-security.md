@@ -55,6 +55,18 @@ go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary build/bin/nhdd-gui.
 
 ## Go 依赖图提交
 
+完整图刷新后，旧基线 39 项全部被 GitHub 标记为 `fixed`，同时新检出 18 项既有工具/间接依赖告警（6 High、8 Medium、4 Low），不是引入了 18 个新依赖。[新增 GHSA 基线](dependency-advisories-tools.json)单独保留，不改写旧基线。针对这组告警升级如下，并将版本下限加入回归检查：
+
+| 模块 | 原版本 | 修复版本 |
+|---|---|---|
+| go-git/v5 | 5.13.2 | 5.19.2 |
+| go-billy/v5 | 5.6.2 | 5.9.0 |
+| x/image | 0.12.0 | 0.41.0 |
+| CIRCL | 1.3.7 | 1.6.3 |
+| Logrus | 1.9.0 | 1.9.3 |
+
+这些版本覆盖 High 的路径越界、对象解析、图像解码资源消耗和日志 DoS，以及同组 Medium/Low 修复。不因依赖只用于工具/测试就将其排除。Go 漏洞库扫描与 GitHub Advisory/Dependabot 的覆盖及更新时间并不相同，前者 0 findings 不能替代后者的逐项核对。
+
 如果 GitHub 的 Go 图任务仍停在旧提交，`.github/workflows/dependency-graph.yml` 会在默认分支的模块文件变更时，或手动运行时，提交与当前提交 SHA 绑定的完整模块快照。解析器使用 `go list -m -json all` 的 MVS 选定版本，并从 `go mod graph` 建立依赖关系；包含工具、测试和间接模块，不以生产 GUI 的 import 列表缩小范围。
 
 任务先执行模块校验和漏洞扫描，再通过 [Dependency Submission API](https://docs.github.com/en/rest/dependency-graph/dependency-submission) 提交 `gui/go.mod` 的真实依赖，保存原始快照作为 CI 附件。只授予该任务 `contents: write`，不授予告警管理权限；缺失模块、解析错误、本地替换、未提交模块文件和非默认分支均拒绝提交。最终以 Dependabot 返回 `state: fixed` 和 `fixed_at` 为关闭证据，而不是以快照提交成功代替告警关闭。
