@@ -346,6 +346,24 @@ static int dump_mem_elf_at_inline(int mem_fd, pid_t pid, uintptr_t elf_addr,
             reconstructed_path, metadata_path, source_path,
             &metadata_identity, &process_generation_publish_guard_inline,
             generation)) {
+        if (generation->invalid) {
+            metadata_identity.capture_status = "generation_rejected";
+            char recovery_raw[1100], recovery_image[1100], recovery_meta[1100];
+            std::snprintf(recovery_raw, sizeof(recovery_raw),
+                          "%s.generation-rejected.raw.bin", raw_path);
+            std::snprintf(recovery_image, sizeof(recovery_image),
+                          "%s.generation-rejected.so", reconstructed_path);
+            std::snprintf(recovery_meta, sizeof(recovery_meta),
+                          "%s.generation-rejected.json", metadata_path);
+            if (ElfReconstructor::write_artifacts(
+                    result, result.raw_layout_available ? recovery_raw : nullptr,
+                    recovery_image, recovery_meta, source_path,
+                    &metadata_identity, nullptr, nullptr)) {
+                std::fprintf(stderr,
+                    "  [~] Retained SO generation evidence for retry: %s\n",
+                    recovery_image);
+            }
+        }
         std::fprintf(stderr, "  [-] Failed to publish ELF artifact 0x%lx\n",
                      static_cast<unsigned long>(elf_addr));
         return 0;
@@ -511,6 +529,14 @@ static bool write_staged_dex_metadata_inline(
         capture.art_object()?"art_standard_dexfile":"header_scan",
         static_cast<unsigned long long>(capture.art_object()),
         static_cast<unsigned long long>(capture.art_vtable()),capture.art_build_id().c_str());
+    std::fprintf(f, "  \"mapping\": {\"path\":\"");
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(
+             capture.mapping_path().c_str()); *p; ++p) {
+        if (*p == '\\' || *p == '"') std::fputc('\\', f);
+        std::fputc(*p, f);
+    }
+    std::fprintf(f, "\",\"perms\":\"%s\"},\n",
+                 capture.mapping_perms().c_str());
     std::fprintf(f, "  \"holes\": [");
     for (size_t i = 0; i < holes.size(); ++i) {
         if (i != 0) std::fprintf(f, ",");
@@ -944,6 +970,36 @@ public:
                 (void)::unlink(metadata_temp.c_str());
             }
             if (!published) {
+                if (generation.invalid) {
+                    const std::string evidence_path =
+                        std::string(raw_path) + ".generation-rejected.dex";
+                    const std::string evidence_meta =
+                        evidence_path + ".meta.json";
+                    const std::string evidence_temp =
+                        artifact_sidecar_path_inline(evidence_path.c_str(), "tmp");
+                    const std::string evidence_meta_temp =
+                        artifact_sidecar_path_inline(evidence_meta.c_str(), "tmp");
+                    bool retained = write_staged_bytes_inline(
+                        evidence_temp.c_str(), capture.data(), capture.size());
+                    retained = retained && write_staged_dex_metadata_inline(
+                        evidence_meta_temp.c_str(), "generation_rejected",
+                        capture, content_hash, magic_synthesized, nullptr,
+                        evidence_path.c_str(), nullptr);
+                    if (retained) {
+                        std::vector<ArtifactTransactionEntryInline> evidence;
+                        evidence.emplace_back(evidence_path.c_str(), evidence_temp.c_str());
+                        evidence.emplace_back(evidence_meta.c_str(), evidence_meta_temp.c_str());
+                        retained = artifact_publish_transaction_inline(&evidence);
+                    }
+                    if (retained) {
+                        std::fprintf(stderr,
+                            "[~] Retained DEX generation evidence for retry: %s\n",
+                            evidence_path.c_str());
+                    } else {
+                        ::unlink(evidence_temp.c_str());
+                        ::unlink(evidence_meta_temp.c_str());
+                    }
+                }
                 std::fprintf(stderr, "[-] Failed to publish complete DEX %s: %s\n",
                              fixed_path, std::strerror(errno));
                 return;
@@ -1000,6 +1056,8 @@ public:
                     static_cast<unsigned long long>(dex_addr), dex_size,
                     static_cast<unsigned long long>(identity.header_fingerprint));
             }
+            if (source_mapping && (created || capture->mapping_path().empty()))
+                capture->set_mapping(source_mapping->path, source_mapping->perms);
             // ART-owned captures may rebind to a newly validated object after
             // loader churn; header-owned captures retain their initial source.
             if(art && (created || capture->art_object()))

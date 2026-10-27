@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -20,6 +21,17 @@
 
 class ProcessManager {
 public:
+    struct DeepLinkRoute {
+        std::string component;
+        std::string scheme;
+        std::string authority;
+
+        std::string uri() const {
+            if (authority.empty()) return scheme + "://";
+            return scheme + "://" + authority;
+        }
+    };
+
     struct LaunchHelper {
         pid_t pid = -1;
         ~LaunchHelper() {
@@ -131,6 +143,107 @@ public:
             cursor = end + 1;
         }
         return {};
+    }
+
+    // Parse the package-manager's intent-filter dump without depending on
+    // platform-specific binary manifest tooling. Only VIEW+BROWSABLE routes
+    // are returned; callers still decide which routes are safe to launch.
+    static std::vector<DeepLinkRoute> parse_deep_links(
+            const std::string& package, const std::string& output,
+            size_t limit = 16) {
+        std::vector<DeepLinkRoute> routes;
+        std::string component, scheme, authority;
+        bool view = false, browsable = false;
+        auto flush = [&] {
+            if (!component.empty() && view && browsable && !scheme.empty()) {
+                DeepLinkRoute route{component, scheme, authority};
+                const std::string key = route.component + "\n" + route.uri();
+                bool duplicate = false;
+                for (const auto& existing : routes)
+                    if (existing.component + "\n" + existing.uri() == key) {
+                        duplicate = true;
+                        break;
+                    }
+                if (!duplicate && routes.size() < limit) routes.push_back(std::move(route));
+            }
+            component.clear(); scheme.clear(); authority.clear();
+            view = false; browsable = false;
+        };
+        size_t cursor = 0;
+        while (cursor <= output.size()) {
+            size_t end = output.find('\n', cursor);
+            std::string line = output.substr(cursor, end == std::string::npos ?
+                                             std::string::npos : end - cursor);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const std::string marker = package + "/";
+            const size_t component_at = line.find(marker);
+            if (component_at != std::string::npos &&
+                line.find(" filter ", component_at + marker.size()) != std::string::npos) {
+                flush();
+                const size_t end_component = line.find_first_of(" \t", component_at);
+                component = line.substr(component_at,
+                    end_component == std::string::npos ? std::string::npos :
+                    end_component - component_at);
+            } else if (line.find("Action: \"android.intent.action.VIEW\"") != std::string::npos) {
+                view = true;
+            } else if (line.find("Category: \"android.intent.category.BROWSABLE\"") != std::string::npos) {
+                browsable = true;
+            } else if (line.find("Scheme: \"") != std::string::npos) {
+                const size_t begin = line.find("Scheme: \"") + 9;
+                const size_t end_quote = line.find('"', begin);
+                if (end_quote != std::string::npos) scheme = line.substr(begin, end_quote - begin);
+            } else if (line.find("Authority: \"") != std::string::npos) {
+                const size_t begin = line.find("Authority: \"") + 12;
+                const size_t end_quote = line.find('"', begin);
+                if (end_quote != std::string::npos) authority = line.substr(begin, end_quote - begin);
+            }
+            if (end == std::string::npos) break;
+            cursor = end + 1;
+        }
+        flush();
+        return routes;
+    }
+
+    static bool safe_probe_route(const DeepLinkRoute& route) {
+        std::string text = route.component + " " + route.scheme + " " + route.authority;
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        // VIEW routes are still untrusted input. Avoid launching flows that
+        // commonly mutate account, payment, push, or vehicle state during an
+        // unattended dump. The caller can inspect all routes separately.
+        static const char* const blocked[] = {
+            "pay", "recharge", "payment", "wallet", "order", "login",
+            "auth", "verify", "bind", "account", "push", "charge"
+        };
+        for (const char* token : blocked)
+            if (text.find(token) != std::string::npos) return false;
+        return true;
+    }
+
+    static std::vector<DeepLinkRoute> resolve_deep_links(
+            const char* package, size_t limit = 16) {
+        if (!package || !*package) return {};
+        std::string output;
+        if (command({"/system/bin/dumpsys", "package", package}, &output) != 0)
+            return {};
+        const auto candidates = parse_deep_links(package, output, limit * 2);
+        std::vector<DeepLinkRoute> safe;
+        for (const auto& route : candidates) {
+            if (!safe_probe_route(route)) continue;
+            // A manifest can contain stale or malformed filters. Ask the
+            // package manager before launching so the probe queue contains
+            // only routes that resolve back to the target package.
+            std::string resolution;
+            if (command({"/system/bin/cmd", "package", "query-activities",
+                         "--brief", "-a", "android.intent.action.VIEW",
+                         "-d", route.uri()}, &resolution) != 0 ||
+                resolution.find(std::string(package) + "/") == std::string::npos)
+                continue;
+            safe.push_back(route);
+            if (safe.size() >= limit) break;
+        }
+        return safe;
     }
     // Disguise this process to look like a kernel worker thread
     static void disguise_self(int argc, char** argv, const char* name) {

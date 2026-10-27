@@ -28,6 +28,9 @@ struct NhddConfig {
     bool spawn = false;
     bool spawn_restart = false;
     int spawn_timeout = 15;
+    bool spawn_probe = false;      // --spawn-probe: manifest-derived safe VIEW routes
+    int spawn_probe_limit = 8;     // bounded route count per cold launch
+    int spawn_probe_delay_ms = 400;
     // auto: isolated tracefs if available, otherwise explicit polling fallback.
     // tracefs: fail if unavailable. poll: no kernel event source.
     char event_backend[16] = "auto";

@@ -99,6 +99,7 @@ public:
         uint64_t reconstructed_hash = 0;
         uint64_t raw_layout_hash = 0;
         uint64_t evidence_hash = 0;
+        const char* capture_status = "published";
     };
 
     using ArtifactPublishGuard = bool (*)(void*);
@@ -419,6 +420,11 @@ public:
                     artifact_metadata->raw_layout_hash),
                 static_cast<unsigned long long>(
                     artifact_metadata->evidence_hash));
+            std::fprintf(metadata, ",\n  \"capture_status\": ");
+            write_json_string(metadata,
+                              artifact_metadata->capture_status
+                                  ? artifact_metadata->capture_status
+                                  : "published");
         }
         std::fprintf(metadata,
                      ",\n  \"elf_class\": %d,\n  \"elf_header_address\": \"0x%llx\",\n"

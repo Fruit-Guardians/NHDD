@@ -164,6 +164,26 @@ public:
         return true;
     }
 
+    // KernelSU/SELinux can briefly deny /proc access while ActivityManager is
+    // switching a package generation or while an isolated child is entering
+    // its final security context. Retry only bounded, transient errors; never
+    // weaken the identity check or accept a partial maps snapshot.
+    bool take_baseline_retry(const char* pid, uint64_t expected_starttime = 0,
+                             unsigned attempts = 12,
+                             unsigned delay_us = 25000) {
+        if (attempts == 0) attempts = 1;
+        for (unsigned attempt = 0; attempt < attempts; ++attempt) {
+            if (take_baseline(pid, expected_starttime)) return true;
+            const int error = last_capture_errno_ != 0 ? last_capture_errno_ : EIO;
+            const bool transient = error == EACCES || error == EPERM ||
+                                   error == ENOENT || error == ESRCH ||
+                                   error == EIO;
+            if (!transient || attempt + 1 == attempts) return false;
+            if (delay_us != 0) ::usleep(delay_us);
+        }
+        return false;
+    }
+
     // Compare against the immediately preceding snapshot, then advance the
     // baseline. This catches load, unload, permission, identity and sampled
     // in-place content changes without repeatedly reporting the same event.

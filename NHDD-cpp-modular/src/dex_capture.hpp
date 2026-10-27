@@ -92,6 +92,12 @@ public:
     uintptr_t art_object() const {return art_object_;}
     uintptr_t art_vtable() const {return art_vtable_;}
     const std::string& art_build_id() const {return art_build_id_;}
+    const std::string& mapping_path() const { return mapping_path_; }
+    const std::string& mapping_perms() const { return mapping_perms_; }
+    void set_mapping(const char* path, const char* perms) {
+        mapping_path_ = path ? path : "";
+        mapping_perms_ = perms ? perms : "";
+    }
     void mark_art(uintptr_t object,uintptr_t vtable,const std::string& build_id) {
         art_object_=object;art_vtable_=vtable;art_build_id_=build_id;
     }
@@ -322,6 +328,8 @@ public:
 private:
     uintptr_t art_object_=0,art_vtable_=0;
     std::string art_build_id_;
+    std::string mapping_path_;
+    std::string mapping_perms_;
     static constexpr size_t kVolatileHeaderEnd = 0x24;
     static constexpr size_t kMaxProcessedRevisionKeys = 256;
 

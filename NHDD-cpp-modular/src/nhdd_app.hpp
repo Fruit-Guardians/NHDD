@@ -249,6 +249,19 @@ public:
             if (std::strcmp(argv[i], "--spawn-restart") == 0) {
                 cfg.spawn = true; cfg.spawn_restart = true; cfg.continuous = true; continue;
             }
+            if (std::strcmp(argv[i], "--spawn-probe") == 0) {
+                cfg.spawn = true; cfg.spawn_probe = true; cfg.continuous = true; continue;
+            }
+            if (std::strcmp(argv[i], "--spawn-probe-limit") == 0 && i + 1 < argc) {
+                cfg.spawn_probe_limit = std::atoi(argv[++i]);
+                if (cfg.spawn_probe_limit < 1 || cfg.spawn_probe_limit > 32) return 1;
+                continue;
+            }
+            if (std::strcmp(argv[i], "--spawn-probe-delay-ms") == 0 && i + 1 < argc) {
+                cfg.spawn_probe_delay_ms = std::atoi(argv[++i]);
+                if (cfg.spawn_probe_delay_ms < 100 || cfg.spawn_probe_delay_ms > 5000) return 1;
+                continue;
+            }
             if (std::strcmp(argv[i], "--spawn-timeout") == 0 && i + 1 < argc) {
                 cfg.spawn_timeout = std::atoi(argv[++i]);
                 if (cfg.spawn_timeout < 1 || cfg.spawn_timeout > 300) return 1;
@@ -350,10 +363,17 @@ public:
         }
 
         std::string spawn_component;
+        std::vector<ProcessManager::DeepLinkRoute> spawn_routes;
         if (cfg.spawn) {
             spawn_component = ProcessManager::resolve_activity(target);
             if (spawn_component.empty()) {
                 std::fprintf(stderr, "[-] No launcher activity resolved for %s\n", target); return 1;
+            }
+            if (cfg.spawn_probe) {
+                spawn_routes = ProcessManager::resolve_deep_links(
+                    target, static_cast<size_t>(cfg.spawn_probe_limit));
+                std::fprintf(stderr, "[*] SPAWN probes: %zu manifest VIEW/BROWSABLE route(s)\n",
+                             spawn_routes.size());
             }
             if (pid_count > 0 && !cfg.spawn_restart) {
                 std::fprintf(stderr, "[-] Package already running; use --spawn-restart to force-stop before cold launch\n"); return 1;
@@ -378,6 +398,14 @@ public:
         if ((mode & ScanMode::SO) || cfg.save_maps) { if (mkdir_checked(so_dir)) return 1; }
         if (mode & ScanMode::JNIMAP) { if (mkdir_checked(jni_dir)) return 1; }
         if (cfg.save_maps) { if (mkdir_checked(maps_dir)) return 1; }
+
+        char trigger_path[768] = {};
+        if (cfg.spawn_probe) {
+            const int n = std::snprintf(trigger_path, sizeof(trigger_path),
+                                        "%s/triggers.jsonl", out_dir);
+            if (n < 0 || static_cast<size_t>(n) >= sizeof(trigger_path)) return 1;
+            if (!keep) (void)::unlink(trigger_path);
+        }
 
         // Wipe stale output
         if (!keep) {
@@ -516,6 +544,65 @@ public:
                 std::fprintf(stderr, "[*] SPAWN armed; launching %s (discovery every 100ms)\n", spawn_component.c_str());
             }
 
+            struct ProbeProcess { pid_t pid = -1; size_t route = 0; };
+            std::vector<ProbeProcess> probe_processes;
+            size_t next_probe = 0;
+            auto next_probe_due = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(500);
+            auto json_escape = [](const std::string& value) {
+                std::string out;
+                out.reserve(value.size() + 8);
+                for (unsigned char c : value) {
+                    if (c == '\\' || c == '"') { out.push_back('\\'); out.push_back(static_cast<char>(c)); }
+                    else if (c == '\n') out += "\\n";
+                    else if (c == '\r') out += "\\r";
+                    else if (c == '\t') out += "\\t";
+                    else out.push_back(static_cast<char>(c));
+                }
+                return out;
+            };
+            auto write_probe_record = [&](size_t id, const char* event,
+                                          const ProcessManager::DeepLinkRoute& route,
+                                          pid_t pid, int status) {
+                if (!cfg.spawn_probe || !trigger_path[0]) return;
+                FILE* file = std::fopen(trigger_path, "a");
+                if (!file) return;
+                const std::string component = json_escape(route.component);
+                const std::string uri = json_escape(route.uri());
+                std::fprintf(file,
+                    "{\"id\":%zu,\"event\":\"%s\",\"component\":\"%s\","
+                    "\"scheme\":\"%s\",\"authority\":\"%s\",\"uri\":\"%s\","
+                    "\"am_pid\":%d,\"status\":%d}\n",
+                    id, event, component.c_str(), json_escape(route.scheme).c_str(),
+                    json_escape(route.authority).c_str(), uri.c_str(), static_cast<int>(pid), status);
+                std::fflush(file); ::fsync(::fileno(file)); std::fclose(file);
+            };
+            auto reap_probes = [&] {
+                for (size_t i = 0; i < probe_processes.size();) {
+                    int status = 0;
+                    const pid_t result = ::waitpid(probe_processes[i].pid, &status, WNOHANG);
+                    if (result != probe_processes[i].pid) { ++i; continue; }
+                    const auto& route = spawn_routes[probe_processes[i].route];
+                    write_probe_record(probe_processes[i].route + 1, "exit", route,
+                                       result, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+                    probe_processes.erase(probe_processes.begin() + static_cast<long>(i));
+                }
+            };
+            struct ProbeCleanup {
+                std::vector<ProbeProcess>& processes;
+                ~ProbeCleanup() {
+                    for (const auto& process : processes) {
+                        if (process.pid > 0) ::kill(process.pid, SIGTERM);
+                    }
+                    for (const auto& process : processes) {
+                        if (process.pid > 0) {
+                            int status = 0;
+                            while (::waitpid(process.pid, &status, 0) < 0 && errno == EINTR) {}
+                        }
+                    }
+                }
+            } probe_cleanup{probe_processes};
+
             std::fprintf(stderr, "[*] Taking baseline snapshots for %d process(es)...\n", pid_count);
             for (int p = 0; p < pid_count; p++) {
                 uint64_t starttime = 0;
@@ -524,7 +611,7 @@ public:
                     continue;
                 }
                 MapsMonitor monitor;
-                if (!monitor.take_baseline(pids[p], starttime)) {
+                if (!monitor.take_baseline_retry(pids[p], starttime)) {
                     const int capture_errno = monitor.last_capture_errno() != 0
                                                   ? monitor.last_capture_errno()
                                                   : EIO;
@@ -690,6 +777,29 @@ public:
                 if (!spawn_seen && std::time(nullptr) - start_time >= cfg.spawn_timeout) {
                     std::fprintf(stderr, "[-] Spawn timed out without discovering a package process\n"); return 1;
                 }
+                reap_probes();
+                if (cfg.spawn_probe && spawn_seen && next_probe < spawn_routes.size() &&
+                    std::chrono::steady_clock::now() >= next_probe_due) {
+                    const size_t route_index = next_probe++;
+                    const auto& route = spawn_routes[route_index];
+                    const pid_t probe_pid = ::fork();
+                    if (probe_pid == 0) {
+                        const std::string uri = route.uri();
+                        ::execl("/system/bin/am", "am", "start", "-a",
+                                "android.intent.action.VIEW", "-d", uri.c_str(),
+                                static_cast<char*>(nullptr));
+                        ::_exit(127);
+                    }
+                    if (probe_pid > 0) {
+                        probe_processes.push_back({probe_pid, route_index});
+                        write_probe_record(route_index + 1, "launch", route, probe_pid, 0);
+                        std::fprintf(stderr, "[*] SPAWN-PROBE %zu/%zu: %s -> %s\n",
+                                     route_index + 1, spawn_routes.size(),
+                                     route.component.c_str(), route.uri().c_str());
+                    }
+                    next_probe_due = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(cfg.spawn_probe_delay_ms);
+                }
                 if (cfg.timeline && !memory_events.empty()) {
                     FILE* f = std::fopen(timeline_path, "a");
                     if (!f) std::perror("syscall timeline");
@@ -762,7 +872,7 @@ public:
                             break;
                         }
                         MapsMonitor monitor;
-                        if (!monitor.take_baseline(pids[p], process_starttime)) {
+                        if (!monitor.take_baseline_retry(pids[p], process_starttime)) {
                             const int capture_errno =
                                 monitor.last_capture_errno() != 0
                                     ? monitor.last_capture_errno()
@@ -1118,6 +1228,9 @@ private:
             "    --spawn       Arm events before launching a stopped package; follows package processes/descendants\n"
             "    --spawn-restart  Force-stop package, then perform --spawn\n"
             "    --spawn-timeout S  Wait for first process (1..300, default 15)\n"
+            "    --spawn-probe  Also trigger bounded manifest VIEW/BROWSABLE routes\n"
+            "    --spawn-probe-limit N  Maximum manifest routes (1..32, default 8)\n"
+            "    --spawn-probe-delay-ms N  Delay between routes (100..5000, default 400)\n"
             "    --events auto|tracefs|poll  Kernel syscall events with explicit fallback (default auto)\n"
             "    --verify FILE  Offline DEX/CDEX/VDEX/OAT validation to JSON; exit 0=checks passed, 2=invalid, 3=unsupported\n"
             "\n"
