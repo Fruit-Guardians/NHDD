@@ -1,0 +1,5 @@
+# Minimal KernelSU policy for NHDD's isolated tracefs collector.
+# NHDD creates, configures and removes its own per-process instance.
+allow ksu debugfs_tracing_debug dir search
+allow ksu debugfs_tracing_instances dir { add_name remove_name search write }
+allow ksu debugfs_tracing_instances file { open read write }
